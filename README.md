@@ -1,5 +1,5 @@
 # AIUB Notice Checker
-[![Notice Checker](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/notice-checker.yaml/badge.svg)](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/notice-checker.yaml)
+[![AIUB Notice Checker](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/notice-checker.yml/badge.svg)](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/notice-checker.yml)
 
 A Python script that checks for new or edited posts on the [AIUB Notice page](https://aiub.cf/category/notices/) and sends updates to a specified Telegram channel.
 
