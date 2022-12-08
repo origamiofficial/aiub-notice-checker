@@ -70,15 +70,22 @@ for post in posts:
     link = post.xpath(LINK_XPATH)[0].strip().replace("aiub.cf", "www.aiub.edu")
 
     # Define the send_telegram_message function
-    def send_telegram_message(title, description, link):
-        # Use the telegram bot information provided in the script to construct the URL for the API
-        telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_API_KEY}/sendMessage"
+def send_telegram_message(title, description, link):
+    # Use the telegram bot information provided in the script to construct the URL for the API
+    telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_API_KEY}/sendMessage"
 
-        # Construct the message to send
-        message = f"{title}\n\n{description}\n\n{link}"
+    # Construct the message to send
+    message = f"{title}\n\n{description}\n\n{link}"
 
-                # Send the message to the telegram channel
-        requests.post(telegram_api_url, data={"chat_id": TELEGRAM_CHANNEL_USERNAME, "text": message})
+    # Send the message to the telegram channel
+    requests.post(telegram_api_url, data={"chat_id": TELEGRAM_CHANNEL_USERNAME, "text": message})
+
+
+# Check each post and send update if it's new or edited
+for post in posts:
+    title = post.xpath(TITLE_XPATH)[0].strip()
+    description = post.xpath(DESCRIPTION_XPATH)[0].strip()
+    link = post.xpath(LINK_XPATH)[0].strip().replace("aiub.cf", "www.aiub.edu")
 
     # Check if notice is already in database
     c.execute("SELECT * FROM {} WHERE title = ?".format(DB_TABLE_NAME), (title,))
