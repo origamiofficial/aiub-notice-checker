@@ -98,14 +98,6 @@ for post in posts:
             )
             send_telegram_message(title, description, link)
 
-# Close database connection
+# Close connection to database
+conn.commit()
 conn.close()
-
-# Function to send message to Telegram channel
-def send_telegram_message(title, description, link):
-    message = "[{}]\n\n{}\n\n{}".format(title, description, link)
-    requests.get(
-        "https://api.telegram.org/bot{}/sendMessage?chat_id={}&text={}".format(
-            TELEGRAM_BOT_API_KEY, TELEGRAM_CHANNEL_USERNAME, message
-        )
-    )
