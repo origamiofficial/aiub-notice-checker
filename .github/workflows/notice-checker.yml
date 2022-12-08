@@ -1,0 +1,29 @@
+name: AIUB Notice Checker
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+
+jobs:
+  check-notices:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.7'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run script
+        env:
+          TELEGRAM_BOT_API_KEY: ${{ secrets.TELEGRAM_BOT_API_KEY }}
+          TELEGRAM_CHANNEL_USERNAME: ${{ secrets.TELEGRAM_CHANNEL_USERNAME }}
+        run: python main.py
+      - name: Save database
+        uses: actions/upload-artifact@v2
+        with:
+          name: notices-db
+          path: notices.db
