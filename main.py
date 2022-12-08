@@ -11,7 +11,7 @@ TELEGRAM_BOT_API_KEY = "1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 WEBSITE_URL = "https://aiub.cf/category/notices/"
 POST_XPATH = "/html/body/div/div/div/ul/li/div"
 TITLE_XPATH = "/html/body/div/div/div/ul/li/div/h2/text()"
-LINK_XPATH = "/html/body/div/div/div/ul/li/a"
+LINK_XPATH = "/html/body/div/div/div/ul/li/a/@href"
 DESCRIPTION_XPATH = "/html/body/div/div/div/ul/li/div/p/text()"
 
 # SQLite database information
