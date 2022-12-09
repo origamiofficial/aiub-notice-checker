@@ -27,7 +27,7 @@ pip install -r requirements.txt
 ```
 3. Set the `TELEGRAM_CHAT_ID` and `TELEGRAM_BOT_API_KEY` environment variables with your Telegram chat ID and bot API key
 4. Run the script using 
-`bash
+```bash
 python main.py
 ```
 
