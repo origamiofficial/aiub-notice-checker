@@ -4,7 +4,7 @@ import sqlite3
 import time
 
 # Telegram bot information
-TELEGRAM_CHANNEL_USERNAME = "AIUB_Notice_Updates"
+TELEGRAM_CHAT_ID = "0987654321"
 TELEGRAM_BOT_API_KEY = "1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 # URL and XPath information for AIUB Notice page
@@ -22,7 +22,7 @@ DB_NAME = "aiub_notices.db"
 DB_TABLE_NAME = "notices"
 
 # Script version
-SCRIPT_VERSION = "1.5"
+SCRIPT_VERSION = "1.6"
 SCRIPT_URL = "https://raw.githubusercontent.com/origamiofficial/aiub-notice-checker/main/main.py"
 
 # Check for script updates
@@ -102,18 +102,18 @@ def send_telegram_message(title, description, link, day, month, year):
     message = f"{title}\n{day} {month} {year}\n\n{description}\n\n{link}"
 
     # Use the requests module to send a POST request to the telegram API URL with the necessary
-    # parameters to send a message to the specified channel
+    # parameters to send a message to the specified chat
     response = requests.post(
         telegram_api_url,
-        data={"chat_id": TELEGRAM_CHANNEL_USERNAME, "text": message},
+        data={"chat_id": TELEGRAM_CHAT_ID, "text": message},
     )
 
     # Check if the request was successful, and print the response from the server
     if response.status_code == 200:
-        print(f"Successfully sent message to {TELEGRAM_CHANNEL_USERNAME}.")
+        print(f"Successfully sent message to {TELEGRAM_CHAT_ID}.")
     else:
         print(
-            f"Error sending message to {TELEGRAM_CHANNEL_USERNAME}: {response.text}. Exiting script."
+            f"Error sending message to {TELEGRAM_CHAT_ID}: {response.text}. Exiting script."
         )
         exit()
 
@@ -137,7 +137,7 @@ for post in posts:
     )
     result = c.fetchone()
 
-    # If the post does not exist in the database, send a message to the telegram channel
+    # If the post does not exist in the database, send a message to the telegram chat
     # and insert the post into the database
     if result is None:
         print(f"New post found: {title}")
