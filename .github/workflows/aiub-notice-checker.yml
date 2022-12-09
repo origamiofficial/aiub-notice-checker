@@ -21,13 +21,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - 
-        name: Restore SQLite Database
-        if: steps.save-cache.outputs.cache-hit != 'true'
-        uses: actions/cache@v3
+        name: Download SQLite Database
+        uses: actions/download-artifact@v1
         with:
-          key: aiub_notices_cache
-          path: aiub_notices.db
-          restore-keys: aiub_notices.db
+          name: aiub_notices_db
+          continue-on-error: true
       - 
         name: Run script
         env:
@@ -35,9 +33,9 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py
       - 
-        name: Backup SQLite Database
+        name: Save SQLite Database
         if: success()
-        uses: actions/cache@v3
+        uses: actions/upload-artifact@v1
         with:
-          key: aiub_notices_cache
+          name: aiub_notices_db
           path: aiub_notices.db
