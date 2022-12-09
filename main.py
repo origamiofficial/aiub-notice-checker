@@ -1,7 +1,6 @@
 import requests
 from lxml import html
 import sqlite3
-import time
 import os
 
 # Telegram bot information
