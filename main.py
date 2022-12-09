@@ -59,6 +59,39 @@ except requests.ConnectionError as e:
     print(f"AIUB website is down: {e}. Exiting script.")
     exit()
 
+# Visit AIUB Notice page and check for new posts
+print("Checking for new posts on AIUB Notice page...")
+try:
+    page = requests.get(WEBSITE_URL)
+    tree = html.fromstring(page.content)
+    posts = tree.xpath(POST_XPATH)
+    print(f"{len(posts)} posts found on AIUB Notice page.")
+except Exception as e:
+    print(f"Error checking for new posts on AIUB Notice page: {e}. Exiting script.")
+    exit()
+
+# Connect to SQLite database
+print("Connecting to SQLite database...")
+try:
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    print("Connection to database successful.")
+except Exception as e:
+    print(f"Error connecting to database: {e}. Exiting script.")
+    exit()
+
+# Check if notices table exists in database, and create it if it doesn't
+try:
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS {} (title text, description text, link text)".format(
+            DB_TABLE_NAME
+        )
+    )
+    print("Notices table exists or has been created in database.")
+except Exception as e:
+    print(f"Error creating notices table in database: {e}. Exiting script.")
+    exit()
+
 # Define the send_telegram_message function
 def send_telegram_message(title, description, link, day, month, year):
     # Use the telegram bot information provided in the script to construct the URL for the API
@@ -84,36 +117,38 @@ def send_telegram_message(title, description, link, day, month, year):
         )
         exit()
 
-# Visit AIUB Notice page and check for new posts
-print("Checking for new posts on AIUB Notice page...")
-try:
-    page = requests.get(WEBSITE_URL)
-    tree = html.fromstring(page.content)
-    posts = tree.xpath(POST_XPATH)
-    print(f"{len(posts)} posts found on AIUB Notice page.")
-    for post in posts:
-        # Use the XPath expressions provided to extract the title, description, link, day, month, and year
-        # for each post on the AIUB Notice page
-        title = post.xpath(TITLE_XPATH)[0]
-        link = post.xpath(LINK_XPATH)[0]
-        description = post.xpath(DESCRIPTION_XPATH)[0]
-        day = post.xpath(DAY_XPATH)[0]
-        month = post.xpath(MONTH_XPATH)[0]
-        year = post.xpath(YEAR_XPATH)[0]
+# Iterate through each post on the AIUB Notice page and check if it exists in the database
+for post in posts:
+    # Use the XPath expressions provided in the script to extract the title, description, link, day, month, and year
+    # for each post
+    title = post.xpath(TITLE_XPATH)[0]
+    description = post.xpath(DESCRIPTION_XPATH)[0]
+    link = post.xpath(LINK_XPATH)[0]
+    day = post.xpath(DAY_XPATH)[0]
+    month = post.xpath(MONTH_XPATH)[0]
+    year = post.xpath(YEAR_XPATH)[0]
 
-        # Check if the post already exists in the database, and send a notification to the Telegram channel
-        # if it doesn't
-        c.execute("SELECT * FROM {} WHERE link=?".format(DB_TABLE_NAME), (link,))
-        if c.fetchone() is None:
-            send_telegram_message(title, description, link, day, month, year)
-            c.execute("INSERT INTO {} VALUES (?, ?, ?)".format(DB_TABLE_NAME), (title, description, link))
-except Exception as e:
-    print(f"Error checking for new posts on AIUB Notice page: {e}. Exiting script.")
-    exit()
+    # Check if the post exists in the database
+    c.execute(
+        "SELECT * FROM {} WHERE title = ? AND description = ? AND link = ?".format(
+            DB_TABLE_NAME
+        ),
+        (title, description, link),
+    )
+    result = c.fetchone()
+
+    # If the post does not exist in the database, send a message to the telegram channel
+    # and insert the post into the database
+    if result is None:
+        print(f"New post found: {title}")
+        send_telegram_message(title, description, link, day, month, year)
+        c.execute(
+            "INSERT INTO {} (title, description, link) VALUES (?, ?, ?)".format(
+                DB_TABLE_NAME
+            ),
+            (title, description, link),
+        )
 
 # Save changes to database and close connection
 conn.commit()
 conn.close()
-
-# Print completion message and exit script
-print("All tasks completed successfully. Exiting script.")
