@@ -111,7 +111,7 @@ def send_telegram_message(title, description, link, day, month, year):
     # parameters to send a message to the specified chat
     response = requests.post(
         telegram_api_url,
-        data={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+        data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_web_page_preview": True},
     )
 
     # Check if the request was successful, and print the response from the server
