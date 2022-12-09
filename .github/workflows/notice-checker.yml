@@ -17,11 +17,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Download database
-        uses: actions/download-artifact@v3
-        with:
-          name: notices-db
-          path: notices-db
       - name: Run script
         env:
           TELEGRAM_BOT_API_KEY: ${{ secrets.TELEGRAM_BOT_API_KEY }}
