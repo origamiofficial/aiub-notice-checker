@@ -25,6 +25,6 @@ jobs:
       - name: Upload database
         uses: actions/upload-artifact@v3
         with:
-          name: notices-db
-          path: notices.db
+          name: Notice DB
+          path: aiub_notices.db
 
