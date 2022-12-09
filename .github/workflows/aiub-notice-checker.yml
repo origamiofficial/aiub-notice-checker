@@ -1,4 +1,4 @@
-name: Notice Checker
+name: AIUB Notice Checker
 
 on:
   schedule:
