@@ -134,20 +134,19 @@ for post in posts:
     month = post.xpath(MONTH_XPATH)[0]
     year = post.xpath(YEAR_XPATH)[0]
 
-    # Check if the post exists in the database
+    # Check if post is already in database
     c.execute(
-        "SELECT * FROM {} WHERE title = ? AND description = ? AND link = ?".format(
+        "SELECT * FROM {} WHERE title=? AND description=? AND link=?".format(
             DB_TABLE_NAME
         ),
         (title, description, link),
     )
-    result = c.fetchone()
-
-    # If the post does not exist in the database, send a message to the telegram chat
-    # and insert the post into the database
-    if result is None:
-        print(f"New post found: {title}")
+    # Check if the query returned any rows
+    if c.fetchone() is None:
+        # Send post to Telegram
         send_telegram_message(title, description, link, day, month, year)
+        print(f"Sent post to Telegram: {title}")
+        # Insert post into database
         c.execute(
             "INSERT INTO {} (title, description, link) VALUES (?, ?, ?)".format(
                 DB_TABLE_NAME
@@ -157,4 +156,4 @@ for post in posts:
 
 # Save changes to database and close connection
 conn.commit()
-conn.close()
+conn.close
