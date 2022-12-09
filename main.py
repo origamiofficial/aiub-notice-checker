@@ -2,6 +2,7 @@ import requests
 from lxml import html
 import sqlite3
 import time
+import os
 
 # Telegram bot information
 TELEGRAM_CHAT_ID = "1234567890"
@@ -69,6 +70,12 @@ try:
 except Exception as e:
     print(f"Error checking for new posts on AIUB Notice page: {e}. Exiting script.")
     exit()
+
+# Check if database file exists
+if os.path.exists(DB_NAME):
+    print(f"Existing SQLite database file found.")
+else:
+    print(f"Existing SQLite database file not found.")
 
 # Connect to SQLite database
 print("Connecting to SQLite database...")
