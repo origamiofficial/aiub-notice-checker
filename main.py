@@ -13,13 +13,16 @@ POST_XPATH = "//ul[@class='event-list']/li"
 TITLE_XPATH = ".//h2[@class='title']/text()"
 LINK_XPATH = ".//a[@class='info-link']/@href"
 DESCRIPTION_XPATH = ".//p[@class='desc']/text()"
+DAY_XPATH = ".//time/span[@class='day']/text()"
+MONTH_XPATH = ".//time/span[@class='month']/text()"
+YEAR_XPATH = ".//time/span[@class='year']/text()"
 
 # SQLite database information
 DB_NAME = "aiub_notices.db"
 DB_TABLE_NAME = "notices"
 
 # Script version
-SCRIPT_VERSION = "1.4"
+SCRIPT_VERSION = "1.5"
 SCRIPT_URL = "https://raw.githubusercontent.com/origamiofficial/aiub-notice-checker/main/main.py"
 
 # Check for script updates
@@ -56,6 +59,31 @@ except requests.ConnectionError as e:
     print(f"AIUB website is down: {e}. Exiting script.")
     exit()
 
+# Define the send_telegram_message function
+def send_telegram_message(title, description, link, day, month, year):
+    # Use the telegram bot information provided in the script to construct the URL for the API
+    telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_API_KEY}/sendMessage"
+
+    # Use the URL and XPath information provided in the script to extract the title, description, and link
+    # for each post on the AIUB Notice page
+    message = f"{title}\n{day} {month} {year}\n\n{description}\n\n{link}"
+
+    # Use the requests module to send a POST request to the telegram API URL with the necessary
+    # parameters to send a message to the specified channel
+    response = requests.post(
+        telegram_api_url,
+        data={"chat_id": TELEGRAM_CHANNEL_USERNAME, "text": message},
+    )
+
+    # Check if the request was successful, and print the response from the server
+    if response.status_code == 200:
+        print(f"Successfully sent message to {TELEGRAM_CHANNEL_USERNAME}.")
+    else:
+        print(
+            f"Error sending message to {TELEGRAM_CHANNEL_USERNAME}: {response.text}. Exiting script."
+        )
+        exit()
+
 # Visit AIUB Notice page and check for new posts
 print("Checking for new posts on AIUB Notice page...")
 try:
@@ -63,90 +91,29 @@ try:
     tree = html.fromstring(page.content)
     posts = tree.xpath(POST_XPATH)
     print(f"{len(posts)} posts found on AIUB Notice page.")
+    for post in posts:
+        # Use the XPath expressions provided to extract the title, description, link, day, month, and year
+        # for each post on the AIUB Notice page
+        title = post.xpath(TITLE_XPATH)[0]
+        link = post.xpath(LINK_XPATH)[0]
+        description = post.xpath(DESCRIPTION_XPATH)[0]
+        day = post.xpath(DAY_XPATH)[0]
+        month = post.xpath(MONTH_XPATH)[0]
+        year = post.xpath(YEAR_XPATH)[0]
+
+        # Check if the post already exists in the database, and send a notification to the Telegram channel
+        # if it doesn't
+        c.execute("SELECT * FROM {} WHERE link=?".format(DB_TABLE_NAME), (link,))
+        if c.fetchone() is None:
+            send_telegram_message(title, description, link, day, month, year)
+            c.execute("INSERT INTO {} VALUES (?, ?, ?)".format(DB_TABLE_NAME), (title, description, link))
 except Exception as e:
     print(f"Error checking for new posts on AIUB Notice page: {e}. Exiting script.")
     exit()
 
-# Connect to SQLite database
-print("Connecting to SQLite database...")
-try:
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    print("Connection to database successful.")
-except Exception as e:
-    print(f"Error connecting to database: {e}. Exiting script.")
-    exit()
-
-# Check if notices table exists in database, and create it if it doesn't
-try:
-    c.execute(
-        "CREATE TABLE IF NOT EXISTS {} (title text, description text, link text)".format(
-            DB_TABLE_NAME
-        )
-    )
-    print("Notices table exists or has been created in database.")
-except Exception as e:
-    print(f"Error creating notices table in database: {e}. Exiting script.")
-    exit()
-
-# Define the send_telegram_message function
-def send_telegram_message(title, description, link):
-    # Use the telegram bot information provided in the script to construct the URL for the API
-    telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_API_KEY}/sendMessage"
-
-    # Construct the message to send
-    message = f"{title}\n\n{description}\n\n{link}"
-
-    # Send the message to the telegram channel
-    requests.post(telegram_api_url, data={"chat_id": TELEGRAM_CHANNEL_USERNAME, "text": message})
-
-
-# Check each post and send update if it's new or edited
-print("Checking each post and sending update if new or edited...")
-try:
-    for post in posts:
-        title = post.xpath(TITLE_XPATH)[0].strip()
-        description = post.xpath(DESCRIPTION_XPATH)[0].strip()
-        link = post.xpath(LINK_XPATH)[0].strip().replace("aiub.cf", "www.aiub.edu")
-
-        # Check if the notice already exists in the database
-        c.execute("SELECT * FROM {} WHERE title=? AND description=? AND link=?".format(DB_TABLE_NAME), (title, description, link))
-        notice = c.fetchone()
-
-        # If the notice doesn't exist in the database, insert it
-        if notice is None:
-            c.execute(
-                "INSERT INTO {} VALUES (?, ?, ?)".format(DB_TABLE_NAME),
-                (title, description, link),
-            )
-            conn.commit()
-            print(f"New notice: {title}")
-            send_telegram_message(title, description, link)
-
-        # If the notice exists in the database, check if it has been edited
-        else:
-            c.execute(
-                "SELECT * FROM {} WHERE title=? AND description=? AND link=?".format(DB_TABLE_NAME),
-                (title, description, link),
-            )
-            notice = c.fetchone()
-            if notice is None:
-                print(f"Notice edited: {title}")
-                c.execute(
-                    "DELETE FROM {} WHERE title=? AND description=? AND link=?".format(DB_TABLE_NAME),
-                    (title, description, link),
-                )
-                c.execute(
-                    "INSERT INTO {} VALUES (?, ?, ?)".format(DB_TABLE_NAME),
-                    (title, description, link),
-                )
-                conn.commit()
-                send_telegram_message(title, description, link)
-
-    print("Script completed.")
-except Exception as e:
-    print(f"Error checking each post and sending update if new or edited: {e}. Exiting script.")
-    exit()
-
-# Close the SQLite connection
+# Save changes to database and close connection
+conn.commit()
 conn.close()
+
+# Print completion message and exit script
+print("All tasks completed successfully. Exiting script.")
