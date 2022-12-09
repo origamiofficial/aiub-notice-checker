@@ -4,7 +4,7 @@ import sqlite3
 import time
 
 # Telegram bot information
-TELEGRAM_CHAT_ID = "0987654321"
+TELEGRAM_CHAT_ID = "1234567890"
 TELEGRAM_BOT_API_KEY = "1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 # URL and XPath information for AIUB Notice page
@@ -99,7 +99,7 @@ def send_telegram_message(title, description, link, day, month, year):
 
     # Use the URL and XPath information provided in the script to extract the title, description, and link
     # for each post on the AIUB Notice page
-    message = f"{title}\n{day} {month} {year}\n\n{description}\n\n{link}"
+    message = f"{title}\n{day} {month} {year}\n\n{description}\n\nhttps://www.aiub.edu{link}"
 
     # Use the requests module to send a POST request to the telegram API URL with the necessary
     # parameters to send a message to the specified chat
