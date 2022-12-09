@@ -19,7 +19,7 @@ DB_NAME = "aiub_notices.db"
 DB_TABLE_NAME = "notices"
 
 # Script version
-SCRIPT_VERSION = "1.2"
+SCRIPT_VERSION = "1.3"
 SCRIPT_URL = "https://raw.githubusercontent.com/origamiofficial/aiub-notice-checker/main/main.py"
 
 # Check for script updates
@@ -63,13 +63,7 @@ c.execute(
     )
 )
 
-# Check each post and send update if it's new or edited
-for post in posts:
-    title = post.xpath(TITLE_XPATH)[0].strip()
-    description = post.xpath(DESCRIPTION_XPATH)[0].strip()
-    link = post.xpath(LINK_XPATH)[0].strip().replace("aiub.cf", "www.aiub.edu")
-
-    # Define the send_telegram_message function
+# Define the send_telegram_message function
 def send_telegram_message(title, description, link):
     # Use the telegram bot information provided in the script to construct the URL for the API
     telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_API_KEY}/sendMessage"
@@ -87,35 +81,19 @@ for post in posts:
     description = post.xpath(DESCRIPTION_XPATH)[0].strip()
     link = post.xpath(LINK_XPATH)[0].strip().replace("aiub.cf", "www.aiub.edu")
 
-    # Check if notice is already in database
-    c.execute("SELECT * FROM {} WHERE title = ?".format(DB_TABLE_NAME), (title,))
-    result = c.fetchone()
+    # Check if the notice already exists in the database
+    c.execute("SELECT * FROM {} WHERE title=? AND description=? AND link=?".format(DB_TABLE_NAME), (title, description, link))
+    notice = c.fetchone()
 
-    # If notice is not in database, add it and send update
-    if result is None:
-        c.execute(
-            "INSERT INTO {} (title, description, link) VALUES (?, ?, ?)".format(
-                DB_TABLE_NAME
-            ),
-            (title, description, link),
-        )
+    # If the notice doesn't exist in the database, insert it
+    if notice is None:
+        c.execute("INSERT INTO {} VALUES (?, ?, ?)".format(DB_TABLE_NAME), (title, description, link))
+
+    # If the notice exists in the database but has been edited, update the database and send a notification
+    elif notice[0] == title and notice[1] == description and notice[2] == link:
+        c.execute("UPDATE {} SET title=?, description=?, link=? WHERE title=? AND description=? AND link=?".format(DB_TABLE_NAME), (title, description, link, title, description, link))
         send_telegram_message(title, description, link)
 
-    # If notice is in database, check if it has been edited and send update if necessary
-    else:
-        if (
-            description != result[1]
-            or link != result[2]
-        ):
-            # Update notice in database
-            c.execute(
-                "UPDATE {} SET description = ?, link = ? WHERE title = ?".format(
-                    DB_TABLE_NAME
-                ),
-                (description, link, title),
-            )
-            send_telegram_message(title, description, link)
-
-# Close connection to database
+# Save changes to the database and close the connection
 conn.commit()
 conn.close()
