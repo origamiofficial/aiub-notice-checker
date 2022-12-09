@@ -21,6 +21,7 @@ jobs:
         if: steps.save-cache.outputs.cache-hit != 'true'
         uses: actions/cache@v3
         with:
+          key: aiub_notices_cache
           path: aiub_notices.db
           restore-keys: aiub_notices.db
       - name: Run script
@@ -32,4 +33,5 @@ jobs:
         if: success()
         uses: actions/cache@v3
         with:
+          key: aiub_notices_cache
           path: aiub_notices.db
