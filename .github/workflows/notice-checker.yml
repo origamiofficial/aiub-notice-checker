@@ -17,14 +17,19 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      - name: Restore cache
+        if: steps.save-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v3
+        with:
+          path: aiub_notices.db
+          restore-keys: aiub_notices.db
       - name: Run script
         env:
           TELEGRAM_BOT_API_KEY: ${{ secrets.TELEGRAM_BOT_API_KEY }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py
-      - name: Upload database
-        uses: actions/upload-artifact@v3
+      - name: Save cache
+        if: success()
+        uses: actions/cache@v3
         with:
-          name: notices
           path: aiub_notices.db
-
