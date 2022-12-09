@@ -4,8 +4,8 @@ import sqlite3
 import os
 
 # Telegram bot information
-TELEGRAM_CHAT_ID = "-1001539114137"
-TELEGRAM_BOT_API_KEY = "1234567890:ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+TELEGRAM_CHAT_ID = "context.secrets.TELEGRAM_CHAT_ID"
+TELEGRAM_BOT_API_KEY = "context.secrets.TELEGRAM_BOT_API_KEY"
 
 # URL and XPath information for AIUB Notice page
 WEBSITE_URL = "https://aiub.cf/category/notices/"
