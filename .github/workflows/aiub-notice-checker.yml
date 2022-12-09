@@ -21,20 +21,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
       - 
-        name: Download SQLite Database
-        uses: actions/download-artifact@v1
-        with:
-          name: aiub_notices_db
-      - 
         name: Run script
         env:
           TELEGRAM_BOT_API_KEY: ${{ secrets.TELEGRAM_BOT_API_KEY }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py
       - 
-        name: Save SQLite Database
+        name: Commit and push changes
         if: success()
-        uses: actions/upload-artifact@v1
-        with:
-          name: aiub_notices_db
-          path: aiub_notices.db
+        run: |
+          git add aiub_notices.db
+          git commit -m "Update aiub_notices.db"
+          git push
