@@ -8,11 +8,6 @@ jobs:
   check-notices:
     runs-on: ubuntu-latest
     steps:
-      - name: Download database
-        uses: actions/download-artifact@v3
-        with:
-          name: notices
-          path: aiub_notices.db
       - uses: actions/checkout@v3
       - name: Set up Python
         uses: actions/setup-python@v4
