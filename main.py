@@ -3,7 +3,7 @@ from lxml import html
 import sqlite3
 import os
 
-# Telegram bot information
+# Telegram information
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TELEGRAM_BOT_API_KEY = os.environ["TELEGRAM_BOT_API_KEY"]
 
@@ -22,7 +22,7 @@ DB_NAME = "aiub_notices.db"
 DB_TABLE_NAME = "notices"
 
 # Script version
-SCRIPT_VERSION = "1.6"
+SCRIPT_VERSION = "1.7"
 SCRIPT_URL = "https://raw.githubusercontent.com/origamiofficial/aiub-notice-checker/main/main.py"
 
 # Check for script updates
@@ -67,14 +67,14 @@ try:
     posts = tree.xpath(POST_XPATH)
     print(f"{len(posts)} posts found on AIUB Notice page.")
 except Exception as e:
-    print(f"Error checking for new posts on AIUB Notice page: {e}. Exiting script.")
+    print(f"Error checking for new posts on AIUB Notice page: {e}. Check if XPath expressions need to be updated. Exiting script.")
     exit()
 
 # Check if database file exists
 if os.path.exists(DB_NAME):
     print(f"Existing SQLite database file found.")
 else:
-    print(f"Existing SQLite database file not found.")
+    print(f"Existing SQLite database file not found, created one")
 
 # Connect to SQLite database
 print("Connecting to SQLite database...")
@@ -93,14 +93,24 @@ try:
             DB_TABLE_NAME
         )
     )
-    print("Notices table exists or has been created in database.")
 except Exception as e:
     print(f"Error creating notices table in database: {e}. Exiting script.")
     exit()
 
+# Check if table was created or already exists
+try:
+    c.execute("SELECT * FROM sqlite_master WHERE type='table' AND name=?", (DB_TABLE_NAME,))
+    if c.fetchone():
+        print("Notices table already exists in database.")
+    else:
+        print("Notices table created in database.")
+except Exception as e:
+    print(f"Error checking if notices table exists: {e}. Exiting script.")
+    exit()
+
 # Define the send_telegram_message function
 def send_telegram_message(title, description, link, day, month, year):
-    # Use the telegram bot information provided in the script to construct the URL for the API
+    # Use the telegram information provided in the script to construct the URL for the API
     telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_API_KEY}/sendMessage"
 
     # Use the URL and XPath information provided in the script to extract the title, description, and link
@@ -116,10 +126,10 @@ def send_telegram_message(title, description, link, day, month, year):
 
     # Check if the request was successful, and print the response from the server
     if response.status_code == 200:
-        print(f"Successfully sent message to {TELEGRAM_CHAT_ID}.")
+        print(f"Successfully sent message to Telegram.")
     else:
         print(
-            f"Error sending message to {TELEGRAM_CHAT_ID}: {response.text}. Exiting script."
+            f"Error sending message to Telegram: {response.text}. Exiting script."
         )
         exit()
 
