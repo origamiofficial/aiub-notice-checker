@@ -44,7 +44,7 @@ jobs:
           git remote set-url origin https://${{ secrets.GIT_AUTH }}@github.com/origamiofficial/aiub-notice-checker.git
       - 
         name: Commit changes
-        if: steps.check-for-changes.output == "Changes found. Proceeding with commit..."
+        if: steps.check-for-changes.output == 'Changes found. Proceeding with commit...'
         run: |
           git add aiub_notices.db
           git commit -m "Update aiub_notices.db"
