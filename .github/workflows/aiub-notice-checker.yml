@@ -30,8 +30,9 @@ jobs:
         name: Commit and push changes
         if: success()
         run: |
-          git config --global user.name 'Origami Official
-          git config --global user.email 'origamiofficial@users.noreply.github.com'
-          git add aiub_notices.db
-          git commit -m "Update aiub_notices.db"
-          git push
+            git config user.name "GitHub Actions"
+            git config user.email "actions@github.com"
+            git remote set-url origin https://${{ secrets.GIT_AUTH }}@github.com/origamiofficial/aiub-notice-checker.git
+            git add aiub_notices.db
+            git commit -m "Update aiub_notices.db"
+            git push
