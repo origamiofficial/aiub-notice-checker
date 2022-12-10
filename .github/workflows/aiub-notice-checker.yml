@@ -38,6 +38,7 @@ jobs:
           fi
       - 
         name: Configure Git
+        if: steps.check-for-changes.output == 'Changes found. Proceeding with commit...'
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
