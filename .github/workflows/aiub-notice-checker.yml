@@ -26,12 +26,11 @@ jobs:
           TELEGRAM_BOT_API_KEY: ${{ secrets.TELEGRAM_BOT_API_KEY }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py
-      - 
-        name: Commit changes
-        if: |
-          `git rev-parse HEAD:aiub_notices.db` &&
-          `git diff --exit-code HEAD -- aiub_notices.db`
-
+      -
+        name: Push changes to repository
+        if: ${{ github.workspace.files['aiub_notices.db'].status == 'modified' }}
+        env:
+          GIT_AUTH: ${{ secrets.GIT_AUTH }}
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
