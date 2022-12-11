@@ -28,10 +28,12 @@ jobs:
         run: python main.py
       -
         name: Push changes to repository
-        if: ${{ github.workspace.files['aiub_notices.db'].status == 'modified' }}
         env:
           GIT_AUTH: ${{ secrets.GIT_AUTH }}
         run: |
+          if [[ $(git status) == *"nothing to commit, working tree clean"* ]]; then
+          exit
+          fi
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           git remote set-url origin https://${{ secrets.GIT_AUTH }}@github.com/origamiofficial/aiub-notice-checker.git
