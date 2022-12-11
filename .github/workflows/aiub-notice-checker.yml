@@ -29,8 +29,9 @@ jobs:
       - 
         name: Commit changes
         if: |
-          "git rev-parse HEAD:aiub_notices.db" &&
-          "git diff --exit-code HEAD -- aiub_notices.db"
+          `git rev-parse HEAD:aiub_notices.db` &&
+          `git diff --exit-code HEAD -- aiub_notices.db`
+
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
