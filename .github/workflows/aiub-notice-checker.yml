@@ -26,27 +26,15 @@ jobs:
           TELEGRAM_BOT_API_KEY: ${{ secrets.TELEGRAM_BOT_API_KEY }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py
-        
       - 
-        name: Check for changes
-        if: success()
-        run: |
-          if [[ -n "$(git status --porcelain)" ]]; then
-            echo 'Changes found'
-          else
-            echo 'No changes found'
-          fi
-      - 
-        name: Configure Git
-        if: steps.check-for-changes.output == 'Changes found'
+        name: Commit changes
+        if: |
+          git rev-parse HEAD:aiub_notices.db &&
+          git diff --exit-code HEAD -- aiub_notices.db
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           git remote set-url origin https://${{ secrets.GIT_AUTH }}@github.com/origamiofficial/aiub-notice-checker.git
-      - 
-        name: Commit changes
-        if: steps.check-for-changes.output == 'Changes found'
-        run: |
           git add aiub_notices.db
-          git commit -m "Update aiub_notices.db"
+          git commit -m "New notice added to the database"
           git push
