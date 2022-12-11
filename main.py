@@ -115,7 +115,7 @@ def send_telegram_message(title, description, link, day, month, year):
 
     # Use the URL and XPath information provided in the script to extract the title, description, and link
     # for each post on the AIUB Notice page
-    message = f"{title}\n{day} {month} {year}\n\n{description}\n\nhttps://www.aiub.edu{link}"
+    message = f"{title}\nDate: {day} {month} {year}\n\n{description}\n\nhttps://www.aiub.edu{link}"
 
     # Use the requests module to send a POST request to the telegram API URL with the necessary
     # parameters to send a message to the specified chat
