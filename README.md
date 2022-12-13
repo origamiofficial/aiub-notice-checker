@@ -1,5 +1,5 @@
 # AIUB Notice Checker
-[![AIUB Notice Checker](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/aiub-notice-checker.yml/badge.svg)](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/aiub-notice-checker.yml)
+[![Facebook](https://raw.githubusercontent.com/gauravghongde/social-icons/master/SVG/Color/Facebook.svg)](https://facebook.com/aiubnotice) [![Telegram](https://raw.githubusercontent.com/gauravghongde/social-icons/master/SVG/Color/Telegram.svg)](https://t.me/aiubnotice) [![Twitter](https://raw.githubusercontent.com/gauravghongde/social-icons/master/SVG/Color/Twitter.svg)](https://twitter.com/aiubnotice) [![LinkedIn](https://raw.githubusercontent.com/gauravghongde/social-icons/master/SVG/Color/LinkedIN.svg)](https://linkedin.com/in/aiubnotice) [![Discord](https://raw.githubusercontent.com/gauravghongde/social-icons/master/SVG/Color/Discord.svg)](https://discord.gg/M8XVrA2Fnb) <br /> [![AIUB Notice Checker](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/aiub-notice-checker.yml/badge.svg)](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/aiub-notice-checker.yml)
 
 A Python script that checks for new or edited posts on the [AIUB Notice page](https://aiub.cf/category/notices/) and sends updates to a specified Telegram channel.
 
@@ -31,9 +31,9 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## Maintenance
+## Contribution
 
-The script will automatically check for updates and update itself if necessary. It will then check if the AIUB website is up and visit the notice page to check for new or edited posts. If it finds any, it will send updates to the specified Telegram channel.
+If the administrators make any changes and break things, we will only need to update the XPath. I would be incredibly grateful for any pull requests that you might have. Just remember, there is no need to update the script version if you have made changes – it will be updated automatically.
 
 ## How it works
 
