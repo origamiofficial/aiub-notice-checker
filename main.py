@@ -2,6 +2,7 @@ import requests
 from lxml import html
 import sqlite3
 import os
+import sys
 
 # Telegram information
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -50,11 +51,14 @@ try:
         lines = response.text.split("\n")
         for line in lines:
             if line.startswith("SCRIPT_VERSION"):
-                online_version = line.split("=")[1].strip()
+                ONLINE_VERSION = line.split("=")[1].strip().strip('"')
                 break
+        # Print current and online versions
+        print(f"Current version: {SCRIPT_VERSION}")
+        print(f"Online version: {ONLINE_VERSION}")
         # Compare versions and update if necessary
-        if online_version > SCRIPT_VERSION:
-            print(f"New version {online_version} available. Updating script...")
+        if ONLINE_VERSION > SCRIPT_VERSION:
+            print(f"New version {ONLINE_VERSION} available. Updating script...")
             # Download new version of script
             with open("main.py", "w") as f:
                 f.write(response.text)
