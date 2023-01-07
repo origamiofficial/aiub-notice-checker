@@ -75,6 +75,39 @@ except requests.ConnectionError as e:
     print(f"AIUB website is down: {e}. Exiting script.")
     exit()
 
+def check_xpath(tree, xpaths):
+    invalid_xpaths = []
+    for xpath_name, xpath in xpaths.items():
+        element_name = xpath.split("/")[-1]
+        elements = tree.xpath(xpath)
+        if len(elements) == 0:
+            invalid_xpaths.append((xpath_name, element_name))
+    return invalid_xpaths
+
+try:
+    page = requests.get(WEBSITE_URL)
+    tree = html.fromstring(page.content)
+    xpaths = {
+        "POST_XPATH": POST_XPATH,
+        "TITLE_XPATH": TITLE_XPATH,
+        "LINK_XPATH": LINK_XPATH,
+        "DESCRIPTION_XPATH": DESCRIPTION_XPATH,
+        "DAY_XPATH": DAY_XPATH,
+        "MONTH_XPATH": MONTH_XPATH,
+        "YEAR_XPATH": YEAR_XPATH
+    }
+    invalid_xpaths = check_xpath(tree, xpaths)
+    if invalid_xpaths:
+        print(f"Error: Invalid XPath expressions found:")
+        for xpath_name, element_name in invalid_xpaths:
+            print(f"{xpath_name}: No {element_name} found")
+        print("XPath expressions may need to be updated. Exiting script.")
+        exit()
+except Exception as e:
+    print(f"Error checking XPath expressions: {e}. XPath expressions may need to be updated. Exiting script.")
+    exit()
+print("All XPath expressions are valid.")
+
 # Visit AIUB Notice page and check for new posts
 print("Checking for new posts on AIUB Notice page...")
 try:
@@ -87,10 +120,41 @@ except Exception as e:
     exit()
 
 # Check if database file exists
+print(f"Checking if database file exists...")
 if os.path.exists(DB_NAME):
     print(f"Existing SQLite database file found.")
+    # Open connection to database
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    
+    # Count number of notices in database
+    c.execute(f"SELECT COUNT(*) FROM {DB_TABLE_NAME}")
+    notice_count = c.fetchone()[0]
+    print(f"{notice_count} notices found in database.")
+    
+    # Check for moved notices in database
+    print(f"Checking for moved notices in website...")
+    c.execute(f"SELECT link, title FROM {DB_TABLE_NAME}")
+    database_links = c.fetchall()
+    for db_link, title in database_links:
+        # Check if link is still on AIUB Notice page
+        found = False
+        for post in posts:
+            web_link = "".join(post.xpath(LINK_XPATH)).strip()
+            if db_link == web_link:
+                found = True
+                break
+        if not found:
+            # Link not found on AIUB Notice page, delete from database
+            c.execute(f"DELETE FROM {DB_TABLE_NAME} WHERE link=?", (db_link,))
+            conn.commit()
+            print(f"Deleting Notice: '{title}' from database.")
+
+    # Close connection to database
+    conn.commit()
+    conn.close()
 else:
-    print(f"Existing SQLite database file not found. Creating new file...")
+    print(f"Existing SQLite database file NOT found. Creating new...")
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute(
@@ -105,7 +169,7 @@ else:
         ")"
     )
     conn.commit()
-    conn.close()
+    print(f"New SQLite database file created.")
 
 # Connect to database
 conn = sqlite3.connect(DB_NAME)
@@ -122,7 +186,7 @@ def send_telegram_message(message):
     }
     try:
         response = requests.post(url, json=payload)
-        print(f"Sending notice: {title}")
+        print(f"Sending Notice: '{title}'.")
         # Check if the request was successful, and print the response from the server
         if response.status_code == 200:
             print(f"Successfully sent message to Telegram.")
@@ -185,28 +249,6 @@ for post in posts:
                 link=link
             )
             send_telegram_message(message)
-
-# Check for moved notices
-c.execute(f"SELECT link, title FROM {DB_TABLE_NAME}")
-results = c.fetchall()
-for result in results:
-    link = result[0]
-    title = result[1]
-    # Check if link is still present on AIUB Notice page
-    page = requests.get(WEBSITE_URL)
-    tree = html.fromstring(page.content)
-    posts = tree.xpath(POST_XPATH)
-    found = False
-    for post in posts:
-        post_link = post.xpath(LINK_XPATH)[0]
-        if post_link == link:
-            found = True
-            break
-    if not found:
-        # Link not found on AIUB Notice page, delete from database
-        c.execute(f"DELETE FROM {DB_TABLE_NAME} WHERE link=?", (link,))
-        conn.commit()
-        print(f"Notice '{title}' has been deleted.")
 
 # Close database connection
 conn.commit()
