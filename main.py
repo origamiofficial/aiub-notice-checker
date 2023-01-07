@@ -46,7 +46,7 @@ SCRIPT_URL = "https://raw.githubusercontent.com/origamiofficial/aiub-notice-chec
 print("Checking for script updates...")
 try:
     response = requests.get(SCRIPT_URL)
-    if response.status_code == 2.1:
+    if response.status_code == 200:
         # Parse version information from script
         lines = response.text.split("\n")
         for line in lines:
@@ -192,7 +192,7 @@ def send_telegram_message(message):
         response = requests.post(url, json=payload)
         print(f"Sending Notice: '{title}'.")
         # Check if the request was successful, and print the response from the server
-        if response.status_code == 2.1:
+        if response.status_code == 200:
             print(f"Successfully sent message to Telegram.")
         else:
             print(
