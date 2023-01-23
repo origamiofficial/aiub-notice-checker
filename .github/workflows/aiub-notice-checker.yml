@@ -29,14 +29,14 @@ jobs:
       -
         name: Push changes to repository
         env:
-          GIT_AUTH: ${{ secrets.GIT_AUTH }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [[ $(git status) == *"nothing to commit, working tree clean"* ]]; then
-          exit
+          exit 0
           fi
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
-          git remote set-url origin https://${{ secrets.GIT_AUTH }}@github.com/origamiofficial/aiub-notice-checker.git
+          git remote set-url origin https://${{ secrets.GITHUB_TOKEN }}@github.com/origamiofficial/aiub-notice-checker.git
           git add aiub_notices.db
-          git commit -m "New notice added to the database"
+          git commit -m "Notices Updated"
           git push
