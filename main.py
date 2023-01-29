@@ -118,7 +118,11 @@ try:
     page = requests.get(WEBSITE_URL)
     tree = html.fromstring(page.content)
     posts = tree.xpath(POST_XPATH)
-    print(f"{len(posts)} posts found on AIUB Notice page.")
+    if len(posts) == 0:
+        print("NO POSTS WERE FOUND on the AIUB Notice page. Check if XPath expressions need to be updated. Exiting script.")
+        exit()
+    else:
+        print(f"{len(posts)} posts found on AIUB Notice page.")
 except Exception as e:
     print(f"Error checking for new posts on AIUB Notice page: {e}. Check if XPath expressions need to be updated. Exiting script.")
     exit()
