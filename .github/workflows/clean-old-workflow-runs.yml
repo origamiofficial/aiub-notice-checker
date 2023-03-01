@@ -2,8 +2,8 @@ name: Cleanup Old Workflow
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 0 * * 0'
-# Run monthly, at 00:00 on the 1st day of month.
+    - cron: '0 * * * *' # Temporary setup to cleanup!
+# Default runs at 00:00, every 3 days. [0 0 * * 0]
 
 jobs:
   del_runs:
@@ -15,4 +15,4 @@ jobs:
           token: ${{ github.token }}
           repository: ${{ github.repository }}
           retain_days: 7
-          keep_minimum_runs: 500
+          keep_minimum_runs: 1500
