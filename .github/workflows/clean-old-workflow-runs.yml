@@ -2,8 +2,8 @@ name: Cleanup Old Workflow
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 * * * *' # Temporary setup to cleanup!
-# Default runs at 00:00, every 3 days. [0 0 * * 0]
+    - cron: '0 0 * * 0' # Temporary setup to cleanup!
+# Default runs weekly at 00:00, only on Sunday. [0 0 * * 0]
 
 jobs:
   del_runs:
