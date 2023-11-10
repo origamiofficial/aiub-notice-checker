@@ -8,7 +8,7 @@ jobs:
   update_version:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v3
         with:
           fetch-depth: 2
       # Check if main.py has been modified since the last commit
@@ -26,7 +26,7 @@ jobs:
             PREVIOUS_SCRIPT_VERSION=$(git show HEAD~:main.py | grep "SCRIPT_VERSION = " | cut -d "=" -f 2 | tr -d " '\"")
 
             # Get the current SCRIPT_VERSION from main.py
-            SCRIPT_VERSION=$(grep "SCRIPT_VERSION = " main.py | cut -d "=" -f 2 | tr -d " '\"")
+            SCRIPT_VERSION=$(grep "SCRIPT_VERSION = " main.py | cut -d '"' -f 2)
 
             # Check if the SCRIPT_VERSION has been manually updated
             if [[ "$SCRIPT_VERSION" != "$PREVIOUS_SCRIPT_VERSION" ]]; then
@@ -35,10 +35,10 @@ jobs:
             else
               echo 'SCRIPT_VERSION has NOT been manually updated'
               # Increment the SCRIPT_VERSION by 0.1
-              NEW_SCRIPT_VERSION=$(awk -v x=$SCRIPT_VERSION 'BEGIN { printf "%.1f", x+0.1 }')
+              NEW_SCRIPT_VERSION=$(awk -v prev="$SCRIPT_VERSION" 'BEGIN { printf "%.1f", prev+0.1 }')
 
               # Update the SCRIPT_VERSION in main.py
-              sed -i "s/$SCRIPT_VERSION/$NEW_SCRIPT_VERSION/g" main.py
+              sed -i "s/SCRIPT_VERSION = \"$SCRIPT_VERSION\"/SCRIPT_VERSION = \"$NEW_SCRIPT_VERSION\"/" main.py
               if [[ $(git status) == *"nothing to commit, working tree clean"* ]]; then
               echo "Nothing to commit, working tree clean"
               exit 0
