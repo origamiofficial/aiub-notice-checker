@@ -9,7 +9,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TELEGRAM_BOT_API_KEY = os.environ["TELEGRAM_BOT_API_KEY"]
 
 # URL and XPath information for AIUB Notice page
-WEBSITE_URL = "https://aiub.cf/category/notices/"
+WEBSITE_URL = "https://www.aiub.edu/category/notices/"
 POST_XPATH = "//ul[@class='event-list']/li"
 TITLE_XPATH = ".//h2[@class='title']/text()"
 LINK_XPATH = ".//a[@class='info-link']/@href"
