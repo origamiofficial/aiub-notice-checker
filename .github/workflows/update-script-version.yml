@@ -8,7 +8,7 @@ jobs:
   update_version:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 2
       # Check if main.py has been modified since the last commit
