@@ -6,6 +6,7 @@ import sys
 
 # Telegram information
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
 TELEGRAM_BOT_API_KEY = os.environ["TELEGRAM_BOT_API_KEY"]
 
 # URL and XPath information for AIUB Notice page
@@ -79,6 +80,21 @@ except requests.ConnectionError as e:
     print(f"AIUB website is down: {e}. Exiting script.")
     exit()
 
+# Function to send admin notification
+def send_admin_notification(message):
+    admin_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_API_KEY}/sendMessage"
+    admin_payload = {
+        "chat_id": TELEGRAM_ADMIN_CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": "true"
+    }
+    try:
+        admin_response = requests.post(admin_url, json=admin_payload)
+        if admin_response.status_code != 200:
+            print(f"Error sending admin notification: {admin_response.text}")
+    except Exception as e:
+        print(f"Error sending admin notification: {e}")
+
 def check_xpath(tree, xpaths):
     invalid_xpaths = []
     for xpath_name, xpath in xpaths.items():
@@ -86,6 +102,9 @@ def check_xpath(tree, xpaths):
         elements = tree.xpath(xpath)
         if len(elements) == 0:
             invalid_xpaths.append((xpath_name, element_name))
+            # Send admin notification for invalid XPath
+            admin_notification = f"AIUB Notice\n\nInvalid XPath: {xpath_name} - No {element_name} found.\n\nXPath expressions may need to be updated."
+            send_admin_notification(admin_notification)
     return invalid_xpaths
 
 try:
