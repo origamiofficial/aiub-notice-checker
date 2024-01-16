@@ -13,7 +13,7 @@ jobs:
           fetch-depth: 2
       # Check if main.py has been modified since the last commit
       - name: Update Script Version
-        id: update-script
+        id: version_code_check
         env:
           GIT_AUTH: ${{ secrets.GIT_AUTH }}
         run: |
@@ -49,5 +49,17 @@ jobs:
               git add main.py
               git commit -m "Bump Script Version"
               git push
+              echo "New Version: $NEW_SCRIPT_VERSION"
+              echo VERSION_CODE=$NEW_SCRIPT_VERSION >> $GITHUB_OUTPUT
             fi
           fi
+      -
+        name: Create release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: ./main.py
+          release_name: ${{ steps.version_code_check.outputs.VERSION_CODE }}
+          tag: ${{ steps.version_code_check.outputs.VERSION_CODE }}
+          make_latest: true
+          overwrite: true
