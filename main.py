@@ -29,7 +29,7 @@ NEW_NOTICE_MESSAGE_FORMAT = (
 
 # Message format for edited notices
 EDITED_NOTICE_MESSAGE_FORMAT = (
-    "[Edited] {title}\n\n"
+    "[EDITED] {title}\n\n"
     "Date: {day} {month} {year}\n\n"
     "{description}\n\n"
     "https://www.aiub.edu{link}"
@@ -281,4 +281,4 @@ for post in posts:
 conn.commit()
 conn.close()
 
-print("Script completed.")
+print("Script Completed.")
