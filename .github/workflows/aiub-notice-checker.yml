@@ -28,16 +28,14 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python main.py
       -
-        name: Push changes to repository
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        name: Commit files
         run: |
-          if [[ $(git status) == *"nothing to commit, working tree clean"* ]]; then
-          exit 0
-          fi
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
-          git remote set-url origin https://${{ secrets.GITHUB_TOKEN }}@github.com/origamiofficial/aiub-notice-checker.git
-          git add aiub_notices.db
-          git commit -m "Notices Updated"
-          git push
+          git commit -a -m "Notices Updated"
+      -
+        name: Push changes to repository
+        uses: ad-m/github-push-action@master
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          force: true
