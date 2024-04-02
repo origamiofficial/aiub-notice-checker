@@ -4,10 +4,11 @@ import sqlite3
 import os
 import sys
 
-# Telegram information
+# Environment variable information
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
 TELEGRAM_BOT_API_KEY = os.environ["TELEGRAM_BOT_API_KEY"]
+GITHUB_RUN_ID = os.environ["GITHUB_RUN_ID"]
 
 # URL and XPath information for AIUB Notice page
 WEBSITE_URL = "https://www.aiub.edu/category/notices/"
