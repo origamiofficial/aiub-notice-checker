@@ -171,11 +171,11 @@ if os.path.exists(DB_NAME):
             if db_link == web_link:
                 found = True
                 break
-        if not found:
+        #if not found:
             # Link not found on AIUB Notice page, delete from database
-            c.execute(f"DELETE FROM {DB_TABLE_NAME} WHERE link=?", (db_link,))
-            conn.commit()
-            print(f"Deleting Notice: '{title}' from database.")
+            #c.execute(f"DELETE FROM {DB_TABLE_NAME} WHERE link=?", (db_link,))
+            #conn.commit()
+            #print(f"Deleting Notice: '{title}' from database.")
 
     # Close connection to database
     conn.commit()
