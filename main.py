@@ -25,7 +25,7 @@ NEW_NOTICE_MESSAGE_FORMAT = (
     "{title}\n\n"
     "Date: {day} {month} {year}\n\n"
     "{description}\n\n"
-    "https://www.aiub.edu{link} | {GITHUB_RUN_ID}"
+    "https://www.aiub.edu{link} | {gh_run_id}"
 )
 
 # Message format for edited notices
@@ -33,7 +33,7 @@ EDITED_NOTICE_MESSAGE_FORMAT = (
     "[EDITED] {title}\n\n"
     "Date: {day} {month} {year}\n\n"
     "{description}\n\n"
-    "https://www.aiub.edu{link} | {GITHUB_RUN_ID}"
+    "https://www.aiub.edu{link} | {gh_run_id}"
 )
 
 # SQLite database information
@@ -252,7 +252,8 @@ for post in posts:
             month=month,
             year=year,
             description=description,
-            link=link
+            link=link,
+            gh_run_id=GITHUB_RUN_ID
         )
         send_telegram_message(message)
     else:
@@ -274,7 +275,8 @@ for post in posts:
                 month=month,
                 year=year,
                 description=description,
-                link=link
+                link=link,
+                gh_run_id=GITHUB_RUN_ID
             )
             send_telegram_message(message)
 
