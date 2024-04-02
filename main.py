@@ -25,7 +25,7 @@ NEW_NOTICE_MESSAGE_FORMAT = (
     "{title}\n\n"
     "Date: {day} {month} {year}\n\n"
     "{description}\n\n"
-    "https://www.aiub.edu{link}"
+    "https://www.aiub.edu{link} | {GITHUB_RUN_ID}"
 )
 
 # Message format for edited notices
@@ -33,7 +33,7 @@ EDITED_NOTICE_MESSAGE_FORMAT = (
     "[EDITED] {title}\n\n"
     "Date: {day} {month} {year}\n\n"
     "{description}\n\n"
-    "https://www.aiub.edu{link}"
+    "https://www.aiub.edu{link} | {GITHUB_RUN_ID}"
 )
 
 # SQLite database information
@@ -41,7 +41,7 @@ DB_NAME = "aiub_notices.db"
 DB_TABLE_NAME = "notices"
 
 # Script version
-SCRIPT_VERSION = "2.6"
+SCRIPT_VERSION = "2.7"
 SCRIPT_URL = "https://raw.githubusercontent.com/origamiofficial/aiub-notice-checker/main/main.py"
 
 # Check for script updates
