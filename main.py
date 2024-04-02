@@ -25,7 +25,7 @@ NEW_NOTICE_MESSAGE_FORMAT = (
     "{title}\n\n"
     "Date: {day} {month} {year}\n\n"
     "{description}\n\n"
-    "https://www.aiub.edu{link}"
+    "https://www.aiub.edu{link} | {GITHUB_RUN_ID}"
 )
 
 # Message format for edited notices
@@ -33,7 +33,7 @@ EDITED_NOTICE_MESSAGE_FORMAT = (
     "[EDITED] {title}\n\n"
     "Date: {day} {month} {year}\n\n"
     "{description}\n\n"
-    "https://www.aiub.edu{link}"
+    "https://www.aiub.edu{link} | {GITHUB_RUN_ID}"
 )
 
 # SQLite database information
