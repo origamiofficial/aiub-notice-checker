@@ -8,7 +8,7 @@ import sys
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
 TELEGRAM_BOT_API_KEY = os.environ["TELEGRAM_BOT_API_KEY"]
-GITHUB_RUN_ID = os.environ["GITHUB_RUN_ID"]
+GITHUB_RUN_NUMBER = os.environ["GITHUB_RUN_NUMBER"]
 
 # URL and XPath information for AIUB Notice page
 WEBSITE_URL = "https://www.aiub.edu/category/notices/"
@@ -25,7 +25,7 @@ NEW_NOTICE_MESSAGE_FORMAT = (
     "{title}\n\n"
     "Date: {day} {month} {year}\n\n"
     "{description}\n\n"
-    "https://www.aiub.edu{link} | {gh_run_id}"
+    "https://www.aiub.edu{link} | {gh_run_no}"
 )
 
 # Message format for edited notices
@@ -33,7 +33,7 @@ EDITED_NOTICE_MESSAGE_FORMAT = (
     "[EDITED] {title}\n\n"
     "Date: {day} {month} {year}\n\n"
     "{description}\n\n"
-    "https://www.aiub.edu{link} | {gh_run_id}"
+    "https://www.aiub.edu{link} | {gh_run_no}"
 )
 
 # SQLite database information
@@ -253,7 +253,7 @@ for post in posts:
             year=year,
             description=description,
             link=link,
-            gh_run_id=GITHUB_RUN_ID
+            gh_run_no=GITHUB_RUN_NUMBER
         )
         send_telegram_message(message)
     else:
@@ -276,7 +276,7 @@ for post in posts:
                 year=year,
                 description=description,
                 link=link,
-                gh_run_id=GITHUB_RUN_ID
+                gh_run_no=GITHUB_RUN_NUMBER
             )
             send_telegram_message(message)
 
