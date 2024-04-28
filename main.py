@@ -9,9 +9,11 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
 TELEGRAM_BOT_API_KEY = os.environ["TELEGRAM_BOT_API_KEY"]
 GITHUB_RUN_NUMBER = os.environ["GITHUB_RUN_NUMBER"]
+PROTOCOLS = ["https://", "http://"]
+NOTICE_PAGE = "www.aiub.edu/category/notices/"
+WEBSITE_URL = None # DO NOT CHANGE
 
-# URL and XPath information for AIUB Notice page
-WEBSITE_URL = "https://www.aiub.edu/category/notices/"
+# XPath information for AIUB Notice page
 POST_XPATH = "//ul[@class='event-list']/li"
 TITLE_XPATH = ".//h2[@class='title']/text()"
 LINK_XPATH = ".//a[@class='info-link']/@href"
@@ -74,11 +76,18 @@ except Exception as e:
 
 # Check if AIUB website is up
 print("Checking if AIUB website is up...")
-try:
-    requests.get(WEBSITE_URL)
-    print("AIUB website is up.")
-except requests.ConnectionError as e:
-    print(f"AIUB website is down: {e}. Exiting script.")
+for protocol in PROTOCOLS:
+    try:
+        response = requests.get(protocol + NOTICE_PAGE)
+        if response.status_code == 200:
+            WEBSITE_URL = protocol + NOTICE_PAGE
+            print(f"AIUB website is up. Protocol: {protocol} is working.")
+            break
+    except requests.exceptions.RequestException as e:
+        print(f"Error trying {protocol}: {e}")
+
+if WEBSITE_URL is None:
+    print("AIUB website is down. Exiting script.")
     exit()
 
 # Function to send admin notification
