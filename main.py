@@ -3,6 +3,8 @@ from lxml import html
 import sqlite3
 import os
 import sys
+import xml.etree.ElementTree as ET
+import datetime
 
 # Environment variable information
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -10,7 +12,7 @@ TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
 TELEGRAM_BOT_API_KEY = os.environ["TELEGRAM_BOT_API_KEY"]
 GITHUB_RUN_NUMBER = os.environ["GITHUB_RUN_NUMBER"]
 PROTOCOLS = ["https://", "http://"]
-NOTICE_PAGE = "www.aiub.edu/category/notices/"
+NOTICE_PAGE = "www.aiub.edu/category/notices"
 WEBSITE_URL = None # DO NOT CHANGE
 
 # XPath information for AIUB Notice page
@@ -41,6 +43,10 @@ EDITED_NOTICE_MESSAGE_FORMAT = (
 # SQLite database information
 DB_NAME = "aiub_notices.db"
 DB_TABLE_NAME = "notices"
+
+# RSS feed information
+RSS_FEED_FILE = "rss.xml"
+DEFAULT_TIME = "00:00:00"
 
 # Script version
 SCRIPT_VERSION = "3.0"
@@ -288,6 +294,45 @@ for post in posts:
                 gh_run_no=GITHUB_RUN_NUMBER
             )
             send_telegram_message(message)
+
+# Generate RSS feed
+def generate_rss_feed():
+    c.execute(f"SELECT title, description, link, day, month, year FROM {DB_TABLE_NAME} ORDER BY year DESC, month DESC, day DESC")
+    notices = c.fetchall()
+    # Root element
+    rss = ET.Element("rss", version="2.0")
+    channel = ET.SubElement(rss, "channel")
+    # Channel elements
+    ET.SubElement(channel, "title").text = "AIUB Notices"
+    ET.SubElement(channel, "link").text = f"https://{NOTICE_PAGE}"
+    ET.SubElement(channel, "description").text = "Latest notices from AIUB."
+    # Add notices to RSS feed
+    for notice in notices:
+        title, description, link, day, month_name, year = notice
+		# Extract month as a number (assuming month names are stored as strings)
+        month_number = datetime.datetime.strptime(month_name, "%B").month
+        # Generate RFC-822 date-time format with default time
+        pub_date = datetime.datetime(year=int(year), month=month_number, day=int(day), hour=int(DEFAULT_TIME.split(":")[0]), minute=int(DEFAULT_TIME.split(":")[1]), second=int(DEFAULT_TIME.split(":")[2])).strftime("%a, %d %b %Y %H:%M:%S GMT")
+        item = ET.SubElement(channel, "item")
+        ET.SubElement(item, "title").text = title
+        ET.SubElement(item, "description").text = description
+        ET.SubElement(item, "link").text = f"https://www.aiub.edu{link}"
+        ET.SubElement(item, "pubDate").text = pub_date
+        # Add guid element
+        guid = ET.SubElement(item, "guid")
+        guid.text = f"https://www.aiub.edu{link}"
+    # Add atom:link with rel="self"
+    self_link = ET.SubElement(channel, "{http://www.w3.org/2005/Atom}link")
+    self_link.set("rel", "self")
+    self_link.set("type", "application/rss+xml")
+    self_link.set("href", "https://raw.githubusercontent.com/origamiofficial/TestLab/main/rss.xml")
+    # Write to file
+    tree = ET.ElementTree(rss)
+    tree.write(RSS_FEED_FILE, encoding="UTF-8", xml_declaration=True, method="xml")
+    print(f"RSS feed generated at {RSS_FEED_FILE}")
+
+# Generate RSS feed after processing notices
+generate_rss_feed()
 
 # Close database connection
 conn.commit()
