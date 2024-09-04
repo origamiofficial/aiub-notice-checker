@@ -315,6 +315,8 @@ def generate_rss_feed():
         pub_date = datetime.datetime(year=int(year), month=month_number, day=int(day), hour=int(DEFAULT_TIME.split(":")[0]), minute=int(DEFAULT_TIME.split(":")[1]), second=int(DEFAULT_TIME.split(":")[2])).strftime("%a, %d %b %Y %H:%M:%S GMT")
         item = ET.SubElement(channel, "item")
         ET.SubElement(item, "title").text = title
+        # Escape special characters
+        description = description.replace("&", "&amp;")
         ET.SubElement(item, "description").text = description
         ET.SubElement(item, "link").text = f"https://www.aiub.edu{link}"
         ET.SubElement(item, "pubDate").text = pub_date
