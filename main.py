@@ -309,7 +309,7 @@ def generate_rss_feed():
     # Add notices to RSS feed
     for notice in notices:
         title, description, link, day, month_name, year = notice
-		# Extract month as a number (assuming month names are stored as strings)
+        # Extract month as a number (assuming month names are stored as strings)
         month_number = datetime.datetime.strptime(month_name, "%B").month
         # Generate RFC-822 date-time format with default time
         pub_date = datetime.datetime(year=int(year), month=month_number, day=int(day), hour=int(DEFAULT_TIME.split(":")[0]), minute=int(DEFAULT_TIME.split(":")[1]), second=int(DEFAULT_TIME.split(":")[2])).strftime("%a, %d %b %Y %H:%M:%S GMT")
@@ -327,7 +327,7 @@ def generate_rss_feed():
     self_link = ET.SubElement(channel, "{http://www.w3.org/2005/Atom}link")
     self_link.set("rel", "self")
     self_link.set("type", "application/rss+xml")
-    self_link.set("href", "https://raw.githubusercontent.com/origamiofficial/TestLab/main/rss.xml")
+    self_link.set("href", "https://raw.githubusercontent.com/origamiofficial/aiub-notice-checker/main/rss.xml")
     # Write to file
     tree = ET.ElementTree(rss)
     tree.write(RSS_FEED_FILE, encoding="UTF-8", xml_declaration=True, method="xml")
