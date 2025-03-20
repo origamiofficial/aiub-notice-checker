@@ -16,13 +16,13 @@ NOTICE_PAGE = "www.aiub.edu/category/notices"
 WEBSITE_URL = None # DO NOT CHANGE
 
 # XPath information for AIUB Notice page
-POST_XPATH = "//ul[@class='event-list']/li"
+POST_XPATH = "//div[@class='category-notices']/ul/li"
 TITLE_XPATH = ".//h2[@class='title']/text()"
 LINK_XPATH = ".//a[@class='info-link']/@href"
 DESCRIPTION_XPATH = ".//p[@class='desc']/text()"
-DAY_XPATH = ".//time/span[@class='day']/text()"
-MONTH_XPATH = ".//time/span[@class='month']/text()"
-YEAR_XPATH = ".//time/span[@class='year']/text()"
+DAY_XPATH = ".//div[@class='date-custom']/text()[1]"
+MONTH_XPATH = ".//div[@class='date-custom']/text()[2]"
+YEAR_XPATH = ".//div[@class='date-custom']/span/text()"
 
 # Message format for new notices
 NEW_NOTICE_MESSAGE_FORMAT = (
