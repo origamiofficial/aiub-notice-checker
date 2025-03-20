@@ -20,9 +20,9 @@ POST_XPATH = "//div[contains(@class, 'notification')]"
 TITLE_XPATH = ".//h2[@class='title']/text()"
 LINK_XPATH = ".//a[@class='info-link']/@href"
 DESCRIPTION_XPATH = ".//p[@class='desc']/text()"
-DAY_XPATH = ".//div[contains(@class, 'date-custom')]/text()[1]"
-MONTH_XPATH = ".//div[contains(@class, 'date-custom')]/text()[2]"
-YEAR_XPATH = ".//div[contains(@class, 'date-custom')]/span/text()"
+DAY_XPATH = ".//div[contains(@class, 'date-custom')]/normalize-space(text()[1])"
+MONTH_XPATH = ".//div[contains(@class, 'date-custom')]/normalize-space(text()[2])"
+YEAR_XPATH = ".//div[contains(@class, 'date-custom')]/span/normalize-space(text())"
 
 # Message format for new notices
 NEW_NOTICE_MESSAGE_FORMAT = (
