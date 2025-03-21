@@ -28,7 +28,7 @@ YEAR_XPATH = ".//div[contains(@class, 'date-custom')]/span/text()"
 # Message format for new notices
 NEW_NOTICE_MESSAGE_FORMAT = (
     "{title}\n\n"
-    "Date: {day} {month} {year}\n\n"
+    "Date: {day} {month}{year}\n\n"
     "{description}\n\n"
     "https://www.aiub.edu{link}#{gh_run_no}"
 )
@@ -36,7 +36,7 @@ NEW_NOTICE_MESSAGE_FORMAT = (
 # Message format for edited notices
 EDITED_NOTICE_MESSAGE_FORMAT = (
     "[EDITED] {title}\n\n"
-    "Date: {day} {month} {year}\n\n"
+    "Date: {day} {month}{year}\n\n"
     "{description}\n\n"
     "https://www.aiub.edu{link}#{gh_run_no}"
 )
@@ -244,8 +244,7 @@ def send_telegram_message(message):
 
 # Removes unwanted spaces, ensuring proper formatting
 def clean_text(text):
-    return re.sub(r'\s{2,}', ' ', text).strip()
-    return cleaned if cleaned else default  # Return default if empty
+    return re.sub(r'\s+', ' ', text).strip()
 
 # Iterate through posts and check for new or edited notices
 for post in posts:
@@ -316,7 +315,7 @@ def generate_rss_feed():
     for notice in notices:
         title, description, link, day, month_name, year = notice
         # Extract month as a number (assuming month names are stored as strings)
-        month_number = datetime.datetime.strptime(month_name, "%B").month
+        month_number = datetime.datetime.strptime(month_name, "%b").month
         # Generate RFC-822 date-time format with default time
         pub_date = datetime.datetime(year=int(year), month=month_number, day=int(day), hour=int(DEFAULT_TIME.split(":")[0]), minute=int(DEFAULT_TIME.split(":")[1]), second=int(DEFAULT_TIME.split(":")[2])).strftime("%a, %d %b %Y %H:%M:%S GMT")
         item = ET.SubElement(channel, "item")
