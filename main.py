@@ -5,6 +5,7 @@ import os
 import sys
 import xml.etree.ElementTree as ET
 import datetime
+import re
 
 # Environment variable information
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
@@ -243,7 +244,7 @@ def send_telegram_message(message):
 
 # Removes unwanted spaces, ensuring proper formatting
 def clean_text(text):
-    return text.strip().lstrip()
+    return re.sub(r'\s+', ' ', text).strip()
 
 # Iterate through posts and check for new or edited notices
 for post in posts:
