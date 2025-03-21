@@ -244,7 +244,7 @@ def send_telegram_message(message):
 
 # Removes unwanted spaces, ensuring proper formatting
 def clean_text(text):
-    return re.sub(r'\s+', ' ', text).strip()
+    return re.sub(r'\s+', ' ', text).strip().replace("  ", " ")
 
 # Iterate through posts and check for new or edited notices
 for post in posts:
