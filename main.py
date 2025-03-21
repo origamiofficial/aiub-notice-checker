@@ -241,15 +241,19 @@ def send_telegram_message(message):
     except Exception as e:
         print(f"Error sending message to Telegram: {e}")
 
+# Removes unwanted spaces, ensuring proper formatting
+def clean_text(text):
+    return text.strip().lstrip()
+
 # Iterate through posts and check for new or edited notices
 for post in posts:
     # Retrieve data for post
     title = "".join(post.xpath(TITLE_XPATH)).strip()
     link = "".join(post.xpath(LINK_XPATH)).strip()
     description = "".join(post.xpath(DESCRIPTION_XPATH)).strip()
-    day = "".join(post.xpath(DAY_XPATH)).strip()
-    month = "".join(post.xpath(MONTH_XPATH)).strip()
-    year = "".join(post.xpath(YEAR_XPATH)).strip()
+    day = clean_text("".join(post.xpath(DAY_XPATH)))
+    month = clean_text("".join(post.xpath(MONTH_XPATH)))
+    year = clean_text("".join(post.xpath(YEAR_XPATH)))
     # Check if notice has been seen before
     c.execute(f"SELECT * FROM {DB_TABLE_NAME} WHERE link=?", (link,))
     result = c.fetchone()
