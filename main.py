@@ -50,7 +50,7 @@ RSS_FEED_FILE = "rss.xml"
 DEFAULT_TIME = "00:00:00"
 
 # Script version
-SCRIPT_VERSION = "3.8"
+SCRIPT_VERSION = "3.9"
 SCRIPT_URL = "https://raw.githubusercontent.com/origamiofficial/aiub-notice-checker/main/main.py"
 
 # Check for script updates
