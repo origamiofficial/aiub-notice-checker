@@ -17,18 +17,18 @@ NOTICE_PAGE = "www.aiub.edu/category/notices"
 WEBSITE_URL = None # DO NOT CHANGE
 
 # XPath information for AIUB Notice page
-POST_XPATH = "//div[contains(@class, 'notification')]"
+POST_XPATH = "//div[contains(@class, 'notification') and not(ancestor::div[contains(@class, 'notification')])]"
 TITLE_XPATH = ".//h2[@class='title']/text()"
 LINK_XPATH = ".//a[@class='info-link']/@href"
 DESCRIPTION_XPATH = ".//p[@class='desc']/text()"
-DAY_XPATH = ".//div[contains(@class, 'date-custom')]/text()[1]"
-MONTH_XPATH = ".//div[contains(@class, 'date-custom')]/text()[2]"
+DAY_XPATH = ".//div[contains(@class, 'date-custom')]/text()[normalize-space()][1]"
+#MONTH_XPATH = "None" # DISABLED
 YEAR_XPATH = ".//div[contains(@class, 'date-custom')]/span/text()"
 
 # Message format for new notices
 NEW_NOTICE_MESSAGE_FORMAT = (
     "{title}\n\n"
-    "Date: {day} {month}{year}\n\n"
+    "Date: {day} {month} {year}\n\n"
     "{description}\n\n"
     "https://www.aiub.edu{link}#{gh_run_no}"
 )
@@ -36,7 +36,7 @@ NEW_NOTICE_MESSAGE_FORMAT = (
 # Message format for edited notices
 EDITED_NOTICE_MESSAGE_FORMAT = (
     "[EDITED] {title}\n\n"
-    "Date: {day} {month}{year}\n\n"
+    "Date: {day} {month} {year}\n\n"
     "{description}\n\n"
     "https://www.aiub.edu{link}#{gh_run_no}"
 )
@@ -133,7 +133,7 @@ try:
         "LINK_XPATH": LINK_XPATH,
         "DESCRIPTION_XPATH": DESCRIPTION_XPATH,
         "DAY_XPATH": DAY_XPATH,
-        "MONTH_XPATH": MONTH_XPATH,
+        #"MONTH_XPATH": MONTH_XPATH, # DISABLED
         "YEAR_XPATH": YEAR_XPATH
     }
     invalid_xpaths = check_xpath(tree, xpaths)
@@ -252,9 +252,13 @@ for post in posts:
     title = "".join(post.xpath(TITLE_XPATH)).strip()
     link = "".join(post.xpath(LINK_XPATH)).strip()
     description = "".join(post.xpath(DESCRIPTION_XPATH)).strip()
-    day = clean_text("".join(post.xpath(DAY_XPATH)))
-    month = clean_text("".join(post.xpath(MONTH_XPATH)))
+    day_month = clean_text("".join(post.xpath(DAY_XPATH))) # COMBINED
+    #month = clean_text("".join(post.xpath(MONTH_XPATH)))  # DISABLED
     year = clean_text("".join(post.xpath(YEAR_XPATH)))
+    
+    # Split day and month
+    day, month = day_month.split()
+    
     # Check if notice has been seen before
     c.execute(f"SELECT * FROM {DB_TABLE_NAME} WHERE link=?", (link,))
     result = c.fetchone()
