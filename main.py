@@ -1,352 +1,868 @@
-import requests
-from lxml import html
-import sqlite3
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import html as html_lib
+import json
+import logging
 import os
-import sys
-import xml.etree.ElementTree as ET
-import datetime
 import re
+import sqlite3
+import tempfile
+from dataclasses import dataclass
+from email.utils import format_datetime
+from typing import Mapping
+from urllib.parse import urldefrag, urljoin, urlparse
 
-# Environment variable information
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-TELEGRAM_ADMIN_CHAT_ID = os.environ.get("TELEGRAM_ADMIN_CHAT_ID")
-TELEGRAM_BOT_API_KEY = os.environ["TELEGRAM_BOT_API_KEY"]
-GITHUB_RUN_NUMBER = os.environ["GITHUB_RUN_NUMBER"]
-PROTOCOLS = ["https://", "http://"]
-NOTICE_PAGE = "www.aiub.edu/category/notices"
-WEBSITE_URL = None # DO NOT CHANGE
+import requests
+from lxml import etree
+from lxml import html as lxml_html
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import xml.etree.ElementTree as ET
 
-# XPath information for AIUB Notice page
-POST_XPATH = "//div[contains(@class, 'notification') and not(ancestor::div[contains(@class, 'notification')])]"
-TITLE_XPATH = ".//h2[@class='title']/text()"
-LINK_XPATH = ".//a[@class='info-link']/@href"
-DESCRIPTION_XPATH = ".//p[@class='desc']/text()"
-DAY_XPATH = ".//div[contains(@class, 'date-custom')]/text()[normalize-space()][1]"
-#MONTH_XPATH = "None" # DISABLED
-YEAR_XPATH = ".//div[contains(@class, 'date-custom')]/span/text()"
 
-# Message format for new notices
-NEW_NOTICE_MESSAGE_FORMAT = (
-    "{title}\n\n"
-    "Date: {day} {month} {year}\n\n"
-    "{description}\n\n"
-    "https://www.aiub.edu{link}#{gh_run_no}"
-)
+BASE_URL = "https://www.aiub.edu"
+BASE_HOST = urlparse(BASE_URL).netloc.lower()
+NOTICE_PATH = "/category/notices"
 
-# Message format for edited notices
-EDITED_NOTICE_MESSAGE_FORMAT = (
-    "[EDITED] {title}\n\n"
-    "Date: {day} {month} {year}\n\n"
-    "{description}\n\n"
-    "https://www.aiub.edu{link}#{gh_run_no}"
-)
+LIST_PAGE_SIZE = 100
+MAX_LIST_PAGES = 60
+MIN_SCAN_PAGES = 2
+REQUEST_TIMEOUT = (5.0, 30.0)
+DETAIL_FETCH_LIMIT = LIST_PAGE_SIZE
+FETCH_DETAILS_FOR_EXISTING = False
+SEND_EXISTING_ON_FIRST_RUN = False
+DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in {"1", "true", "yes"}
+TELEGRAM_MAX_RETRIES = 3
+TELEGRAM_RETRY_BACKOFF = 2.0
 
-# SQLite database information
 DB_NAME = "aiub_notices.db"
+DB_TIMEOUT = 30.0
+DB_BUSY_TIMEOUT_MS = int(DB_TIMEOUT * 1000)
 DB_TABLE_NAME = "notices"
-
-# RSS feed information
 RSS_FEED_FILE = "rss.xml"
-DEFAULT_TIME = "00:00:00"
+RSS_ITEM_LIMIT = 500
+SCRIPT_VERSION = "5.0"
 
-# Script version
-SCRIPT_VERSION = "4.1"
-SCRIPT_URL = "https://raw.githubusercontent.com/origamiofficial/aiub-notice-checker/main/main.py"
+POST_XPATH = (
+    "//div[contains(concat(' ', normalize-space(@class), ' '), ' notification ') "
+    "and not(ancestor::div[contains(concat(' ', normalize-space(@class), ' '), ' notification ')])]"
+)
+TITLE_XPATH = ".//h2[contains(concat(' ', normalize-space(@class), ' '), ' title ')]/text()"
+LINK_XPATH = ".//a[contains(concat(' ', normalize-space(@class), ' '), ' info-link ')]/@href"
+DESCRIPTION_XPATH = ".//p[contains(concat(' ', normalize-space(@class), ' '), ' desc ')]/text()"
+DATE_TEXT_XPATH = ".//div[contains(concat(' ', normalize-space(@class), ' '), ' date-custom ')]//text()[normalize-space()]"
+DETAIL_TITLE_XPATH = "string(//h1[@id='dynamicHeading'])"
+DETAIL_BODY_XPATH = (
+    "//div[contains(concat(' ', normalize-space(@class), ' '), ' notice-page ')]"
+    "//div[contains(concat(' ', normalize-space(@class), ' '), ' question-column ') "
+    "and not(contains(concat(' ', normalize-space(@class), ' '), ' notice-sticky-header '))]"
+)
 
-# Check for script updates
-print("Checking for script updates...")
-try:
-    response = requests.get(SCRIPT_URL)
-    if response.status_code == 200:
-        # Parse version information from script
-        lines = response.text.split("\n")
-        for line in lines:
-            if line.startswith("SCRIPT_VERSION"):
-                ONLINE_VERSION = line.split("=")[1].strip().strip('"')
-                break
-        # Print current and online versions
-        print(f"Current version: {SCRIPT_VERSION}")
-        print(f"Online version: {ONLINE_VERSION}")
-        # Compare versions and update if necessary
-        if ONLINE_VERSION > SCRIPT_VERSION:
-            print(f"New version {ONLINE_VERSION} available. Updating script...")
-            # Download new version of script
-            with open("main.py", "w") as f:
-                f.write(response.text)
-            # Run new version of script and exit current script
-            os.execv(sys.executable, ["python"] + sys.argv)
-            sys.exit()
-        else:
-            print("Script is up to date.")
-except Exception as e:
-    print(f"Error checking for script updates: {e}")
+@dataclass
+class Notice:
+    title: str
+    description: str
+    url: str
+    published_date: str | None
+    body_text: str = ""
+    attachments: list[str] | None = None
 
-# Check if AIUB website is up
-print("Checking if AIUB website is up...")
-for protocol in PROTOCOLS:
+    @property
+    def attachments_json(self) -> str:
+        return json.dumps(self.attachments or [], ensure_ascii=False, sort_keys=True)
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=os.environ.get("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
+
+def clean_text(text: str) -> str:
+    return re.sub(r"\s+", " ", html_lib.unescape(str(text))).strip()
+
+
+def normalize_url(href: str) -> str:
+    href = (href or "").replace("\\", "/").strip()
+    if not href:
+        return ""
+    absolute = urljoin(f"{BASE_URL}/", href)
+    absolute, _fragment = urldefrag(absolute)
+    parsed = urlparse(absolute)
+    if parsed.scheme not in {"http", "https"}:
+        logging.warning("Ignoring URL with unsupported scheme: %r", href)
+        return ""
+    if parsed.netloc.lower() != BASE_HOST:
+        logging.warning("Ignoring external URL: %s", absolute)
+        return ""
+    return absolute
+
+
+def parse_date_parts(parts: list[str]) -> str | None:
+    text = re.sub(r"\bSept\b", "Sep", clean_text(" ".join(parts)), flags=re.IGNORECASE)
+    if not text:
+        return None
+
+    for date_format in ("%d %b %Y", "%d %B %Y"):
+        try:
+            return dt.datetime.strptime(text, date_format).date().isoformat()
+        except ValueError:
+            pass
+    logging.warning("Could not parse notice date from parts: %s", text)
+    return None
+
+
+def display_date(iso_date: str | None) -> str:
+    if not iso_date:
+        return "Unknown"
     try:
-        response = requests.get(protocol + NOTICE_PAGE)
-        if response.status_code == 200:
-            WEBSITE_URL = protocol + NOTICE_PAGE
-            print(f"AIUB website is up. Protocol: {protocol} is working.")
+        return dt.date.fromisoformat(iso_date).strftime("%d %b %Y")
+    except ValueError:
+        return iso_date
+
+
+def create_aiub_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "aiub-notice-checker/5.0 (+https://github.com/origamiofficial/aiub-notice-checker)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+    )
+    retry_options = {
+        "total": 4,
+        "connect": 4,
+        "read": 4,
+        "status": 4,
+        "backoff_factor": 1.0,
+        "status_forcelist": (429, 500, 502, 503, 504),
+        "respect_retry_after_header": True,
+    }
+    retry = Retry(allowed_methods=frozenset(["GET"]), **retry_options)
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def create_telegram_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": "aiub-notice-checker/5.0"})
+    retry = Retry(
+        total=max(0, TELEGRAM_MAX_RETRIES - 1),
+        status=TELEGRAM_MAX_RETRIES,
+        backoff_factor=TELEGRAM_RETRY_BACKOFF,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["POST"]),
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def fetch_html(session: requests.Session, url: str) -> lxml_html.HtmlElement:
+    response = session.get(url, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    return lxml_html.fromstring(response.content)
+
+
+def parse_listing_page(tree: lxml_html.HtmlElement) -> list[Notice]:
+    notices: list[Notice] = []
+    for post in tree.xpath(POST_XPATH):
+        title = clean_text("".join(post.xpath(TITLE_XPATH)))
+        description = clean_text("".join(post.xpath(DESCRIPTION_XPATH)))
+        link = "".join(post.xpath(LINK_XPATH)).strip()
+        url = normalize_url(link)
+        date_parts = [text for part in post.xpath(DATE_TEXT_XPATH) if (text := clean_text(part))]
+
+        if not url:
+            logging.warning("Skipping notice without a link: %s", title)
+            continue
+
+        notices.append(
+            Notice(
+                title=title,
+                description=description,
+                url=url,
+                published_date=parse_date_parts(date_parts),
+                attachments=[],
+            )
+        )
+    return notices
+
+
+def parse_detail_page(tree: lxml_html.HtmlElement, fallback: Notice) -> Notice:
+    title = clean_text(tree.xpath(DETAIL_TITLE_XPATH)) or fallback.title
+    body_nodes = tree.xpath(DETAIL_BODY_XPATH)
+    body_parts = []
+    for node in body_nodes:
+        text = clean_text(node.text_content())
+        if text:
+            body_parts.append(text)
+    body_text = "\n\n".join(body_parts)
+
+    attachments: list[str] = []
+    for node in body_nodes:
+        for href in node.xpath(".//a[@href]/@href"):
+            normalized = normalize_url(href)
+            if normalized and normalized not in attachments:
+                attachments.append(normalized)
+
+    return Notice(
+        title=title,
+        description=fallback.description,
+        url=fallback.url,
+        published_date=fallback.published_date,
+        body_text=body_text,
+        attachments=attachments,
+    )
+
+
+def enrich_notice(session: requests.Session, notice: Notice) -> Notice:
+    try:
+        tree = fetch_html(session, notice.url)
+        return parse_detail_page(tree, notice)
+    except (requests.RequestException, etree.ParserError, ValueError) as exc:
+        logging.warning("Could not fetch notice detail %s: %s", notice.url, exc)
+        return notice
+
+
+def crawl_notices(session: requests.Session, known_links: set[str]) -> list[Notice]:
+    notices: list[Notice] = []
+    seen_links: set[str] = set()
+    seen_page_fingerprints: set[tuple[str, ...]] = set()
+
+    for page_no in range(1, MAX_LIST_PAGES + 1):
+        url = f"{BASE_URL}{NOTICE_PATH}?pageNo={page_no}&pageSize={LIST_PAGE_SIZE}"
+        logging.info("Fetching listing page %s", page_no)
+        tree = fetch_html(session, url)
+        page_notices = parse_listing_page(tree)
+
+        if not page_notices:
+            logging.info("Stopping at page %s because it returned no notices.", page_no)
             break
-    except requests.exceptions.RequestException as e:
-        print(f"Error trying {protocol}: {e}")
 
-if WEBSITE_URL is None:
-    print("AIUB website is down. Exiting script.")
-    exit()
+        fingerprint = tuple(notice.url for notice in page_notices)
+        if fingerprint in seen_page_fingerprints:
+            logging.info("Stopping at page %s because the page repeated a previous result.", page_no)
+            break
+        seen_page_fingerprints.add(fingerprint)
 
-# Function to send admin notification
-def send_admin_notification(message):
-    admin_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_API_KEY}/sendMessage"
-    admin_payload = {
-        "chat_id": TELEGRAM_ADMIN_CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": "true"
+        page_has_new_link = False
+        for notice in page_notices:
+            if notice.url in seen_links:
+                continue
+            seen_links.add(notice.url)
+            notices.append(notice)
+            if notice.url not in known_links:
+                page_has_new_link = True
+
+        if known_links and page_no >= MIN_SCAN_PAGES and not page_has_new_link:
+            logging.info("Stopping at page %s because all links on the page are already known.", page_no)
+            break
+
+    return notices
+
+
+def connect_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_NAME, timeout=DB_TIMEOUT)
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
+    return conn
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {DB_TABLE_NAME} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            link TEXT NOT NULL,
+            published_date TEXT,
+            body_text TEXT NOT NULL DEFAULT '',
+            attachments_json TEXT NOT NULL DEFAULT '[]',
+            content_hash TEXT NOT NULL DEFAULT '',
+            first_seen_at TEXT NOT NULL DEFAULT '',
+            last_seen_at TEXT NOT NULL DEFAULT '',
+            sent_at TEXT,
+            last_notified_hash TEXT
+        )
+        """
+    )
+
+    existing_columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({DB_TABLE_NAME})")}
+    added_columns: set[str] = set()
+    migrations = {
+        "published_date": "TEXT",
+        "body_text": "TEXT NOT NULL DEFAULT ''",
+        "attachments_json": "TEXT NOT NULL DEFAULT '[]'",
+        "content_hash": "TEXT NOT NULL DEFAULT ''",
+        "first_seen_at": "TEXT NOT NULL DEFAULT ''",
+        "last_seen_at": "TEXT NOT NULL DEFAULT ''",
+        "sent_at": "TEXT",
+        "last_notified_hash": "TEXT",
     }
-    try:
-        admin_response = requests.post(admin_url, json=admin_payload)
-        if admin_response.status_code != 200:
-            print(f"Error sending admin notification: {admin_response.text}")
-    except Exception as e:
-        print(f"Error sending admin notification: {e}")
+    for name, definition in migrations.items():
+        if name not in existing_columns:
+            logging.info("Adding database column %s", name)
+            conn.execute(f"ALTER TABLE {DB_TABLE_NAME} ADD COLUMN {name} {definition}")
+            added_columns.add(name)
 
-def check_xpath(tree, xpaths):
-    invalid_xpaths = []
-    for xpath_name, xpath in xpaths.items():
-        element_name = xpath.split("/")[-1]
-        elements = tree.xpath(xpath)
-        if len(elements) == 0:
-            invalid_xpaths.append((xpath_name, element_name))
-            # Send admin notification for invalid XPath
-            admin_notification = f"AIUB Notice\n\nInvalid XPath: {xpath_name} - No {element_name} found.\n\nXPath expressions may need to be updated."
-            send_admin_notification(admin_notification)
-    return invalid_xpaths
-
-try:
-    page = requests.get(WEBSITE_URL)
-    tree = html.fromstring(page.content)
-    xpaths = {
-        "POST_XPATH": POST_XPATH,
-        "TITLE_XPATH": TITLE_XPATH,
-        "LINK_XPATH": LINK_XPATH,
-        "DESCRIPTION_XPATH": DESCRIPTION_XPATH,
-        "DAY_XPATH": DAY_XPATH,
-        #"MONTH_XPATH": MONTH_XPATH, # DISABLED
-        "YEAR_XPATH": YEAR_XPATH
-    }
-    invalid_xpaths = check_xpath(tree, xpaths)
-    if invalid_xpaths:
-        print(f"Error: Invalid XPath expressions found:")
-        for xpath_name, element_name in invalid_xpaths:
-            print(f"{xpath_name}: No {element_name} found")
-        print("XPath expressions may need to be updated. Exiting script.")
-        exit()
-except Exception as e:
-    print(f"Error checking XPath expressions: {e}. XPath expressions may need to be updated. Exiting script.")
-    exit()
-print("All XPath expressions are valid.")
-
-# Visit AIUB Notice page and check for new posts
-print("Checking for new posts on AIUB Notice page...")
-try:
-    page = requests.get(WEBSITE_URL)
-    tree = html.fromstring(page.content)
-    posts = tree.xpath(POST_XPATH)
-    if len(posts) == 0:
-        print("NO POSTS WERE FOUND on the AIUB Notice page. Check if XPath expressions need to be updated. Exiting script.")
-        exit()
+    now = utc_now()
+    if added_columns:
+        rows = conn.execute(f"SELECT * FROM {DB_TABLE_NAME}").fetchall()
     else:
-        print(f"{len(posts)} posts found on AIUB Notice page.")
-except Exception as e:
-    print(f"Error checking for new posts on AIUB Notice page: {e}. Check if XPath expressions need to be updated. Exiting script.")
-    exit()
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM {DB_TABLE_NAME}
+            WHERE link IS NULL
+               OR link = ''
+               OR (link NOT LIKE 'http://%' AND link NOT LIKE 'https://%')
+               OR INSTR(link, '#') > 0
+               OR INSTR(link, '\\') > 0
+               OR body_text IS NULL
+               OR attachments_json IS NULL
+               OR attachments_json = ''
+               OR content_hash IS NULL
+               OR content_hash = ''
+               OR first_seen_at IS NULL
+               OR first_seen_at = ''
+               OR last_seen_at IS NULL
+               OR last_seen_at = ''
+               OR (sent_at IS NOT NULL AND last_notified_hash IS NULL)
+            """
+        ).fetchall()
 
-# Check if database file exists
-print(f"Checking if database file exists...")
-if os.path.exists(DB_NAME):
-    print(f"Existing SQLite database file found.")
-    # Open connection to database
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    
-    # Count number of notices in database
-    c.execute(f"SELECT COUNT(*) FROM {DB_TABLE_NAME}")
-    notice_count = c.fetchone()[0]
-    print(f"{notice_count} notices found in database.")
-    
-    # Check for moved notices in database
-    print(f"Checking for moved notices in website...")
-    c.execute(f"SELECT link, title FROM {DB_TABLE_NAME}")
-    database_links = c.fetchall()
-    for db_link, title in database_links:
-        # Check if link is still on AIUB Notice page
-        found = False
-        for post in posts:
-            web_link = "".join(post.xpath(LINK_XPATH)).strip()
-            if db_link == web_link:
-                found = True
-                break
-        #if not found:
-            # Link not found on AIUB Notice page, delete from database
-            #c.execute(f"DELETE FROM {DB_TABLE_NAME} WHERE link=?", (db_link,))
-            #conn.commit()
-            #print(f"Deleting Notice: '{title}' from database.")
+    for row in rows:
+        link = normalize_url(row["link"])
+        if not link:
+            logging.warning("Deleting notice with invalid link during migration: %r", row["link"])
+            conn.execute(f"DELETE FROM {DB_TABLE_NAME} WHERE id=?", (row["id"],))
+            continue
 
-    # Close connection to database
+        published_date = row["published_date"]
+        body_text = row["body_text"] or ""
+        attachments_json = row["attachments_json"] or "[]"
+        row_hash = row["content_hash"] or compute_hash(
+            row["title"],
+            row["description"],
+            link,
+            published_date,
+            body_text,
+            attachments_json,
+        )
+        sent_at = row["sent_at"]
+        if "sent_at" in added_columns and not sent_at:
+            sent_at = now
+        first_seen_at = row["first_seen_at"] or now
+        last_seen_at = row["last_seen_at"] or now
+        last_notified_hash = row["last_notified_hash"]
+        if ("last_notified_hash" in added_columns or sent_at) and not last_notified_hash:
+            last_notified_hash = row_hash
+
+        if (
+            row["link"] == link
+            and row["published_date"] == published_date
+            and row["body_text"] == body_text
+            and row["attachments_json"] == attachments_json
+            and row["content_hash"] == row_hash
+            and row["first_seen_at"] == first_seen_at
+            and row["last_seen_at"] == last_seen_at
+            and row["sent_at"] == sent_at
+            and row["last_notified_hash"] == last_notified_hash
+        ):
+            continue
+
+        conn.execute(
+            f"""
+            UPDATE {DB_TABLE_NAME}
+            SET link=?,
+                published_date=?,
+                body_text=?,
+                attachments_json=?,
+                content_hash=?,
+                first_seen_at=?,
+                last_seen_at=?,
+                sent_at=?,
+                last_notified_hash=?
+            WHERE id=?
+            """,
+            (
+                link,
+                published_date,
+                body_text,
+                attachments_json,
+                row_hash,
+                first_seen_at,
+                last_seen_at,
+                sent_at,
+                last_notified_hash,
+                row["id"],
+            ),
+        )
+
+    deduplicate_links(conn)
+    conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{DB_TABLE_NAME}_link ON {DB_TABLE_NAME}(link)")
+    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{DB_TABLE_NAME}_published_date ON {DB_TABLE_NAME}(published_date)")
     conn.commit()
-    conn.close()
-else:
-    print(f"Existing SQLite database file NOT found. Creating new...")
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute(
-        f"CREATE TABLE {DB_TABLE_NAME} ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "title TEXT NOT NULL,"
-        "description TEXT NOT NULL,"
-        "link TEXT NOT NULL,"
-        "day INTEGER NOT NULL,"
-        "month INTEGER NOT NULL,"
-        "year INTEGER NOT NULL"
-        ")"
+
+
+def deduplicate_links(conn: sqlite3.Connection) -> None:
+    cursor = conn.execute(
+        f"""
+        DELETE FROM {DB_TABLE_NAME}
+        WHERE id NOT IN (
+            SELECT MIN(id)
+            FROM {DB_TABLE_NAME}
+            GROUP BY link
+        )
+        """
+    )
+    if cursor.rowcount > 0:
+        logging.warning("Removed %s duplicate database rows.", cursor.rowcount)
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def compute_hash(
+    title: str,
+    description: str,
+    link: str,
+    published_date: str | None,
+    body_text: str,
+    attachments_json: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "title": clean_text(title),
+            "description": clean_text(description),
+            "link": normalize_url(link),
+            "published_date": published_date or "",
+            "body_text": clean_text(body_text),
+            "attachments": parse_attachments_json(attachments_json),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def notice_hash(notice: Notice) -> str:
+    return compute_hash(
+        notice.title,
+        notice.description,
+        notice.url,
+        notice.published_date,
+        notice.body_text,
+        notice.attachments_json,
+    )
+
+
+def load_existing_notice_rows(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
+    return {
+        link: row
+        for row in conn.execute(f"SELECT * FROM {DB_TABLE_NAME}")
+        if (link := normalize_url(row["link"]))
+    }
+
+
+def get_notice_row(conn: sqlite3.Connection, url: str) -> sqlite3.Row | None:
+    return conn.execute(f"SELECT * FROM {DB_TABLE_NAME} WHERE link=?", (normalize_url(url),)).fetchone()
+
+
+def parse_attachments_json(value: str | None) -> list[str]:
+    if not value:
+        return []
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        logging.warning("Ignoring invalid attachments_json value: %r", value)
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed]
+
+
+def merge_cached_notice(listing_notice: Notice, existing: sqlite3.Row | None) -> Notice:
+    if existing is None:
+        return listing_notice
+
+    cached_body = existing["body_text"] or ""
+    cached_attachments = parse_attachments_json(existing["attachments_json"])
+    cached_title = existing["title"] or ""
+    title = listing_notice.title
+    if cached_title and "..." in listing_notice.title and "..." not in cached_title:
+        title = cached_title
+
+    return Notice(
+        title=title,
+        description=listing_notice.description or existing["description"] or "",
+        url=listing_notice.url,
+        published_date=listing_notice.published_date or existing["published_date"],
+        body_text=cached_body,
+        attachments=cached_attachments,
+    )
+
+
+def upsert_seen_notice(
+    conn: sqlite3.Connection,
+    notice: Notice,
+    content_hash: str,
+    return_row: bool = True,
+) -> sqlite3.Row | None:
+    now = utc_now()
+    conn.execute(
+        f"""
+        INSERT INTO {DB_TABLE_NAME}
+            (title, description, link, published_date, body_text, attachments_json,
+             content_hash, first_seen_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(link) DO UPDATE SET
+            title=excluded.title,
+            description=excluded.description,
+            published_date=excluded.published_date,
+            body_text=excluded.body_text,
+            attachments_json=excluded.attachments_json,
+            content_hash=excluded.content_hash,
+            last_seen_at=excluded.last_seen_at
+        """,
+        (
+            notice.title,
+            notice.description,
+            notice.url,
+            notice.published_date,
+            notice.body_text,
+            notice.attachments_json,
+            content_hash,
+            now,
+            now,
+        ),
+    )
+    if return_row:
+        return get_notice_row(conn, notice.url)
+    return None
+
+
+def mark_notified(conn: sqlite3.Connection, notice_url: str, content_hash: str) -> None:
+    now = utc_now()
+    conn.execute(
+        f"""
+        UPDATE {DB_TABLE_NAME}
+        SET sent_at=COALESCE(sent_at, ?),
+            last_notified_hash=?
+        WHERE link=?
+        """,
+        (now, content_hash, normalize_url(notice_url)),
     )
     conn.commit()
-    print(f"New SQLite database file created.")
 
-# Connect to database
-conn = sqlite3.connect(DB_NAME)
-c = conn.cursor()
 
-# Send message to Telegram chat
-def send_telegram_message(message):
-    # Send message to Telegram chat
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_API_KEY}/sendMessage"
+def seed_without_notification(conn: sqlite3.Connection, notice_url: str, content_hash: str) -> None:
+    now = utc_now()
+    conn.execute(
+        f"""
+        UPDATE {DB_TABLE_NAME}
+        SET sent_at=COALESCE(sent_at, ?),
+            last_notified_hash=?
+        WHERE link=?
+        """,
+        (now, content_hash, normalize_url(notice_url)),
+    )
+
+
+def truncate_text(text: str, limit: int) -> str:
+    text = str(text).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def format_notice_message(notice: Notice, gh_run_no: str, edited: bool = False) -> str:
+    description = notice.description or first_nonempty_line(notice.body_text) or "Please click the link for details."
+    message = (
+        f"{'[EDITED] ' if edited else ''}{truncate_text(notice.title, 500)}\n\n"
+        f"Date: {display_date(notice.published_date)}\n\n"
+        f"{truncate_text(description, 1600)}\n\n"
+        f"{notice.url}#{gh_run_no}"
+    )
+    return truncate_text(message, 4096)
+
+
+def first_nonempty_line(text: str) -> str:
+    for line in text.splitlines():
+        line = clean_text(line)
+        if line:
+            return line
+    return ""
+
+
+def send_telegram_message(
+    session: requests.Session,
+    chat_id: str,
+    message: str,
+    config: dict[str, str | None],
+    label: str,
+) -> bool:
+    if DRY_RUN:
+        logging.info("DRY_RUN: would send %s to Telegram chat %s", label, chat_id)
+        return True
+
+    bot_api_key = config["bot_api_key"]
+    url = f"https://api.telegram.org/bot{bot_api_key}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id,
         "text": message,
-		"disable_web_page_preview": "true"
+        "disable_web_page_preview": True,
     }
+
     try:
-        response = requests.post(url, json=payload)
-        print(f"Sending Notice: '{title}'.")
-        # Check if the request was successful, and print the response from the server
-        if response.status_code == 200:
-            print(f"Successfully sent message to Telegram.")
+        response = session.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+    except requests.RequestException as exc:
+        logging.error("Telegram send failed for %s: %s", label, exc)
+        return False
+
+    if response.status_code == 200:
+        logging.info("Sent %s to Telegram.", label)
+        return True
+
+    logging.error("Telegram send failed for %s: %s", label, response.text)
+    return False
+
+
+def should_fetch_detail(existing: sqlite3.Row | None, index: int) -> bool:
+    if index >= DETAIL_FETCH_LIMIT:
+        return False
+    if existing is None:
+        return True
+    if not existing["body_text"]:
+        return True
+    return FETCH_DETAILS_FOR_EXISTING
+
+
+def process_notices(
+    conn: sqlite3.Connection,
+    aiub_session: requests.Session,
+    telegram_session: requests.Session,
+    notices: list[Notice],
+    config: dict[str, str | None],
+    first_run: bool,
+    existing_by_url: Mapping[str, sqlite3.Row] | None = None,
+) -> tuple[int, int, int]:
+    new_count = 0
+    edited_count = 0
+    failed_notifications = 0
+    chat_id = str(config["chat_id"])
+    gh_run_no = str(config["github_run_number"])
+    existing_by_url = existing_by_url or load_existing_notice_rows(conn)
+
+    detail_targets = [
+        listing_notice
+        for index, listing_notice in enumerate(notices)
+        if should_fetch_detail(existing_by_url.get(listing_notice.url), index)
+    ]
+    enriched_by_url = {notice.url: enrich_notice(aiub_session, notice) for notice in detail_targets}
+
+    for index, listing_notice in enumerate(notices):
+        existing = existing_by_url.get(listing_notice.url)
+        if should_fetch_detail(existing, index):
+            notice = enriched_by_url.get(listing_notice.url, listing_notice)
+            if existing is not None and not notice.body_text:
+                notice = merge_cached_notice(notice, existing)
         else:
-            print(
-                f"Error sending message to Telegram: {response.text}. Exiting script."
-            )
-            exit()
-    except Exception as e:
-        print(f"Error sending message to Telegram: {e}")
+            notice = merge_cached_notice(listing_notice, existing)
+        new_hash = notice_hash(notice)
+        previous_hash = existing["content_hash"] if existing else None
+        previous_notified_hash = existing["last_notified_hash"] if existing else None
+        had_detail_before = bool(existing and existing["body_text"])
 
-# Removes unwanted spaces, ensuring proper formatting
-def clean_text(text):
-    return re.sub(r'\s+', ' ', text).strip()
+        upsert_seen_notice(conn, notice, new_hash, return_row=False)
 
-# Iterate through posts and check for new or edited notices
-for post in posts:
-    # Retrieve data for post
-    title = "".join(post.xpath(TITLE_XPATH)).strip()
-    link = "".join(post.xpath(LINK_XPATH)).strip()
-    description = "".join(post.xpath(DESCRIPTION_XPATH)).strip()
-    day_month = clean_text("".join(post.xpath(DAY_XPATH))) # COMBINED
-    #month = clean_text("".join(post.xpath(MONTH_XPATH)))  # DISABLED
-    year = clean_text("".join(post.xpath(YEAR_XPATH)))
-    
-    # Split day and month
-    day, month = day_month.split()
-    
-    # Check if notice has been seen before
-    c.execute(f"SELECT * FROM {DB_TABLE_NAME} WHERE link=?", (link,))
-    result = c.fetchone()
-    if result is None:
-        # Notice is new, add to database and send message
-        c.execute(
-            f"INSERT INTO {DB_TABLE_NAME} "
-            "(title, description, link, day, month, year) VALUES (?,?,?,?,?,?)",
-            (title, description, link, day, month, year)
-        )
-        conn.commit()
-        message = NEW_NOTICE_MESSAGE_FORMAT.format(
-            title=title,
-            day=day,
-            month=month,
-            year=year,
-            description=description,
-            link=link,
-            gh_run_no=GITHUB_RUN_NUMBER
-        )
-        send_telegram_message(message)
-    else:
-        # Notice has been seen before, check if it has been edited
-        old_title = result[1]
-        old_description = result[2]
-        if old_title != title or old_description != description:
-            # Notice has been edited, update database and send message
-            c.execute(
-                f"UPDATE {DB_TABLE_NAME} "
-                "SET title=?, description=? "
-                "WHERE link=?",
-                (title, description, link)
-            )
-            conn.commit()
-            message = EDITED_NOTICE_MESSAGE_FORMAT.format(
-                title=title,
-                day=day,
-                month=month,
-                year=year,
-                description=description,
-                link=link,
-                gh_run_no=GITHUB_RUN_NUMBER
-            )
-            send_telegram_message(message)
+        if existing is None:
+            new_count += 1
+            if first_run and not SEND_EXISTING_ON_FIRST_RUN:
+                seed_without_notification(conn, notice.url, new_hash)
+                logging.info("Seeded existing notice without Telegram notification: %s", notice.title)
+                continue
 
-# Generate RSS feed
-def generate_rss_feed():
-    c.execute(f"SELECT title, description, link, day, month, year FROM {DB_TABLE_NAME} ORDER BY year DESC, month DESC, day DESC")
-    notices = c.fetchall()
-    # Root element
+            message = format_notice_message(notice, gh_run_no, edited=False)
+            if send_telegram_message(telegram_session, chat_id, message, config, notice.title):
+                mark_notified(conn, notice.url, new_hash)
+            else:
+                failed_notifications += 1
+            continue
+
+        if existing["sent_at"] is None:
+            message = format_notice_message(notice, gh_run_no, edited=False)
+            if send_telegram_message(telegram_session, chat_id, message, config, notice.title):
+                mark_notified(conn, notice.url, new_hash)
+            else:
+                failed_notifications += 1
+            continue
+
+        if previous_hash and previous_hash != new_hash:
+            if not had_detail_before:
+                seed_without_notification(conn, notice.url, new_hash)
+                logging.info("Backfilled detail data without edit notification: %s", notice.title)
+                continue
+
+            if previous_notified_hash != new_hash:
+                edited_count += 1
+                message = format_notice_message(notice, gh_run_no, edited=True)
+                if send_telegram_message(telegram_session, chat_id, message, config, notice.title):
+                    mark_notified(conn, notice.url, new_hash)
+                else:
+                    failed_notifications += 1
+
+    conn.commit()
+    return new_count, edited_count, failed_notifications
+
+
+def generate_rss_feed(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        f"""
+        SELECT title, description, link, published_date, body_text
+        FROM {DB_TABLE_NAME}
+        ORDER BY COALESCE(published_date, '') DESC, id DESC
+        LIMIT ?
+        """,
+        (RSS_ITEM_LIMIT,),
+    ).fetchall()
+
+    ET.register_namespace("atom", "http://www.w3.org/2005/Atom")
     rss = ET.Element("rss", version="2.0")
     channel = ET.SubElement(rss, "channel")
-    # Channel elements
     ET.SubElement(channel, "title").text = "AIUB Notices"
-    ET.SubElement(channel, "link").text = f"https://{NOTICE_PAGE}"
+    ET.SubElement(channel, "link").text = f"{BASE_URL}{NOTICE_PATH}"
     ET.SubElement(channel, "description").text = "Latest notices from AIUB."
-    # Add notices to RSS feed
-    for notice in notices:
-        title, description, link, day, month_name, year = notice
-        # Extract month as a number (assuming month names are stored as strings)
-        month_number = datetime.datetime.strptime(month_name, "%b").month
-        # Generate RFC-822 date-time format with default time
-        pub_date = datetime.datetime(year=int(year), month=month_number, day=int(day), hour=int(DEFAULT_TIME.split(":")[0]), minute=int(DEFAULT_TIME.split(":")[1]), second=int(DEFAULT_TIME.split(":")[2])).strftime("%a, %d %b %Y %H:%M:%S GMT")
-        item = ET.SubElement(channel, "item")
-        ET.SubElement(item, "title").text = title
-        # Escape special characters
-        description = description.replace("&", "&amp;")
-        ET.SubElement(item, "description").text = description
-        ET.SubElement(item, "link").text = f"https://www.aiub.edu{link}"
-        ET.SubElement(item, "pubDate").text = pub_date
-        # Add guid element
-        guid = ET.SubElement(item, "guid")
-        guid.text = f"https://www.aiub.edu{link}"
-    # Add atom:link with rel="self"
+
     self_link = ET.SubElement(channel, "{http://www.w3.org/2005/Atom}link")
     self_link.set("rel", "self")
     self_link.set("type", "application/rss+xml")
     self_link.set("href", "https://raw.githubusercontent.com/origamiofficial/aiub-notice-checker/main/rss.xml")
-    # Write to file
+
+    for row in rows:
+        link = normalize_url(row["link"])
+        if not link:
+            logging.warning("Skipping RSS item with invalid link: %r", row["link"])
+            continue
+        item = ET.SubElement(channel, "item")
+        ET.SubElement(item, "title").text = row["title"]
+        ET.SubElement(item, "description").text = row["description"] or first_nonempty_line(row["body_text"])
+        ET.SubElement(item, "link").text = link
+        ET.SubElement(item, "guid").text = link
+        pub_date = rss_pub_date(row["published_date"])
+        if pub_date:
+            ET.SubElement(item, "pubDate").text = pub_date
+
     tree = ET.ElementTree(rss)
-    tree.write(RSS_FEED_FILE, encoding="UTF-8", xml_declaration=True, method="xml")
-    print(f"RSS feed generated at {RSS_FEED_FILE}")
+    feed_dir = os.path.dirname(os.path.abspath(RSS_FEED_FILE)) or "."
+    os.makedirs(feed_dir, exist_ok=True)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            delete=False,
+            dir=feed_dir,
+            prefix=f".{os.path.basename(RSS_FEED_FILE)}.",
+            suffix=".tmp",
+        ) as temp_file:
+            temp_path = temp_file.name
+            tree.write(temp_file, encoding="UTF-8", xml_declaration=True, method="xml")
+        os.replace(temp_path, RSS_FEED_FILE)
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+    logging.info("RSS feed generated at %s", RSS_FEED_FILE)
 
-# Generate RSS feed after processing notices
-generate_rss_feed()
 
-# Close database connection
-conn.commit()
-conn.close()
+def rss_pub_date(iso_date: str | None) -> str | None:
+    if not iso_date:
+        return None
+    try:
+        date_value = dt.date.fromisoformat(iso_date)
+        datetime_value = dt.datetime.combine(date_value, dt.time(), dt.timezone.utc)
+        return format_datetime(datetime_value, usegmt=True)
+    except ValueError:
+        return None
 
-print("Script Completed.")
+
+def load_config() -> dict[str, str | None]:
+    bot_api_key = os.environ.get("TELEGRAM_BOT_API_KEY")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not DRY_RUN and (not bot_api_key or not chat_id):
+        raise RuntimeError("TELEGRAM_BOT_API_KEY and TELEGRAM_CHAT_ID are required unless DRY_RUN=true.")
+
+    return {
+        "bot_api_key": bot_api_key or "dry-run",
+        "chat_id": chat_id or "dry-run",
+        "admin_chat_id": os.environ.get("TELEGRAM_ADMIN_CHAT_ID"),
+        "github_run_number": os.environ.get("GITHUB_RUN_NUMBER", "local"),
+    }
+
+
+def main() -> int:
+    configure_logging()
+    logging.info("AIUB notice checker v%s starting.", SCRIPT_VERSION)
+    config = load_config()
+    aiub_session = create_aiub_session()
+    telegram_session = create_telegram_session()
+
+    with connect_db() as conn:
+        ensure_schema(conn)
+        first_run = conn.execute(f"SELECT COUNT(*) FROM {DB_TABLE_NAME}").fetchone()[0] == 0
+        existing_by_url = load_existing_notice_rows(conn)
+        known_links = set(existing_by_url)
+
+        notices = crawl_notices(aiub_session, known_links)
+        if not notices:
+            admin_chat_id = config.get("admin_chat_id")
+            if admin_chat_id:
+                send_telegram_message(
+                    telegram_session,
+                    str(admin_chat_id),
+                    (
+                        "AIUB Notice\n\nNo notices were found on the listing page. "
+                        "The page structure or parser may need to be updated."
+                    ),
+                    config,
+                    "admin notification",
+                )
+            raise RuntimeError("No notices were collected from AIUB.")
+
+        logging.info("Collected %s unique notices from listing pages.", len(notices))
+        new_count, edited_count, failed_notifications = process_notices(
+            conn,
+            aiub_session,
+            telegram_session,
+            notices,
+            config,
+            first_run,
+            existing_by_url,
+        )
+        generate_rss_feed(conn)
+
+    logging.info(
+        "Script completed. New=%s, Edited=%s, Failed notifications=%s",
+        new_count,
+        edited_count,
+        failed_notifications,
+    )
+    return 1 if failed_notifications else 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        logging.exception("Script failed: %s", exc)
+        raise SystemExit(1)
