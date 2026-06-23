@@ -31,16 +31,12 @@ MAX_LIST_PAGES = 60
 MIN_SCAN_PAGES = 2
 REQUEST_TIMEOUT = (5.0, 30.0)
 DETAIL_FETCH_LIMIT = LIST_PAGE_SIZE
-FETCH_DETAILS_FOR_EXISTING = False
-SEND_EXISTING_ON_FIRST_RUN = False
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in {"1", "true", "yes"}
 TELEGRAM_MAX_RETRIES = 3
 TELEGRAM_RETRY_BACKOFF = 2.0
 
 DB_NAME = "aiub_notices.db"
 DB_TIMEOUT = 30.0
-DB_BUSY_TIMEOUT_MS = int(DB_TIMEOUT * 1000)
-DB_TABLE_NAME = "notices"
 RSS_FEED_FILE = "rss.xml"
 RSS_ITEM_LIMIT = 500
 SCRIPT_VERSION = "5.0"
@@ -273,14 +269,14 @@ def crawl_notices(session: requests.Session, known_links: set[str]) -> list[Noti
 def connect_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_NAME, timeout=DB_TIMEOUT)
     conn.row_factory = sqlite3.Row
-    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
+    conn.execute(f"PRAGMA busy_timeout={int(DB_TIMEOUT * 1000)}")
     return conn
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {DB_TABLE_NAME} (
+        """
+        CREATE TABLE IF NOT EXISTS notices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
             description TEXT NOT NULL DEFAULT '',
@@ -296,138 +292,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
-
-    existing_columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({DB_TABLE_NAME})")}
-    added_columns: set[str] = set()
-    migrations = {
-        "published_date": "TEXT",
-        "body_text": "TEXT NOT NULL DEFAULT ''",
-        "attachments_json": "TEXT NOT NULL DEFAULT '[]'",
-        "content_hash": "TEXT NOT NULL DEFAULT ''",
-        "first_seen_at": "TEXT NOT NULL DEFAULT ''",
-        "last_seen_at": "TEXT NOT NULL DEFAULT ''",
-        "sent_at": "TEXT",
-        "last_notified_hash": "TEXT",
-    }
-    for name, definition in migrations.items():
-        if name not in existing_columns:
-            logging.info("Adding database column %s", name)
-            conn.execute(f"ALTER TABLE {DB_TABLE_NAME} ADD COLUMN {name} {definition}")
-            added_columns.add(name)
-
-    now = utc_now()
-    if added_columns:
-        rows = conn.execute(f"SELECT * FROM {DB_TABLE_NAME}").fetchall()
-    else:
-        rows = conn.execute(
-            f"""
-            SELECT *
-            FROM {DB_TABLE_NAME}
-            WHERE link IS NULL
-               OR link = ''
-               OR (link NOT LIKE 'http://%' AND link NOT LIKE 'https://%')
-               OR INSTR(link, '#') > 0
-               OR INSTR(link, '\\') > 0
-               OR body_text IS NULL
-               OR attachments_json IS NULL
-               OR attachments_json = ''
-               OR content_hash IS NULL
-               OR content_hash = ''
-               OR first_seen_at IS NULL
-               OR first_seen_at = ''
-               OR last_seen_at IS NULL
-               OR last_seen_at = ''
-               OR (sent_at IS NOT NULL AND last_notified_hash IS NULL)
-            """
-        ).fetchall()
-
-    for row in rows:
-        link = normalize_url(row["link"])
-        if not link:
-            logging.warning("Deleting notice with invalid link during migration: %r", row["link"])
-            conn.execute(f"DELETE FROM {DB_TABLE_NAME} WHERE id=?", (row["id"],))
-            continue
-
-        published_date = row["published_date"]
-        body_text = row["body_text"] or ""
-        attachments_json = row["attachments_json"] or "[]"
-        row_hash = row["content_hash"] or compute_hash(
-            row["title"],
-            row["description"],
-            link,
-            published_date,
-            body_text,
-            attachments_json,
-        )
-        sent_at = row["sent_at"]
-        if "sent_at" in added_columns and not sent_at:
-            sent_at = now
-        first_seen_at = row["first_seen_at"] or now
-        last_seen_at = row["last_seen_at"] or now
-        last_notified_hash = row["last_notified_hash"]
-        if ("last_notified_hash" in added_columns or sent_at) and not last_notified_hash:
-            last_notified_hash = row_hash
-
-        if (
-            row["link"] == link
-            and row["published_date"] == published_date
-            and row["body_text"] == body_text
-            and row["attachments_json"] == attachments_json
-            and row["content_hash"] == row_hash
-            and row["first_seen_at"] == first_seen_at
-            and row["last_seen_at"] == last_seen_at
-            and row["sent_at"] == sent_at
-            and row["last_notified_hash"] == last_notified_hash
-        ):
-            continue
-
-        conn.execute(
-            f"""
-            UPDATE {DB_TABLE_NAME}
-            SET link=?,
-                published_date=?,
-                body_text=?,
-                attachments_json=?,
-                content_hash=?,
-                first_seen_at=?,
-                last_seen_at=?,
-                sent_at=?,
-                last_notified_hash=?
-            WHERE id=?
-            """,
-            (
-                link,
-                published_date,
-                body_text,
-                attachments_json,
-                row_hash,
-                first_seen_at,
-                last_seen_at,
-                sent_at,
-                last_notified_hash,
-                row["id"],
-            ),
-        )
-
-    deduplicate_links(conn)
-    conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{DB_TABLE_NAME}_link ON {DB_TABLE_NAME}(link)")
-    conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{DB_TABLE_NAME}_published_date ON {DB_TABLE_NAME}(published_date)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_notices_link ON notices(link)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_notices_published_date ON notices(published_date)")
     conn.commit()
-
-
-def deduplicate_links(conn: sqlite3.Connection) -> None:
-    cursor = conn.execute(
-        f"""
-        DELETE FROM {DB_TABLE_NAME}
-        WHERE id NOT IN (
-            SELECT MIN(id)
-            FROM {DB_TABLE_NAME}
-            GROUP BY link
-        )
-        """
-    )
-    if cursor.rowcount > 0:
-        logging.warning("Removed %s duplicate database rows.", cursor.rowcount)
 
 
 def utc_now() -> str:
@@ -471,13 +338,13 @@ def notice_hash(notice: Notice) -> str:
 def load_existing_notice_rows(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
     return {
         link: row
-        for row in conn.execute(f"SELECT * FROM {DB_TABLE_NAME}")
+        for row in conn.execute("SELECT * FROM notices")
         if (link := normalize_url(row["link"]))
     }
 
 
 def get_notice_row(conn: sqlite3.Connection, url: str) -> sqlite3.Row | None:
-    return conn.execute(f"SELECT * FROM {DB_TABLE_NAME} WHERE link=?", (normalize_url(url),)).fetchone()
+    return conn.execute("SELECT * FROM notices WHERE link=?", (normalize_url(url),)).fetchone()
 
 
 def parse_attachments_json(value: str | None) -> list[str]:
@@ -501,7 +368,11 @@ def merge_cached_notice(listing_notice: Notice, existing: sqlite3.Row | None) ->
     cached_attachments = parse_attachments_json(existing["attachments_json"])
     cached_title = existing["title"] or ""
     title = listing_notice.title
-    if cached_title and "..." in listing_notice.title and "..." not in cached_title:
+    if cached_title and (
+        cached_body
+        or cached_attachments
+        or ("..." in listing_notice.title and "..." not in cached_title)
+    ):
         title = cached_title
 
     return Notice(
@@ -518,12 +389,11 @@ def upsert_seen_notice(
     conn: sqlite3.Connection,
     notice: Notice,
     content_hash: str,
-    return_row: bool = True,
-) -> sqlite3.Row | None:
+) -> None:
     now = utc_now()
     conn.execute(
-        f"""
-        INSERT INTO {DB_TABLE_NAME}
+        """
+        INSERT INTO notices
             (title, description, link, published_date, body_text, attachments_json,
              content_hash, first_seen_at, last_seen_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -548,16 +418,13 @@ def upsert_seen_notice(
             now,
         ),
     )
-    if return_row:
-        return get_notice_row(conn, notice.url)
-    return None
 
 
 def mark_notified(conn: sqlite3.Connection, notice_url: str, content_hash: str) -> None:
     now = utc_now()
     conn.execute(
-        f"""
-        UPDATE {DB_TABLE_NAME}
+        """
+        UPDATE notices
         SET sent_at=COALESCE(sent_at, ?),
             last_notified_hash=?
         WHERE link=?
@@ -570,8 +437,8 @@ def mark_notified(conn: sqlite3.Connection, notice_url: str, content_hash: str) 
 def seed_without_notification(conn: sqlite3.Connection, notice_url: str, content_hash: str) -> None:
     now = utc_now()
     conn.execute(
-        f"""
-        UPDATE {DB_TABLE_NAME}
+        """
+        UPDATE notices
         SET sent_at=COALESCE(sent_at, ?),
             last_notified_hash=?
         WHERE link=?
@@ -640,13 +507,7 @@ def send_telegram_message(
 
 
 def should_fetch_detail(existing: sqlite3.Row | None, index: int) -> bool:
-    if index >= DETAIL_FETCH_LIMIT:
-        return False
-    if existing is None:
-        return True
-    if not existing["body_text"]:
-        return True
-    return FETCH_DETAILS_FOR_EXISTING
+    return index < DETAIL_FETCH_LIMIT and (existing is None or not existing["body_text"])
 
 
 def process_notices(
@@ -685,11 +546,11 @@ def process_notices(
         previous_notified_hash = existing["last_notified_hash"] if existing else None
         had_detail_before = bool(existing and existing["body_text"])
 
-        upsert_seen_notice(conn, notice, new_hash, return_row=False)
+        upsert_seen_notice(conn, notice, new_hash)
 
         if existing is None:
             new_count += 1
-            if first_run and not SEND_EXISTING_ON_FIRST_RUN:
+            if first_run:
                 seed_without_notification(conn, notice.url, new_hash)
                 logging.info("Seeded existing notice without Telegram notification: %s", notice.title)
                 continue
@@ -729,9 +590,9 @@ def process_notices(
 
 def generate_rss_feed(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
-        f"""
+        """
         SELECT title, description, link, published_date, body_text
-        FROM {DB_TABLE_NAME}
+        FROM notices
         ORDER BY COALESCE(published_date, '') DESC, id DESC
         LIMIT ?
         """,
@@ -819,7 +680,7 @@ def main() -> int:
 
     with connect_db() as conn:
         ensure_schema(conn)
-        first_run = conn.execute(f"SELECT COUNT(*) FROM {DB_TABLE_NAME}").fetchone()[0] == 0
+        first_run = conn.execute("SELECT COUNT(*) FROM notices").fetchone()[0] == 0
         existing_by_url = load_existing_notice_rows(conn)
         known_links = set(existing_by_url)
 
