@@ -39,7 +39,7 @@ DB_NAME = "aiub_notices.db"
 DB_TIMEOUT = 30.0
 RSS_FEED_FILE = "rss.xml"
 RSS_ITEM_LIMIT = 500
-SCRIPT_VERSION = "5.0"
+SCRIPT_VERSION = "5.1"
 
 POST_XPATH = (
     "//div[contains(concat(' ', normalize-space(@class), ' '), ' notification ') "
