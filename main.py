@@ -455,7 +455,7 @@ def truncate_text(text: str, limit: int) -> str:
 
 
 def format_notice_message(notice: Notice, gh_run_no: str, edited: bool = False) -> str:
-    description = notice.description or first_nonempty_line(notice.body_text) or "Please click the link for details."
+    description = notice.body_text or notice.description or "Please click the link for details."
     message = (
         f"{'[EDITED] ' if edited else ''}{truncate_text(notice.title, 500)}\n\n"
         f"Date: {display_date(notice.published_date)}\n\n"
