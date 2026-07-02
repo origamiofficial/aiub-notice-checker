@@ -31,7 +31,7 @@ MAX_LIST_PAGES = 60
 MIN_SCAN_PAGES = 2
 REQUEST_TIMEOUT = (5.0, 30.0)
 DETAIL_FETCH_LIMIT = LIST_PAGE_SIZE
-DRY_RUN = os.environ.get("DRY_RUN", "true").lower() in {"1", "true", "yes"}
+DRY_RUN = os.environ.get("DRY_RUN", "false").lower() in {"1", "true", "yes"}
 TELEGRAM_MAX_RETRIES = 3
 TELEGRAM_RETRY_BACKOFF = 2.0
 
