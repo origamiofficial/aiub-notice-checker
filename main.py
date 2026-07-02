@@ -744,7 +744,24 @@ def main() -> int:
         existing_by_url = load_existing_notice_rows(conn)
         known_links = set(existing_by_url)
 
-        notices = crawl_notices(aiub_session, known_links)
+        try:
+            notices = crawl_notices(aiub_session, known_links)
+        except requests.RequestException as exc:
+            logging.error("AIUB notices page could not be reached: %s", exc)
+            admin_chat_id = config.get("admin_chat_id")
+            if admin_chat_id:
+                send_telegram_message(
+                    telegram_session,
+                    str(admin_chat_id),
+                    (
+                        "AIUB Notice\n\nThe AIUB notices page could not be reached. "
+                        "This run will be skipped and retried by the next schedule."
+                    ),
+                    config,
+                    "admin notification",
+                )
+            return 0
+
         if not notices:
             admin_chat_id = config.get("admin_chat_id")
             if admin_chat_id:
