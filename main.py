@@ -39,7 +39,10 @@ DB_NAME = "aiub_notices.db"
 DB_TIMEOUT = 30.0
 RSS_FEED_FILE = "rss.xml"
 RSS_ITEM_LIMIT = 500
-SCRIPT_VERSION = "5.2"
+SCRIPT_VERSION = "5.3"
+
+# How much of a dry-run "would send" message to preview in the logs.
+DRY_RUN_PREVIEW_CHARS = 300
 
 POST_XPATH = (
     "//div[contains(concat(' ', normalize-space(@class), ' '), ' notification ') "
@@ -56,6 +59,7 @@ DETAIL_BODY_XPATH = (
     "and not(contains(concat(' ', normalize-space(@class), ' '), ' notice-sticky-header '))]"
 )
 
+
 @dataclass
 class Notice:
     title: str
@@ -71,8 +75,11 @@ class Notice:
 
 
 def configure_logging() -> None:
+    # During dry runs, default to DEBUG so every per-notice decision line
+    # (including [UNCHANGED]) is visible. Can still be overridden via LOG_LEVEL.
+    default_level = "DEBUG" if DRY_RUN else "INFO"
     logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO"),
+        level=os.environ.get("LOG_LEVEL", default_level),
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
@@ -163,8 +170,10 @@ def create_telegram_session() -> requests.Session:
 
 
 def fetch_html(session: requests.Session, url: str) -> lxml_html.HtmlElement:
+    logging.debug("HTTP GET %s", url)
     response = session.get(url, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
+    logging.debug("HTTP %s for %s (%s bytes)", response.status_code, url, len(response.content))
     return lxml_html.fromstring(response.content)
 
 
@@ -223,7 +232,12 @@ def parse_detail_page(tree: lxml_html.HtmlElement, fallback: Notice) -> Notice:
 def enrich_notice(session: requests.Session, notice: Notice) -> Notice:
     try:
         tree = fetch_html(session, notice.url)
-        return parse_detail_page(tree, notice)
+        enriched = parse_detail_page(tree, notice)
+        logging.debug(
+            "Enriched %s: body_len=%s attachments=%s",
+            notice.url, len(enriched.body_text), len(enriched.attachments or []),
+        )
+        return enriched
     except (requests.RequestException, etree.ParserError, ValueError) as exc:
         logging.warning("Could not fetch notice detail %s: %s", notice.url, exc)
         return notice
@@ -236,9 +250,10 @@ def crawl_notices(session: requests.Session, known_links: set[str]) -> list[Noti
 
     for page_no in range(1, MAX_LIST_PAGES + 1):
         url = f"{BASE_URL}{NOTICE_PATH}?pageNo={page_no}&pageSize={LIST_PAGE_SIZE}"
-        logging.info("Fetching listing page %s", page_no)
+        logging.info("Fetching listing page %s: %s", page_no, url)
         tree = fetch_html(session, url)
         page_notices = parse_listing_page(tree)
+        logging.info("Page %s returned %s notices.", page_no, len(page_notices))
 
         if not page_notices:
             logging.info("Stopping at page %s because it returned no notices.", page_no)
@@ -251,6 +266,7 @@ def crawl_notices(session: requests.Session, known_links: set[str]) -> list[Noti
         seen_page_fingerprints.add(fingerprint)
 
         page_has_new_link = False
+        new_on_page = 0
         for notice in page_notices:
             if notice.url in seen_links:
                 continue
@@ -258,11 +274,14 @@ def crawl_notices(session: requests.Session, known_links: set[str]) -> list[Noti
             notices.append(notice)
             if notice.url not in known_links:
                 page_has_new_link = True
+                new_on_page += 1
+        logging.info("Page %s: %s links not previously known to the DB.", page_no, new_on_page)
 
         if known_links and page_no >= MIN_SCAN_PAGES and not page_has_new_link:
             logging.info("Stopping at page %s because all links on the page are already known.", page_no)
             break
 
+    logging.info("Crawl finished: %s total unique notices collected across all pages.", len(notices))
     return notices
 
 
@@ -336,11 +355,13 @@ def notice_hash(notice: Notice) -> str:
 
 
 def load_existing_notice_rows(conn: sqlite3.Connection) -> dict[str, sqlite3.Row]:
-    return {
+    rows = {
         link: row
         for row in conn.execute("SELECT * FROM notices")
         if (link := normalize_url(row["link"]))
     }
+    logging.info("Loaded %s existing notices from the database.", len(rows))
+    return rows
 
 
 def get_notice_row(conn: sqlite3.Connection, url: str) -> sqlite3.Row | None:
@@ -481,7 +502,15 @@ def send_telegram_message(
     label: str,
 ) -> bool:
     if DRY_RUN:
-        logging.info("DRY_RUN: would send %s to Telegram chat %s", label, chat_id)
+        preview = (
+            message if len(message) <= DRY_RUN_PREVIEW_CHARS
+            else message[:DRY_RUN_PREVIEW_CHARS] + "...[truncated]"
+        )
+        logging.info(
+            "DRY_RUN: would send '%s' to chat %s (%d chars)\n"
+            "----- message preview -----\n%s\n----- end preview -----",
+            label, chat_id, len(message), preview,
+        )
         return True
 
     bot_api_key = config["bot_api_key"]
@@ -522,6 +551,7 @@ def process_notices(
     new_count = 0
     edited_count = 0
     failed_notifications = 0
+    unchanged_count = 0
     chat_id = str(config["chat_id"])
     gh_run_no = str(config["github_run_number"])
     existing_by_url = existing_by_url or load_existing_notice_rows(conn)
@@ -531,7 +561,11 @@ def process_notices(
         for index, listing_notice in enumerate(notices)
         if should_fetch_detail(existing_by_url.get(listing_notice.url), index)
     ]
-    enriched_by_url = {notice.url: enrich_notice(aiub_session, notice) for notice in detail_targets}
+    logging.info("Fetching detail pages for %s/%s notices.", len(detail_targets), len(notices))
+    enriched_by_url: dict[str, Notice] = {}
+    for i, notice in enumerate(detail_targets, 1):
+        logging.info("Detail fetch [%s/%s]: %s", i, len(detail_targets), notice.url)
+        enriched_by_url[notice.url] = enrich_notice(aiub_session, notice)
 
     for index, listing_notice in enumerate(notices):
         existing = existing_by_url.get(listing_notice.url)
@@ -552,38 +586,56 @@ def process_notices(
             new_count += 1
             if first_run:
                 seed_without_notification(conn, notice.url, new_hash)
-                logging.info("Seeded existing notice without Telegram notification: %s", notice.title)
+                logging.info("[SEED-FIRSTRUN] %s -> %s", notice.title, notice.url)
                 continue
 
+            logging.info("[NEW] %s -> %s", notice.title, notice.url)
             message = format_notice_message(notice, gh_run_no, edited=False)
             if send_telegram_message(telegram_session, chat_id, message, config, notice.title):
                 mark_notified(conn, notice.url, new_hash)
             else:
                 failed_notifications += 1
+                logging.warning("[NEW-SEND-FAILED] %s -> %s", notice.title, notice.url)
             continue
 
         if existing["sent_at"] is None:
+            logging.info("[RESEND-UNSENT] %s -> %s", notice.title, notice.url)
             message = format_notice_message(notice, gh_run_no, edited=False)
             if send_telegram_message(telegram_session, chat_id, message, config, notice.title):
                 mark_notified(conn, notice.url, new_hash)
             else:
                 failed_notifications += 1
+                logging.warning("[RESEND-FAILED] %s -> %s", notice.title, notice.url)
             continue
 
         if previous_hash and previous_hash != new_hash:
             if not had_detail_before:
                 seed_without_notification(conn, notice.url, new_hash)
-                logging.info("Backfilled detail data without edit notification: %s", notice.title)
+                logging.info("[BACKFILL-NO-NOTIFY] %s -> %s", notice.title, notice.url)
                 continue
 
             if previous_notified_hash != new_hash:
                 edited_count += 1
+                logging.info(
+                    "[EDITED] %s -> %s (old_hash=%s new_hash=%s)",
+                    notice.title, notice.url, (previous_hash or "")[:8], new_hash[:8],
+                )
                 message = format_notice_message(notice, gh_run_no, edited=True)
                 if send_telegram_message(telegram_session, chat_id, message, config, notice.title):
                     mark_notified(conn, notice.url, new_hash)
                 else:
                     failed_notifications += 1
+                    logging.warning("[EDIT-SEND-FAILED] %s -> %s", notice.title, notice.url)
+            else:
+                logging.info("[EDITED-ALREADY-NOTIFIED] %s -> %s (no resend)", notice.title, notice.url)
+        else:
+            unchanged_count += 1
+            logging.debug("[UNCHANGED] %s -> %s", notice.title, notice.url)
 
+    logging.info(
+        "process_notices summary: new=%s edited=%s unchanged=%s failed=%s",
+        new_count, edited_count, unchanged_count, failed_notifications,
+    )
     conn.commit()
     return new_count, edited_count, failed_notifications
 
@@ -598,6 +650,7 @@ def generate_rss_feed(conn: sqlite3.Connection) -> None:
         """,
         (RSS_ITEM_LIMIT,),
     ).fetchall()
+    logging.info("Generating RSS feed with %s items.", len(rows))
 
     ET.register_namespace("atom", "http://www.w3.org/2005/Atom")
     rss = ET.Element("rss", version="2.0")
@@ -611,10 +664,12 @@ def generate_rss_feed(conn: sqlite3.Connection) -> None:
     self_link.set("type", "application/rss+xml")
     self_link.set("href", "https://raw.githubusercontent.com/origamiofficial/aiub-notice-checker/main/rss.xml")
 
+    skipped = 0
     for row in rows:
         link = normalize_url(row["link"])
         if not link:
             logging.warning("Skipping RSS item with invalid link: %r", row["link"])
+            skipped += 1
             continue
         item = ET.SubElement(channel, "item")
         ET.SubElement(item, "title").text = row["title"]
@@ -643,7 +698,7 @@ def generate_rss_feed(conn: sqlite3.Connection) -> None:
     finally:
         if temp_path and os.path.exists(temp_path):
             os.unlink(temp_path)
-    logging.info("RSS feed generated at %s", RSS_FEED_FILE)
+    logging.info("RSS feed generated at %s (%s items, %s skipped).", RSS_FEED_FILE, len(rows) - skipped, skipped)
 
 
 def rss_pub_date(iso_date: str | None) -> str | None:
@@ -673,14 +728,19 @@ def load_config() -> dict[str, str | None]:
 
 def main() -> int:
     configure_logging()
-    logging.info("AIUB notice checker v%s starting.", SCRIPT_VERSION)
+    logging.info("AIUB notice checker v%s starting. DRY_RUN=%s", SCRIPT_VERSION, DRY_RUN)
     config = load_config()
+    logging.info(
+        "Config: chat_id=%s admin_chat_id=%s github_run_number=%s",
+        config["chat_id"], config["admin_chat_id"], config["github_run_number"],
+    )
     aiub_session = create_aiub_session()
     telegram_session = create_telegram_session()
 
     with connect_db() as conn:
         ensure_schema(conn)
         first_run = conn.execute("SELECT COUNT(*) FROM notices").fetchone()[0] == 0
+        logging.info("first_run=%s", first_run)
         existing_by_url = load_existing_notice_rows(conn)
         known_links = set(existing_by_url)
 
