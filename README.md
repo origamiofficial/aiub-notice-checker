@@ -1,122 +1,63 @@
 # AIUB Notice Checker
 
-[![Facebook](https://raw.githubusercontent.com/gauravghongde/social-icons/master/SVG/Color/Facebook.svg)](https://facebook.com/aiubnotice)
-[![Telegram](https://raw.githubusercontent.com/gauravghongde/social-icons/master/SVG/Color/Telegram.svg)](https://t.me/aiubnotice)
-[![Twitter](https://raw.githubusercontent.com/gauravghongde/social-icons/master/SVG/Color/Twitter.svg)](https://twitter.com/aiubnotice)
-[![LinkedIn](https://raw.githubusercontent.com/gauravghongde/social-icons/master/SVG/Color/LinkedIN.svg)](https://linkedin.com/in/aiubnotice)
-[![Discord](https://raw.githubusercontent.com/gauravghongde/social-icons/master/SVG/Color/Discord.svg)](https://discord.gg/M8XVrA2Fnb)
-
 [![AIUB Notice Checker](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/aiub-notice-checker.yml/badge.svg)](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/aiub-notice-checker.yml)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/origamiofficial/aiub-notice-checker)
-![We Support](https://img.shields.io/badge/we%20stand%20with-%F0%9F%87%B5%F0%9F%87%B8%20palestine-white.svg)
-[![Hits](https://hits.seeyoufarm.com/api/count/incr/badge.svg?url=https://github.com/origamiofficial/aiub-notice-checker&icon=github.svg&icon_color=%23FFFFFF&title=hits&edge_flat=false)](https://github.com/origamiofficial/aiub-notice-checker)
+[![Telegram](https://raw.githubusercontent.com/gauravghongde/social-icons/master/SVG/Color/Telegram.svg)](https://t.me/aiubnotice)
 
-A Python script that monitors the [AIUB Notice page](https://www.aiub.edu/category/notices/) for new or edited posts and instantly sends updates to a specified Telegram channel.
+Monitors the [AIUB notices page](https://www.aiub.edu/category/notices/), saves notices in SQLite, sends new and edited notices to Telegram, and publishes an [RSS feed](https://raw.githubusercontent.com/origamiofficial/aiub-notice-checker/main/rss.xml).
 
----
+The GitHub Actions workflow requests a run every five minutes. [Scheduled runs can be delayed or dropped by GitHub](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule), so delivery time is not guaranteed.
 
-## 📡 RSS Feed
+## How it works
 
-Subscribe to get notices in any RSS reader:
+- The first validated scan of an empty database seeds the archive without announcing old notices.
+- Later scans detect new listings and revisit detail pages in bounded batches to find edits, including attachment changes. Periodic full listing scans catch older or backdated additions.
+- A failed Telegram send remains pending for a later run. Each run attempts at most 20 deliveries and honors Telegram rate limits. Delivery is at least once: a lost response or failed state commit can cause a duplicate message.
+- Listing, pagination, and sampled detail-page validation failures fail the run; an optional admin chat receives source-health alerts.
+- Telegram notice links include the GitHub Actions run number as a URL fragment so each message can be traced to the run that posted it.
+- The workflow commits only `aiub_notices.db` and `rss.xml`. Concurrent checker runs are serialized, and a rejected Git push fails the job rather than overwriting repository history.
+- Production executes `main.py` and its dependencies from the latest stable GitHub release. Changes on `main` remain a playground until compile checks, unit tests, and a live AIUB smoke test pass.
+- The RSS feed contains up to 500 recently discovered or changed notices. Item IDs stay stable, though individual readers decide whether to display an edit as new.
 
-[![Valid RSS](https://validator.w3.org/feed/images/valid-rss-rogers.png)](http://validator.w3.org/feed/check.cgi?url=https%3A//github.com/origamiofficial/aiub-notice-checker/raw/main/rss.xml)
+## Stable releases
 
-```
-https://github.com/origamiofficial/aiub-notice-checker/raw/main/rss.xml
-```
+Pushes that change `main.py` or `requirements.txt` run the complete test workflow. After every check passes, the workflow increments the latest numeric release by `0.1`, validates the exact versioned source against the live AIUB site, creates an annotated tag, and publishes `main.py`, `requirements.txt`, and their SHA-256 checksums as the latest release.
 
----
+If any check fails, no tag or release is created. Scheduled notice checks continue using the previous latest release and never execute the failing playground copy.
 
-## ✨ Features
+## Run locally
 
-| Feature | Description |
-|---|---|
-| 🔄 Auto-update | Checks for script updates on every run and updates itself automatically |
-| 🌐 Site health check | Verifies AIUB website is accessible before scraping |
-| 🔍 XPath validation | Detects if the page structure has changed and alerts when XPaths need fixing |
-| 🗄️ SQLite database | Stores all past notices locally to detect both new posts and edits |
-| 📨 Telegram notifications | Sends formatted messages to your channel via the Telegram Bot API |
-| 📰 RSS generation | Auto-generates an RSS 2.0 feed from the database after every run |
+Use Python 3.13 and install the pinned dependencies:
 
----
-
-## 📋 Requirements
-
-- Python 3.6 or higher
-- `requests` library
-- `lxml` library
-- The following environment variables set with valid values:
-
-| Variable | Purpose |
-|---|---|
-| `TELEGRAM_CHAT_ID` | The channel where notices are sent |
-| `TELEGRAM_ADMIN_CHAT_ID` | Admin chat for error and debug alerts |
-| `TELEGRAM_BOT_API_KEY` | Your Telegram bot token |
-| `GITHUB_RUN_NUMBER` | Used internally for version tracking |
-
----
-
-## 🚀 Setup & Usage
-
-**1. Clone the repository**
 ```bash
-git clone https://github.com/origamiofficial/aiub-notice-checker
-cd aiub-notice-checker
+python -m pip install -r requirements.txt
 ```
 
-**2. Install dependencies**
-```bash
-pip install -r requirements.txt
-```
+Set `TELEGRAM_BOT_API_KEY` and `TELEGRAM_CHAT_ID` for live notifications. `TELEGRAM_ADMIN_CHAT_ID` is optional and receives source error alerts. Then run:
 
-**3. Set your environment variables**
-```bash
-export TELEGRAM_CHAT_ID=your_channel_id
-export TELEGRAM_ADMIN_CHAT_ID=your_admin_chat_id
-export TELEGRAM_BOT_API_KEY=your_bot_token
-export GITHUB_RUN_NUMBER=1
-```
-
-**4. Run the script**
 ```bash
 python main.py
 ```
 
----
+For a preview without Telegram delivery or changes to the tracked database and RSS file, set `DRY_RUN=true`:
 
-## ⚙️ How It Works
-
-```
-Start
-  │
-  ├─ 1. Check for script updates → auto-replace if newer version found
-  │
-  ├─ 2. Ping AIUB website → exit gracefully if unreachable
-  │
-  ├─ 3. Validate XPath expressions → alert admin if site structure changed
-  │
-  ├─ 4. Connect to SQLite database → create new DB if first run
-  │
-  ├─ 5. Scrape all notices from the AIUB Notice page
-  │
-  ├─ 6. Compare each notice against database
-  │       ├─ New post?    → flag for Telegram notification
-  │       └─ Edited post? → flag for Telegram notification
-  │
-  ├─ 7. Rebuild RSS feed from updated database
-  │
-  ├─ 8. Send Telegram messages for all new/edited notices
-  │
-  └─ 9. Save updated state to database → close connection
+```bash
+DRY_RUN=true python main.py
 ```
 
----
+Run the offline checks with:
 
-## 🤝 Contribution
+```bash
+python -m unittest discover -v
+```
 
-If AIUB updates their website and breaks the scraper, **only the XPath expressions need updating** — the rest of the script stays the same. Pull requests for XPath fixes or any other improvements are very welcome.
+## RSS
 
-> **Note:** You don't need to manually bump the script version when making changes — it updates itself automatically via the `GITHUB_RUN_NUMBER` mechanism.
+Subscribe with any RSS reader:
 
----
+```text
+https://raw.githubusercontent.com/origamiofficial/aiub-notice-checker/main/rss.xml
+```
 
+## Contributing
+
+Pull requests for parser fixes and other improvements are welcome. Pull requests run offline validation without publishing a release; stable releases are created only after tested runtime changes reach `main`.

@@ -1,0 +1,130 @@
+name: Tests and Stable Release
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'aiub_notices.db'
+      - 'rss.xml'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements.txt
+      - run: python -m py_compile main.py live_smoke.py release_version.py test_main.py test_release_version.py
+      - run: python -m unittest discover -v
+
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: stable-release-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Detect runtime changes
+        id: changes
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          base="$BEFORE_SHA"
+          if [[ "$base" =~ ^0+$ ]] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD^)"
+          fi
+          if git diff --quiet "$base" "$GITHUB_SHA" -- main.py requirements.txt; then
+            echo 'runtime=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'runtime=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Prepare versioned release source
+        id: version
+        if: steps.changes.outputs.runtime == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --force --tags origin
+          latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name' 2>/dev/null || true)"
+          if [[ -z "$latest" ]]; then
+            latest="$(git tag --list '[0-9]*.[0-9]' --sort=-version:refname | head -n 1)"
+          fi
+          if [[ -n "$latest" ]]; then
+            release_commit="$(git rev-parse "${latest}^{commit}")"
+            release_parent="$(git rev-parse "${release_commit}^" 2>/dev/null || true)"
+            if [[ "$release_parent" == "$GITHUB_SHA" ]]; then
+              echo 'skip=true' >> "$GITHUB_OUTPUT"
+              echo "version=$latest" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          version="$(python release_version.py next "$latest")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo 'skip=false' >> "$GITHUB_OUTPUT"
+          if git rev-parse --verify --quiet "refs/tags/$version" >/dev/null; then
+            release_commit="$(git rev-parse "${version}^{commit}")"
+            release_parent="$(git rev-parse "${release_commit}^")"
+            if [[ "$release_parent" != "$GITHUB_SHA" ]]; then
+              echo "Release tag $version already belongs to another source commit" >&2
+              exit 1
+            fi
+            git checkout --detach "$version"
+            echo 'tag_exists=true' >> "$GITHUB_OUTPUT"
+          else
+            python release_version.py set "$version"
+            echo 'tag_exists=false' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        if: steps.changes.outputs.runtime == 'true' && steps.version.outputs.skip != 'true'
+        with:
+          python-version: '3.13'
+      - name: Install release dependencies
+        if: steps.changes.outputs.runtime == 'true' && steps.version.outputs.skip != 'true'
+        run: python -m pip install -r requirements.txt
+      - name: Validate exact release source
+        if: steps.changes.outputs.runtime == 'true' && steps.version.outputs.skip != 'true'
+        run: |
+          python -m py_compile main.py live_smoke.py release_version.py test_main.py test_release_version.py
+          python -m unittest discover -v
+          python live_smoke.py
+      - name: Publish stable release
+        if: steps.changes.outputs.runtime == 'true' && steps.version.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          TAG_EXISTS: ${{ steps.version.outputs.tag_exists }}
+        run: |
+          if [[ "$TAG_EXISTS" != 'true' ]]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add -- main.py
+            git commit -m "Release $RELEASE_VERSION"
+            git tag -a "$RELEASE_VERSION" -m "Stable release $RELEASE_VERSION"
+            git push origin "refs/tags/$RELEASE_VERSION"
+          fi
+          sha256sum main.py requirements.txt > SHA256SUMS
+          cat > release-notes.md <<EOF
+          Stable automated release $RELEASE_VERSION.
+
+          Source commit: $GITHUB_SHA
+          Validation: compile, unit tests, and live AIUB compatibility smoke test passed.
+          EOF
+          gh release create "$RELEASE_VERSION" main.py requirements.txt SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --latest \
+            --title "$RELEASE_VERSION" --notes-file release-notes.md

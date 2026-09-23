@@ -14,6 +14,9 @@ name: "CodeQL"
 on:
   push:
     branches: [ "main" ]
+    paths-ignore:
+      - 'aiub_notices.db'
+      - 'rss.xml'
   pull_request:
     # The branches below must be a subset of the branches above
     branches: [ "main" ]
@@ -24,6 +27,7 @@ jobs:
   analyze:
     name: Analyze
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       actions: read
       contents: read
@@ -40,11 +44,11 @@ jobs:
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v7
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
-      uses: github/codeql-action/init@v4.37.4
+      uses: github/codeql-action/init@c23de5a82f64bb08c6d9f28844551440ca298e76 # v4.38.1
       with:
         languages: ${{ matrix.language }}
         # If you wish to specify custom queries, you can do so here or in a config file.
@@ -58,7 +62,7 @@ jobs:
     # Autobuild attempts to build any compiled languages  (C/C++, C#, Go, or Java).
     # If this step fails, then you should remove it and run the build manually (see below)
     - name: Autobuild
-      uses: github/codeql-action/autobuild@v4.37.4
+      uses: github/codeql-action/autobuild@c23de5a82f64bb08c6d9f28844551440ca298e76 # v4.38.1
 
     # ℹ️ Command-line programs to run using the OS shell.
     # 📚 See https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsrun
@@ -71,6 +75,6 @@ jobs:
     #   ./location_of_script_within_repo/buildscript.sh
 
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v4.37.4
+      uses: github/codeql-action/analyze@c23de5a82f64bb08c6d9f28844551440ca298e76 # v4.38.1
       with:
         category: "/language:${{matrix.language}}"

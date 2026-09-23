@@ -5,43 +5,94 @@ on:
   schedule:
     - cron: '*/5 * * * *'
 
+permissions:
+  contents: write
+
+concurrency:
+  group: aiub-notice-state-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   check-notices:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - 
-        uses: actions/checkout@v7
-      - 
-        name: Set up Python
-        uses: actions/setup-python@v7
+      - name: Checkout production state
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          python-version: '3.8'
-          check-latest: true
-      - 
-        name: Install dependencies
+          ref: main
+      - name: Resolve latest stable release
+        id: stable
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      - 
-        name: Run script
+          tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')"
+          if [[ ! "$tag" =~ ^[0-9]+\.[0-9]$ ]]; then
+            echo "Latest release tag is not a supported numeric version: $tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Checkout stable release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ steps.stable.outputs.tag }}
+          path: .stable-release
+          persist-credentials: false
+      - name: Download and verify stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.stable.outputs.tag }}
+        run: |
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern main.py --dir .stable-release --clobber
+          if [[ "$RELEASE_TAG" == '5.4' ]]; then
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern requirements.txt --dir .stable-release --clobber || true
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern SHA256SUMS --dir .stable-release --clobber || true
+          else
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern requirements.txt --dir .stable-release --clobber
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern SHA256SUMS --dir .stable-release --clobber
+          fi
+          if [[ -f .stable-release/SHA256SUMS ]]; then
+            (cd .stable-release && sha256sum --check --strict SHA256SUMS)
+          fi
+          RELEASE_TAG="$RELEASE_TAG" python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          source = Path('.stable-release/main.py').read_text(encoding='utf-8')
+          match = re.search(r'^SCRIPT_VERSION = "(\d+\.\d)"$', source, re.MULTILINE)
+          if not match or match.group(1) != os.environ['RELEASE_TAG']:
+              raise SystemExit('Released main.py version does not match its release tag')
+          print(f"Using stable AIUB checker release {match.group(1)}")
+          PY
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.13'
+      - name: Install dependencies
+        run: python -m pip install -r .stable-release/requirements.txt
+      - name: Check notices
+        id: checker
+        continue-on-error: true
         env:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
           TELEGRAM_BOT_API_KEY: ${{ secrets.TELEGRAM_BOT_API_KEY }}
           GITHUB_RUN_NUMBER: ${{ github.run_number }}
-        run: python main.py
-      -
-        name: Commit files
+        run: python .stable-release/main.py
+      - name: Persist notice state
         run: |
-          if [[ $(git status) == *"nothing to commit, working tree clean"* ]]; then
-          exit 0
-          fi
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git commit -a -m "Notices Updated"
-      -
-        name: Push changes to repository
-        uses: ad-m/github-push-action@master
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          force: true
+          git add -- aiub_notices.db rss.xml
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Update notice state'
+          git push origin HEAD:main
+      - name: Report checker failure
+        if: steps.checker.outcome == 'failure'
+        run: exit 1
