@@ -48,7 +48,7 @@ DB_NAME = "aiub_notices.db"
 DB_TIMEOUT = 30.0
 RSS_FEED_FILE = "rss.xml"
 RSS_ITEM_LIMIT = 500
-SCRIPT_VERSION = "5.4"
+SCRIPT_VERSION = "5.5"
 
 # How much of a dry-run "would send" message to preview in the logs.
 DRY_RUN_PREVIEW_CHARS = 300
