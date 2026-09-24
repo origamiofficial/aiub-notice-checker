@@ -641,17 +641,7 @@ def format_notice_message(notice: Notice, gh_run_no: str = "local", edited: bool
     )
     suffix = f"\n\n{notice.url}#{gh_run_no}"
     description = truncate_text(description, min(1600, max(4, 4096 - len(header) - len(suffix))))
-    message = header + description
-    if notice.attachments:
-        links = ""
-        for url in notice.attachments:
-            addition = f"\n{url}"
-            if len(message) + len("\n\nLinks and media:") + len(links) + len(addition) + len(suffix) > 4096:
-                break
-            links += addition
-        if links:
-            message += "\n\nLinks and media:" + links
-    message += suffix
+    message = header + description + suffix
     if len(message) > 4096:
         raise ValueError(f"Telegram message exceeds 4096 characters for {notice.url}")
     return message
@@ -999,7 +989,7 @@ def process_notices(
 def generate_rss_feed(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
         """
-        SELECT title, description, link, published_date, body_text, attachments_json, content_changed_at
+        SELECT title, description, link, published_date, body_text, content_changed_at
         FROM notices
         ORDER BY content_changed_at DESC, id ASC
         LIMIT ?
@@ -1036,9 +1026,6 @@ def generate_rss_feed(conn: sqlite3.Connection) -> None:
         item = etree.SubElement(channel, "item")
         etree.SubElement(item, "title").text = row["title"]
         description = truncate_text(row["body_text"] or row["description"], 2000)
-        attachments = parse_attachments_json(row["attachments_json"])
-        if attachments:
-            description += "\n\nLinks and media:\n" + "\n".join(attachments)
         etree.SubElement(item, "description").text = description
         etree.SubElement(item, "link").text = link
         etree.SubElement(item, "guid").text = link

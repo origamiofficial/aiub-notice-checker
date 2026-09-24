@@ -565,6 +565,15 @@ class NoticeCheckerTests(unittest.TestCase):
         message = main.format_notice_message(notice, "12/../ bad")
         self.assertTrue(message.endswith("https://www.aiub.edu/notice#12..bad"))
 
+    def test_message_only_includes_main_notice_link(self):
+        attachment = "https://www.aiub.edu/Files/Uploads/details.pdf"
+        notice = main.Notice(
+            "Title", "Description", "https://www.aiub.edu/notice", "2026-09-22", "", [attachment]
+        )
+        message = main.format_notice_message(notice, "123")
+        self.assertNotIn(attachment, message)
+        self.assertTrue(message.endswith("https://www.aiub.edu/notice#123"))
+
     def test_dry_run_does_not_change_database_or_feed(self):
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "notices.db"
@@ -650,7 +659,7 @@ class NoticeCheckerTests(unittest.TestCase):
             )
         self.assertFalse(delivered)
 
-    def test_rss_keeps_stable_guid_and_shows_links(self):
+    def test_rss_keeps_stable_guid_without_attachment_links(self):
         conn = self.database()
         url = "https://www.aiub.edu/test-notice"
         pdf = "https://www.aiub.edu/Files/Uploads/details.pdf"
@@ -662,7 +671,7 @@ class NoticeCheckerTests(unittest.TestCase):
                 main.generate_rss_feed(conn)
             channel = ET.parse(feed_path).getroot().find("channel")
         self.assertEqual(channel.findtext("item/guid"), url)
-        self.assertIn(pdf, channel.findtext("item/description"))
+        self.assertNotIn(pdf, channel.findtext("item/description"))
         self.assertIsNotNone(channel.findtext("lastBuildDate"))
         conn.close()
 
