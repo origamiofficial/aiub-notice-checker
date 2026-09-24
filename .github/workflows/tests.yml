@@ -29,7 +29,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: write
     concurrency:
@@ -49,7 +49,8 @@ jobs:
           if [[ "$base" =~ ^0+$ ]] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
             base="$(git rev-parse HEAD^)"
           fi
-          if git diff --quiet "$base" "$GITHUB_SHA" -- main.py requirements.txt; then
+          if git diff --quiet "$base" "$GITHUB_SHA" -- main.py requirements.txt \
+            .github/workflows/tests.yml .github/workflows/aiub-notice-checker.yml; then
             echo 'runtime=false' >> "$GITHUB_OUTPUT"
           else
             echo 'runtime=true' >> "$GITHUB_OUTPUT"
@@ -84,7 +85,7 @@ jobs:
               echo "Release tag $version already belongs to another source commit" >&2
               exit 1
             fi
-            git checkout --detach "$version"
+            git cat-file blob "$version:main.py" > main.py
             echo 'tag_exists=true' >> "$GITHUB_OUTPUT"
           else
             python release_version.py set "$version"
@@ -103,12 +104,159 @@ jobs:
           python -m py_compile main.py live_smoke.py release_version.py test_main.py test_release_version.py
           python -m unittest discover -v
           python live_smoke.py
+      - name: Rebuild complete notice database
+        id: rebuild
+        if: steps.changes.outputs.runtime == 'true' && steps.version.outputs.skip != 'true'
+        env:
+          REBUILD_DIR: ${{ runner.temp }}/aiub-notice-rebuild
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p "$REBUILD_DIR"
+          if [[ -e "$REBUILD_DIR/aiub_notices.db" || -e "$REBUILD_DIR/rss.xml" ]]; then
+            echo 'Rebuild directory is not empty' >&2
+            exit 1
+          fi
+          (
+            cd "$REBUILD_DIR"
+            DRY_RUN=false \
+            LOG_LEVEL=WARNING \
+            TELEGRAM_BOT_API_KEY=historical-seed-no-send \
+            TELEGRAM_CHAT_ID=historical-seed-no-send \
+            python "$GITHUB_WORKSPACE/main.py"
+          )
+          count="$(python - "$REBUILD_DIR/aiub_notices.db" "$REBUILD_DIR/rss.xml" aiub_notices.db "$RELEASE_VERSION" <<'PY'
+          import sqlite3
+          import sys
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+
+          fresh_path, rss_path, previous_path = map(Path, sys.argv[1:4])
+          release_version = sys.argv[4]
+          fresh = sqlite3.connect(fresh_path)
+          fresh.execute(
+              "INSERT INTO app_state(key, value) VALUES('stable_release_version', ?) "
+              "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+              (release_version,),
+          )
+          fresh.commit()
+          integrity = fresh.execute("PRAGMA integrity_check").fetchone()[0]
+          count = fresh.execute("SELECT COUNT(*) FROM notices").fetchone()[0]
+          unique = fresh.execute("SELECT COUNT(DISTINCT link) FROM notices").fetchone()[0]
+          incomplete = fresh.execute(
+              "SELECT COUNT(*) FROM notices WHERE title IS NULL OR trim(title)='' "
+              "OR link IS NULL OR trim(link)='' OR published_date IS NULL OR content_hash=''"
+          ).fetchone()[0]
+          pending = fresh.execute(
+              "SELECT COUNT(*) FROM notices WHERE sent_at IS NULL OR last_notified_hash IS NULL "
+              "OR last_notified_hash != content_hash"
+          ).fetchone()[0]
+          details = fresh.execute(
+              "SELECT COUNT(*) FROM notices WHERE detail_fetched_at IS NOT NULL"
+          ).fetchone()[0]
+          full_scan = fresh.execute(
+              "SELECT value FROM app_state WHERE key='last_full_scan_at'"
+          ).fetchone()
+          state_version = fresh.execute(
+              "SELECT value FROM app_state WHERE key='stable_release_version'"
+          ).fetchone()
+          fresh.close()
+
+          if integrity != "ok":
+              raise SystemExit(f"Rebuilt database integrity failed: {integrity}")
+          if (not count or unique != count or incomplete or pending or not details or not full_scan
+                  or not state_version or state_version[0] != release_version):
+              raise SystemExit(
+                  f"Invalid rebuild: rows={count}, unique={unique}, incomplete={incomplete}, "
+                  f"pending={pending}, details={details}, full_scan={bool(full_scan)}, "
+                  f"state_version={state_version}"
+              )
+
+          if previous_path.exists():
+              previous = sqlite3.connect(f"file:{previous_path.resolve()}?mode=ro", uri=True)
+              previous_count = previous.execute("SELECT COUNT(*) FROM notices").fetchone()[0]
+              previous.close()
+              if count * 5 < previous_count * 4:
+                  raise SystemExit(
+                      f"Rebuilt archive shrank from {previous_count} to {count} notices"
+                  )
+
+          items = ET.parse(rss_path).getroot().findall("channel/item")
+          links = [item.findtext("link") for item in items]
+          if len(items) != min(500, count) or len(set(links)) != len(links):
+              raise SystemExit(
+                  f"Invalid rebuilt RSS: items={len(items)}, unique_links={len(set(links))}"
+              )
+          if any("Links and media:" in (item.findtext("description") or "") for item in items):
+              raise SystemExit("Rebuilt RSS contains attachment link lists")
+          print(count)
+          PY
+          )"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "Rebuilt and validated $count notices from the complete AIUB archive."
+      - name: Publish rebuilt notice state
+        if: steps.changes.outputs.runtime == 'true' && steps.version.outputs.skip != 'true'
+        env:
+          REBUILD_DIR: ${{ runner.temp }}/aiub-notice-rebuild
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cp main.py "$RUNNER_TEMP/release-main.py"
+          git checkout -- main.py
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          published=false
+          for attempt in 1 2 3; do
+            git fetch origin main
+            if ! git diff --quiet "$GITHUB_SHA" origin/main -- . \
+              ':(exclude)aiub_notices.db' ':(exclude)rss.xml'; then
+              echo 'main received code changes while the release was being validated' >&2
+              exit 1
+            fi
+            git checkout --detach origin/main
+            python - "$REBUILD_DIR/aiub_notices.db" aiub_notices.db <<'PY'
+          import sqlite3
+          import sys
+          from pathlib import Path
+
+          rebuilt_path, current_path = map(Path, sys.argv[1:])
+          rebuilt = sqlite3.connect(f"file:{rebuilt_path.resolve()}?mode=ro", uri=True)
+          current = sqlite3.connect(f"file:{current_path.resolve()}?mode=ro", uri=True)
+          rebuilt_links = {row[0] for row in rebuilt.execute("SELECT link FROM notices")}
+          current_links = {row[0] for row in current.execute("SELECT link FROM notices")}
+          rebuilt.close()
+          current.close()
+          missing = current_links - rebuilt_links
+          if missing:
+              raise SystemExit(
+                  f"Rebuild would discard {len(missing)} notices added to main during validation"
+              )
+          PY
+            cp "$REBUILD_DIR/aiub_notices.db" aiub_notices.db
+            cp "$REBUILD_DIR/rss.xml" rss.xml
+            git add -- aiub_notices.db rss.xml
+            if git diff --cached --quiet; then
+              published=true
+              break
+            fi
+            git commit -m "Rebuild notice state for release $RELEASE_VERSION"
+            if git push origin HEAD:main; then
+              published=true
+              break
+            fi
+            sleep "$((attempt * 5))"
+          done
+          if [[ "$published" != 'true' ]]; then
+            echo 'Could not publish rebuilt notice state after three attempts' >&2
+            exit 1
+          fi
+          git checkout --detach "$GITHUB_SHA"
+          cp "$RUNNER_TEMP/release-main.py" main.py
       - name: Publish stable release
         if: steps.changes.outputs.runtime == 'true' && steps.version.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_VERSION: ${{ steps.version.outputs.version }}
           TAG_EXISTS: ${{ steps.version.outputs.tag_exists }}
+          NOTICE_COUNT: ${{ steps.rebuild.outputs.count }}
         run: |
           if [[ "$TAG_EXISTS" != 'true' ]]; then
             git config user.name 'github-actions[bot]'
@@ -124,6 +272,7 @@ jobs:
 
           Source commit: $GITHUB_SHA
           Validation: compile, unit tests, and live AIUB compatibility smoke test passed.
+          Database: rebuilt from scratch and validated with $NOTICE_COUNT unique notices.
           EOF
           gh release create "$RELEASE_VERSION" main.py requirements.txt SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --verify-tag --latest \
