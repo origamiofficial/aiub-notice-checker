@@ -367,7 +367,8 @@ def crawl_notices(session: requests.Session, known_links: set[str], full_scan: b
         new_on_page = 0
         for notice in page_notices:
             if notice.url in seen_links:
-                raise ValueError(f"AIUB listing repeated notice across pages: {notice.url}")
+                logging.warning("AIUB listing repeated notice across pages: %s", notice.url)
+                continue
             seen_links.add(notice.url)
             notices.append(notice)
             if notice.url not in known_links:

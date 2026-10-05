@@ -173,7 +173,7 @@ class NoticeCheckerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 main.crawl_notices(None, set())
 
-    def test_cross_page_duplicate_is_rejected(self):
+    def test_cross_page_duplicate_is_ignored(self):
         def listing(urls, page):
             posts = "".join(
                 '<div class="notification"><h2 class="title">Notice</h2>'
@@ -193,8 +193,11 @@ class NoticeCheckerTests(unittest.TestCase):
             main, "fetch_html",
             side_effect=[listing(["/one", "/two"], 1), listing(["/two", "/three"], 2)],
         ):
-            with self.assertRaisesRegex(ValueError, "repeated notice"):
-                main.crawl_notices(None, set(), full_scan=True)
+            with self.assertLogs(level="WARNING") as logs:
+                notices = main.crawl_notices(None, set(), full_scan=True)
+            self.assertEqual(len(notices), 3)
+            self.assertEqual([n.url for n in notices], ["https://www.aiub.edu/one", "https://www.aiub.edu/two", "https://www.aiub.edu/three"])
+            self.assertTrue(any("repeated notice across pages" in log for log in logs.output))
 
     def test_full_scan_rejects_catastrophic_archive_shrink(self):
         posts = "".join(
