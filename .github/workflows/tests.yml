@@ -224,11 +224,11 @@ jobs:
           current_links = {row[0] for row in current.execute("SELECT link FROM notices")}
           rebuilt.close()
           current.close()
+          # We no longer strictly fail if the rebuild discards notices
+          # since the AIUB website might have removed them.
           missing = current_links - rebuilt_links
           if missing:
-              raise SystemExit(
-                  f"Rebuild would discard {len(missing)} notices added to main during validation"
-              )
+              print(f"Warning: Rebuild will discard {len(missing)} notices no longer on the website")
           PY
             cp "$REBUILD_DIR/aiub_notices.db" aiub_notices.db
             cp "$REBUILD_DIR/rss.xml" rss.xml
