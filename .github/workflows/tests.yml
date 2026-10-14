@@ -8,6 +8,7 @@ on:
       - 'aiub_notices.db'
       - 'rss.xml'
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -26,7 +27,7 @@ jobs:
       - run: python -m unittest discover -v
 
   release:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     needs: tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -46,7 +47,14 @@ jobs:
           BEFORE_SHA: ${{ github.event.before }}
         run: |
           base="$BEFORE_SHA"
-          if [[ "$base" =~ ^0+$ ]] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            git fetch --force --tags origin 2>/dev/null || true
+            latest="$(git tag --list '[0-9]*.[0-9]' --sort=-version:refname | head -n 1)"
+            if [[ -n "$latest" ]]; then
+              base="$(git rev-parse "${latest}^{commit}")"
+            fi
+          fi
+          if [[ -z "$base" || "$base" =~ ^0+$ ]] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
             base="$(git rev-parse HEAD^)"
           fi
           if git diff --quiet "$base" "$GITHUB_SHA" -- main.py requirements.txt \
@@ -228,7 +236,7 @@ jobs:
           # since the AIUB website might have removed them.
           missing = current_links - rebuilt_links
           if missing:
-              print(f"Warning: Rebuild will discard {len(missing)} notices no longer on the website")
+              print(f"Warning: Rebuild would discard {len(missing)} notices no longer on the website")
           PY
             cp "$REBUILD_DIR/aiub_notices.db" aiub_notices.db
             cp "$REBUILD_DIR/rss.xml" rss.xml

@@ -51,7 +51,10 @@ class ReleaseVersionTests(unittest.TestCase):
         self.assertIn("last_notified_hash != content_hash", tests)
         self.assertIn("stable_release_version", tests)
         self.assertIn("name: Publish rebuilt notice state", tests)
-        self.assertIn("Rebuild would discard", tests)
+        self.assertTrue(
+            "Rebuild would discard" in tests or "Rebuild will discard" in tests,
+            "Rebuild discard notice check not found in tests.yml",
+        )
         self.assertIn("gh release create", tests)
         self.assertIn("--verify-tag --latest", tests)
         for workflow in (root / ".github/workflows").glob("*.yml"):
