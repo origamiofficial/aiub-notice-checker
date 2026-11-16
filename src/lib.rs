@@ -43,7 +43,9 @@ async fn run(env: &Env) -> Result<()> {
     let session = db::start_primary_session(&database)?;
 
     // 1. Fetch & parse the 100 notices on listing page 1.
-    let listing_notices = enter_span_async("fetch_listing", |span| async {
+    let bot_api_key = &secrets.telegram_bot_api_key;
+    let admin_chat_id = secrets.telegram_admin_chat_id.as_deref();
+    let listing_notices = enter_span_async("fetch_listing", |span| async move {
         let listing_url = scraper::listing_page_url(1);
         span.set_attribute("url", listing_url.as_str());
         let html = match scraper::fetch_html(&listing_url).await {
@@ -51,8 +53,8 @@ async fn run(env: &Env) -> Result<()> {
             Err(err) => {
                 span.set_status(SpanStatus::Error(Some(err.to_string())));
                 telegram::send_admin_alert(
-                    &secrets.telegram_bot_api_key,
-                    secrets.telegram_admin_chat_id.as_deref(),
+                    bot_api_key,
+                    admin_chat_id,
                     "AIUB Notice\n\nFailed to fetch the AIUB notices listing page. Will retry on the next 5-minute run.",
                 )
                 .await;
@@ -65,8 +67,8 @@ async fn run(env: &Env) -> Result<()> {
             Err(err) => {
                 span.set_status(SpanStatus::Error(Some(err.to_string())));
                 telegram::send_admin_alert(
-                    &secrets.telegram_bot_api_key,
-                    secrets.telegram_admin_chat_id.as_deref(),
+                    bot_api_key,
+                    admin_chat_id,
                     "AIUB Notice\n\nAIUB listing parser validation failed. The site HTML structure may have changed.",
                 )
                 .await;
@@ -78,13 +80,13 @@ async fn run(env: &Env) -> Result<()> {
 
     // 2. Load D1 state strictly for these 100 listing URLs via D1DatabaseSession.
     let links: Vec<String> = listing_notices.iter().map(|n| n.url.clone()).collect();
-    let (existing_rows, read_metrics) =
-        enter_span_async("d1_load_100", |span| async {
-            let (rows, metrics) = db::get_notices_by_links(&session, &links).await?;
-            span.set_attribute("rows_read", metrics.rows_read.to_string().as_str());
-            Ok::<_, worker::Error>((rows, metrics))
-        })
-        .await?;
+    let session_ref = &session;
+    let (existing_rows, read_metrics) = enter_span_async("d1_load_100", |span| async move {
+        let (rows, metrics) = db::get_notices_by_links(session_ref, &links).await?;
+        span.set_attribute("rows_read", metrics.rows_read.to_string().as_str());
+        Ok::<_, worker::Error>((rows, metrics))
+    })
+    .await?;
 
     let existing_map: HashMap<String, NoticeRow> = existing_rows
         .into_iter()
@@ -160,7 +162,7 @@ async fn run(env: &Env) -> Result<()> {
 
     // 4. Fetch & parse selected detail pages, stopping early if approaching the 10ms CPU limit.
     let (enriched_map, checked_links, detail_failures) =
-        enter_span_async("fetch_details", |span| async {
+        enter_span_async("fetch_details", |span| async move {
             let mut enriched = HashMap::new();
             let mut checked = HashSet::new();
             let mut failures = 0usize;
@@ -262,7 +264,9 @@ async fn run(env: &Env) -> Result<()> {
 
         let detail_ready_or_fallback = effective.detail_fetched
             || checked
-            || existing.and_then(|r| r.detail_checked_at.as_ref()).is_some();
+            || existing
+                .and_then(|r| r.detail_checked_at.as_ref())
+                .is_some();
 
         match existing {
             None => {
@@ -285,9 +289,10 @@ async fn run(env: &Env) -> Result<()> {
     }
 
     let upserted_count = upsert_statements.len();
-    let write_metrics = enter_span_async("d1_sync", |span| async {
+    let session_ref = &session;
+    let write_metrics = enter_span_async("d1_sync", |span| async move {
         span.set_attribute("statements", upserted_count.to_string().as_str());
-        let metrics = db::execute_batch(&session, upsert_statements).await?;
+        let metrics = db::execute_batch(session_ref, upsert_statements).await?;
         span.set_attribute("rows_read", metrics.rows_read.to_string().as_str());
         span.set_attribute("rows_written", metrics.rows_written.to_string().as_str());
         Ok::<_, worker::Error>(metrics)
@@ -296,7 +301,9 @@ async fn run(env: &Env) -> Result<()> {
 
     // 6. Deliver up to MAX_TELEGRAM_SENDS_PER_RUN notifications with Delay pacing and 429 handling.
     let mut sends = 0usize;
-    enter_span_async("telegram_delivery", |span| async {
+    let session_ref = &session;
+    let bot_api_key = &secrets.telegram_bot_api_key;
+    enter_span_async("telegram_delivery", |span| async move {
         for (idx, (notice, new_hash, edited)) in pending_deliveries
             .into_iter()
             .take(MAX_TELEGRAM_SENDS_PER_RUN)
@@ -306,17 +313,11 @@ async fn run(env: &Env) -> Result<()> {
                 telegram::pace_between_messages().await;
             }
             sends += 1;
-            db::mark_notification_attempt(&session, &notice.url).await?;
+            db::mark_notification_attempt(session_ref, &notice.url).await?;
             let msg = format_notice_message(&notice, edited);
-            match telegram::send_message(
-                &secrets.telegram_bot_api_key,
-                &secrets.telegram_chat_id,
-                &msg,
-            )
-            .await?
-            {
+            match telegram::send_message(bot_api_key, &secrets.telegram_chat_id, &msg).await? {
                 SendOutcome::Delivered => {
-                    db::mark_notified(&session, &notice.url, &new_hash).await?;
+                    db::mark_notified(session_ref, &notice.url, &new_hash).await?;
                 }
                 SendOutcome::Failed => {}
                 SendOutcome::RateLimited => break,

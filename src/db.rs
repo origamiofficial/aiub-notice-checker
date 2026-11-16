@@ -1,9 +1,8 @@
 use chrono::{Duration, Utc};
 use worker::d1::{
-    D1Database, D1DatabaseSession, D1PreparedArgument, D1PreparedStatement, D1Result,
-    D1SessionConstraint, D1Type,
+    D1Database, D1DatabaseSession, D1PreparedStatement, D1Result, D1SessionConstraint, D1Type,
 };
-use worker::{query, Result};
+use worker::Result;
 
 use crate::config::{D1_BIND_CHUNK_SIZE, DETAIL_RETRY_COOLDOWN_MINUTES};
 use crate::models::{D1Metrics, Notice, NoticeRow};
@@ -16,6 +15,10 @@ pub fn retry_cutoff_iso() -> String {
     (Utc::now() - Duration::minutes(DETAIL_RETRY_COOLDOWN_MINUTES))
         .format("%Y-%m-%dT%H:%M:%S+00:00")
         .to_string()
+}
+
+fn checked_type(value: Option<&str>) -> D1Type<'_> {
+    value.map_or(D1Type::Null, D1Type::Text)
 }
 
 pub fn start_primary_session(db: &D1Database) -> Result<D1DatabaseSession> {
@@ -54,10 +57,7 @@ pub async fn get_notices_by_links(
              content_hash, sent_at, last_notified_hash, detail_checked_at, detail_fetched_at \
              FROM notices WHERE link IN ({placeholders})"
         );
-        let args: Vec<D1PreparedArgument> = chunk
-            .iter()
-            .map(|l| D1PreparedArgument::new(D1Type::Text(l.as_str())))
-            .collect();
+        let args: Vec<D1Type> = chunk.iter().map(|l| D1Type::Text(l.as_str())).collect();
         statements.push(session.prepare(&sql).bind_refs(&args)?);
     }
 
@@ -86,32 +86,34 @@ pub fn build_upsert_statement(
 
     match existing {
         None => {
-            let stmt = query!(
-                session,
-                "INSERT INTO notices \
+            let stmt = session
+                .prepare(
+                    "INSERT INTO notices \
                  (title, description, link, published_date, body_text, attachments_json, \
                   content_hash, first_seen_at, last_seen_at, content_changed_at, \
                   detail_checked_at, detail_fetched_at) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                &notice.title,
-                &notice.description,
-                &notice.url,
-                notice.published_date.as_deref(),
-                &notice.body_text,
-                &attachments_json,
-                new_hash,
-                now,
-                now,
-                now,
-                checked_ts,
-                fetched_ts,
-            )?;
+                )
+                .bind_refs(&[
+                    D1Type::Text(&notice.title),
+                    D1Type::Text(&notice.description),
+                    D1Type::Text(&notice.url),
+                    checked_type(notice.published_date.as_deref()),
+                    D1Type::Text(&notice.body_text),
+                    D1Type::Text(&attachments_json),
+                    D1Type::Text(new_hash),
+                    D1Type::Text(now),
+                    D1Type::Text(now),
+                    D1Type::Text(now),
+                    checked_type(checked_ts),
+                    checked_type(fetched_ts),
+                ])?;
             Ok(Some(stmt))
         }
         Some(prev) if prev.content_hash != new_hash => {
             let backfill_flag: i32 = if silent_backfill { 1 } else { 0 };
-            let stmt = query!(
-                session,
+            let stmt = session
+                .prepare(
                 "UPDATE notices SET title=?1, description=?2, published_date=?3, \
                  body_text=?4, attachments_json=?5, content_hash=?6, last_seen_at=?7, \
                  content_changed_at=CASE WHEN ?8 = 1 THEN content_changed_at ELSE ?7 END, \
@@ -119,29 +121,33 @@ pub fn build_upsert_statement(
                  notification_attempted_at=CASE WHEN ?8 = 1 THEN notification_attempted_at ELSE NULL END, \
                  detail_checked_at=COALESCE(?9, detail_checked_at), \
                  detail_fetched_at=COALESCE(?10, detail_fetched_at) WHERE link=?11",
-                &notice.title,
-                &notice.description,
-                notice.published_date.as_deref(),
-                &notice.body_text,
-                &attachments_json,
-                new_hash,
-                now,
-                backfill_flag,
-                checked_ts,
-                fetched_ts,
-                &notice.url,
-            )?;
+                )
+                .bind_refs(&[
+                    D1Type::Text(&notice.title),
+                    D1Type::Text(&notice.description),
+                    checked_type(notice.published_date.as_deref()),
+                    D1Type::Text(&notice.body_text),
+                    D1Type::Text(&attachments_json),
+                    D1Type::Text(new_hash),
+                    D1Type::Text(now),
+                    D1Type::Integer(backfill_flag),
+                    checked_type(checked_ts),
+                    checked_type(fetched_ts),
+                    D1Type::Text(&notice.url),
+                ])?;
             Ok(Some(stmt))
         }
         Some(_) if detail_checked => {
-            let stmt = query!(
-                session,
-                "UPDATE notices SET detail_checked_at=?1, \
+            let stmt = session
+                .prepare(
+                    "UPDATE notices SET detail_checked_at=?1, \
                  detail_fetched_at=COALESCE(?2, detail_fetched_at) WHERE link=?3",
-                now,
-                fetched_ts,
-                &notice.url,
-            )?;
+                )
+                .bind_refs(&[
+                    D1Type::Text(now),
+                    checked_type(fetched_ts),
+                    D1Type::Text(&notice.url),
+                ])?;
             Ok(Some(stmt))
         }
         Some(_) => Ok(None),
@@ -167,14 +173,11 @@ pub async fn execute_batch(
 
 pub async fn mark_notification_attempt(session: &D1DatabaseSession, link: &str) -> Result<()> {
     let now = utc_now_iso();
-    query!(
-        session,
-        "UPDATE notices SET notification_attempted_at=?1 WHERE link=?2",
-        &now,
-        link,
-    )?
-    .run()
-    .await?;
+    session
+        .prepare("UPDATE notices SET notification_attempted_at=?1 WHERE link=?2")
+        .bind_refs(&[D1Type::Text(&now), D1Type::Text(link)])?
+        .run()
+        .await?;
     Ok(())
 }
 
@@ -184,14 +187,16 @@ pub async fn mark_notified(
     content_hash: &str,
 ) -> Result<()> {
     let now = utc_now_iso();
-    query!(
-        session,
-        "UPDATE notices SET sent_at=COALESCE(sent_at, ?1), last_notified_hash=?2 WHERE link=?3",
-        &now,
-        content_hash,
-        link,
-    )?
-    .run()
-    .await?;
+    session
+        .prepare(
+            "UPDATE notices SET sent_at=COALESCE(sent_at, ?1), last_notified_hash=?2 WHERE link=?3",
+        )
+        .bind_refs(&[
+            D1Type::Text(&now),
+            D1Type::Text(content_hash),
+            D1Type::Text(link),
+        ])?
+        .run()
+        .await?;
     Ok(())
 }
