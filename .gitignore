@@ -2,4 +2,4 @@ __pycache__/
 *.py[cod]
 .venv/
 .stable-release/
-.workers/
+.wrangler
