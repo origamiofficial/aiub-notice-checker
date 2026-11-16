@@ -70,7 +70,7 @@ pub async fn get_notices_by_links(
     Ok((rows, metrics))
 }
 
-/// Uses `worker::query!` to build typed INSERT/UPDATE statements only for modified notices.
+/// Builds typed INSERT/UPDATE statements only for modified notices.
 pub fn build_upsert_statement(
     session: &D1DatabaseSession,
     notice: &Notice,
