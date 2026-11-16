@@ -4,17 +4,26 @@ pub const BASE_URL: &str = "https://www.aiub.edu";
 pub const BASE_HOST: &str = "www.aiub.edu";
 pub const NOTICE_PATH: &str = "/category/notices";
 
-// Tuned for Cloudflare Workers Free plan (10 ms CPU, 50 subrequests).
-pub const LIST_PAGE_SIZE: usize = 25;
+// Strictly monitor the latest 100 notices on page 1.
+pub const LIST_PAGE_SIZE: usize = 100;
 pub const MAX_DETAIL_FETCHES_PER_RUN: usize = 5;
 pub const MAX_TELEGRAM_SENDS_PER_RUN: usize = 10;
+pub const DETAIL_RETRY_COOLDOWN_MINUTES: i64 = 30;
+pub const D1_BIND_CHUNK_SIZE: usize = 50;
+
+pub const HTTP_TIMEOUT_MS: u64 = 15_000;
+pub const MAX_REDIRECTS: usize = 5;
 pub const MAX_URL_LENGTH: usize = 2048;
 pub const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
 pub const MIN_LISTING_DATE_COVERAGE: f64 = 0.8;
 pub const MIN_LISTING_DESC_COVERAGE: f64 = 0.8;
 pub const DETAIL_FAILURE_MIN_SAMPLE: usize = 4;
 pub const DETAIL_FAILURE_RATIO: f64 = 0.8;
+
 pub const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
+pub const TELEGRAM_PACE_MS: u64 = 1_000;
+pub const TELEGRAM_MAX_RETRIES: usize = 2;
+pub const TELEGRAM_MAX_RETRY_WAIT_SECS: u64 = 10;
 
 pub struct Secrets {
     pub telegram_bot_api_key: String,

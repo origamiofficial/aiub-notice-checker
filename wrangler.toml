@@ -5,32 +5,27 @@ workers_dev = false
 preview_urls = false
 
 [build]
-command = "worker-build --release"
+command = "worker-build --release --panic-unwind"
 
 [triggers]
 crons = ["*/5 * * * *"]
+
+[observability]
+enabled = true
+
+[observability.traces]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+persist = true
+
+[observability.issues]
+enabled = true
 
 [[d1_databases]]
 binding = "DB"
 database_name = "aiub-notices"
 database_id = "eb3f0605-6564-4082-8e47-16b308c500ad"
 migrations_dir = "migrations"
-
-[observability]
-enabled = false
-head_sampling_rate = 1
-redact_query_string = false
-
-[observability.logs]
-enabled = true
-head_sampling_rate = 1
-invocation_logs = true
-persist = true
-
-[observability.traces]
-enabled = true
-head_sampling_rate = 1
-persist = true
-
-[observability.issues]
-enabled = true

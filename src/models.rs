@@ -17,10 +17,17 @@ pub struct Notice {
 
 impl Notice {
     pub fn attachments_json(&self) -> String {
-        serde_json::to_string(&self.attachments).unwrap_or_else(|_| "[]".to_string())
+        let mut sorted = self.attachments.clone();
+        sorted.sort();
+        sorted.dedup();
+        serde_json::to_string(&sorted).unwrap_or_else(|_| "[]".to_string())
     }
 
     pub fn content_hash(&self) -> String {
+        let mut sorted_attachments = self.attachments.clone();
+        sorted_attachments.sort();
+        sorted_attachments.dedup();
+
         #[derive(Serialize)]
         struct HashPayload<'a> {
             attachments: &'a [String],
@@ -32,7 +39,7 @@ impl Notice {
         }
 
         let payload = HashPayload {
-            attachments: &self.attachments,
+            attachments: &sorted_attachments,
             body_text: &self.body_text,
             description: &self.description,
             link: &self.url,
@@ -65,6 +72,22 @@ impl NoticeRow {
     pub fn parsed_attachments(&self) -> Vec<String> {
         serde_json::from_str::<Vec<String>>(&self.attachments_json).unwrap_or_default()
     }
+
+    pub fn detail_due(&self, retry_cutoff_iso: &str) -> bool {
+        match (&self.detail_checked_at, &self.detail_fetched_at) {
+            (Some(checked), None) => checked.as_str() <= retry_cutoff_iso,
+            (Some(checked), Some(fetched)) if checked > fetched => {
+                checked.as_str() <= retry_cutoff_iso
+            }
+            _ => true,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct D1Metrics {
+    pub rows_read: usize,
+    pub rows_written: usize,
 }
 
 pub fn titles_equivalent(listing_title: &str, cached_title: &str) -> bool {
