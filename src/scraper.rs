@@ -1,5 +1,5 @@
 use chrono::NaiveDate;
-use tl::{Node, Parser, ParserOptions, VDom};
+use tl::{Node, Parser, ParserOptions};
 use url::Url;
 use worker::{Fetch, Headers, Method, Request, RequestInit, Result};
 
@@ -68,7 +68,10 @@ pub async fn fetch_html(url: &str) -> Result<String> {
         .ok_or_else(|| worker::Error::RustError(format!("Unsafe AIUB URL: {url}")))?;
 
     let mut headers = Headers::new();
-    headers.set("User-Agent", "aiub-notice-checker/6.0 (+https://github.com/origamiofficial/aiub-notice-checker)")?;
+    headers.set(
+        "User-Agent",
+        "aiub-notice-checker/6.0 (+https://github.com/origamiofficial/aiub-notice-checker)",
+    )?;
     headers.set("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8")?;
 
     let mut init = RequestInit::new();
@@ -197,31 +200,43 @@ pub fn parse_detail_page(html: &str, fallback: &Notice) -> Result<Notice> {
     let mut body_parts = Vec::new();
     let mut attachments = Vec::new();
 
-    if let Some(cols) = dom.query_selector("div.notice-page div.question-column") {
-        for handle in cols {
-            let Some(node) = handle.get(parser) else {
+    if let Some(pages) = dom.query_selector("div.notice-page") {
+        for page_handle in pages {
+            let Some(page_tag) = page_handle.get(parser).and_then(|n| n.as_tag()) else {
                 continue;
             };
-            let Some(tag) = node.as_tag() else {
+            let Some(cols) = page_tag.query_selector(parser, "div.question-column") else {
                 continue;
             };
-            let is_sticky = tag
-                .attributes()
-                .class()
-                .map(|c| c.as_utf8_str().split_whitespace().any(|w| w == "notice-sticky-header"))
-                .unwrap_or(false);
-            if is_sticky {
-                continue;
-            }
+            for handle in cols {
+                let Some(node) = handle.get(parser) else {
+                    continue;
+                };
+                let Some(tag) = node.as_tag() else {
+                    continue;
+                };
+                let is_sticky = tag
+                    .attributes()
+                    .class()
+                    .map(|c| {
+                        c.as_utf8_str()
+                            .split_whitespace()
+                            .any(|w| w == "notice-sticky-header")
+                    })
+                    .unwrap_or(false);
+                if is_sticky {
+                    continue;
+                }
 
-            let mut text_buf = String::new();
-            collect_visible_text(node, parser, &mut text_buf);
-            let cleaned = clean_text(&text_buf);
-            if !cleaned.is_empty() {
-                body_parts.push(cleaned);
-            }
+                let mut text_buf = String::new();
+                collect_visible_text(node, parser, &mut text_buf);
+                let cleaned = clean_text(&text_buf);
+                if !cleaned.is_empty() {
+                    body_parts.push(cleaned);
+                }
 
-            collect_attachments(tag, parser, &fallback.url, &mut attachments);
+                collect_attachments(tag, parser, &fallback.url, &mut attachments);
+            }
         }
     }
 
