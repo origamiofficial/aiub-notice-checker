@@ -1,0 +1,82 @@
+name: Deploy AIUB Notice Checker Worker
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-aiub-notice-checker
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      D1_DATABASE_NAME: aiub-notices
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust stable & wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'Cargo.toml') }}
+
+      - name: Install worker-build
+        run: |
+          if ! command -v worker-build >/dev/null 2>&1; then
+            cargo install worker-build
+          fi
+
+      - name: Run Rust check & clippy
+        run: cargo check --target wasm32-unknown-unknown
+
+      - name: Setup Node.js for Wrangler
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Wrangler
+        run: npm install --no-save wrangler@latest
+
+      - name: Apply D1 migrations
+        run: npx wrangler d1 migrations apply "$D1_DATABASE_NAME" --remote
+
+      - name: One-time D1 seed from aiub_notices.db
+        if: hashFiles('aiub_notices.db') != ''
+        run: |
+          SEEDED=$(npx wrangler d1 execute "$D1_DATABASE_NAME" --remote --json \
+            --command "SELECT value FROM app_state WHERE key='seeded_from_sqlite' LIMIT 1;" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); r=d[0].get('results',[]); print(r[0]['value'] if r else '')")
+          if [ "$SEEDED" = "1" ]; then
+            echo "D1 already seeded from aiub_notices.db; skipping."
+            exit 0
+          fi
+          python3 scripts/export_seed.py --db aiub_notices.db --out-dir seed_batches
+          for file in seed_batches/seed_*.sql; do
+            echo "Applying $file..."
+            npx wrangler d1 execute "$D1_DATABASE_NAME" --remote --file="$file"
+          done
+
+      - name: Deploy Cloudflare Worker
+        run: npx wrangler deploy
