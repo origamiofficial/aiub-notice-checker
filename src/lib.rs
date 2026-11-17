@@ -21,6 +21,7 @@ use config::{
     MIN_LISTING_DESC_COVERAGE,
 };
 use models::{titles_equivalent, D1Metrics, Notice, NoticeRow};
+use scraper::ParsedDetail;
 
 const DETAIL_CONCURRENCY: usize = 3;
 
@@ -210,7 +211,7 @@ async fn run(env: &Env) -> worker::Result<()> {
     let detail_results = enter_span_async("fetch_detail_pages", |span| async move {
         span.set_attribute("requested", targets_ref.len() as i64);
 
-        let fetched: Vec<(String, Option<(String, Vec<String>)>)> =
+        let fetched: Vec<(String, Option<ParsedDetail>)> =
             stream::iter(targets_ref.iter().cloned())
                 .map(|link| async move {
                     if is_near_cpu_limit() {
@@ -255,9 +256,14 @@ async fn run(env: &Env) -> worker::Result<()> {
             failed_count,
             attempted_count
         );
+        let _ = telegram::send_admin_alert(
+            &secrets,
+            "AIUB Notice\n\nMost sampled detail pages failed validation. The site parser may need an update.",
+        )
+        .await;
     }
 
-    let mut detail_map: HashMap<String, Option<(String, Vec<String>)>> =
+    let mut detail_map: HashMap<String, Option<ParsedDetail>> =
         HashMap::with_capacity(detail_results.len());
     for (link, outcome) in detail_results {
         detail_map.insert(link, outcome);
@@ -276,6 +282,7 @@ async fn run(env: &Env) -> worker::Result<()> {
 
     for mut item in unique_listing {
         let existing = existing_map.get(&item.url);
+        let listing_title = item.title.clone();
 
         if let Some(row) = existing {
             if item.title.contains("...") && titles_equivalent(&item.title, &row.title) {
@@ -288,11 +295,25 @@ async fn run(env: &Env) -> worker::Result<()> {
 
         let detail_outcome = detail_map.get(&item.url);
         let detail_attempted = detail_outcome.is_some();
+        let mut matched_legacy_sticky = false;
 
         match (detail_outcome, existing) {
-            (Some(Some((body, attachments))), _) => {
-                item.body_text = body.clone();
-                item.attachments = attachments.clone();
+            (Some(Some(detail)), _) => {
+                if let Some(full_title) = &detail.title {
+                    item.title = full_title.clone();
+                }
+                if item.published_date.is_none() && detail.published_date.is_some() {
+                    item.published_date = detail.published_date.clone();
+                }
+                if let Some(row) = existing {
+                    if !detail.legacy_sticky_body.is_empty()
+                        && row.body_text.trim() == detail.legacy_sticky_body.trim()
+                    {
+                        matched_legacy_sticky = true;
+                    }
+                }
+                item.body_text = detail.body_text.clone();
+                item.attachments = detail.attachments.clone();
                 item.detail_fetched = true;
             }
             (Some(None), Some(row)) => {
@@ -326,27 +347,29 @@ async fn run(env: &Env) -> worker::Result<()> {
             }
         };
 
-        // Silent hash sync for two non-edit backfill cases:
+        // Silent hash sync for non-edit backfills (matching `main.py`'s `backfill` logic):
         // 1. First-time detail fetch (`row.detail_fetched_at.is_none()`) when listing fields didn't change.
-        // 2. Date-only backfill (`row.published_date != item.published_date`) when title, description,
-        //    body_text, and attachments are identical.
+        // 2. Date-only or full-title backfill when listing fields are equivalent and body/attachments didn't change.
+        // 3. Re-baselining rows from version `e1a14563` whose stored `body_text` was the sticky header (`matched_legacy_sticky`).
         let mut silent_hash_sync = false;
         if let Some(row) = existing {
             if row.sent_at.is_some() && row.last_notified_hash.as_deref() != Some(new_hash.as_str())
             {
-                let first_detail_backfill = row.detail_fetched_at.is_none()
-                    && item.detail_fetched
+                let listing_unchanged = titles_equivalent(&listing_title, &row.title)
                     && titles_equivalent(&item.title, &row.title)
-                    && row.description == item.description
-                    && row.published_date == item.published_date;
+                    && row.description == item.description;
 
-                let date_only_backfill = row.published_date != item.published_date
-                    && titles_equivalent(&item.title, &row.title)
-                    && row.description == item.description
+                let first_detail_backfill =
+                    row.detail_fetched_at.is_none() && item.detail_fetched && listing_unchanged;
+
+                let metadata_only_backfill = listing_unchanged
                     && row.body_text == item.body_text
                     && row.attachments_json == item.attachments_json();
 
-                if first_detail_backfill || date_only_backfill {
+                let sticky_header_rebaseline =
+                    matched_legacy_sticky && item.detail_fetched && listing_unchanged;
+
+                if first_detail_backfill || metadata_only_backfill || sticky_header_rebaseline {
                     silent_hash_sync = true;
                 }
             }
@@ -384,8 +407,6 @@ async fn run(env: &Env) -> worker::Result<()> {
                 } else if detail_attempted
                     && row.last_notified_hash.as_deref() != Some(new_hash.as_str())
                 {
-                    // Only fire [EDITED] after the detail page has been checked in this run,
-                    // preventing two separate [EDITED] alerts for a single notice update.
                     notifications.push(PendingNotification {
                         notice: item,
                         content_hash: new_hash,
