@@ -4,8 +4,8 @@ pub const BASE_URL: &str = "https://www.aiub.edu";
 pub const BASE_HOST: &str = "www.aiub.edu";
 pub const NOTICE_PATH: &str = "/category/notices";
 
-// Strictly monitor the latest 100 notices on page 1.
-pub const LIST_PAGE_SIZE: usize = 100;
+// Strictly monitor the latest 50 notices on page 1.
+pub const LIST_PAGE_SIZE: usize = 50;
 pub const MAX_DETAIL_FETCHES_PER_RUN: usize = 5;
 pub const MAX_TELEGRAM_SENDS_PER_RUN: usize = 10;
 pub const DETAIL_RETRY_COOLDOWN_MINUTES: i64 = 30;
