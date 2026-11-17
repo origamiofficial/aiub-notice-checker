@@ -124,7 +124,6 @@ pub fn parse_listing_html(html: &str) -> Vec<Notice> {
     };
     let parser = dom.parser();
 
-    // Primary selector matching `main.py`'s `POST_XPATH` (`div.notification`), with `ul.event-list > li` fallback.
     let mut item_handles = query_handles(&dom, "div.notification");
     if item_handles.is_empty() {
         item_handles = find_listing_li_handles(&dom, parser);
@@ -258,7 +257,6 @@ pub fn parse_detail_html(html: &str, page_url: &str) -> Option<ParsedDetail> {
         }
     }
 
-    // Fallback if `div.notice-page` wrapper wasn't matched
     if body_handles.is_empty() {
         if let Some(cols) = dom.query_selector("div.question-column") {
             for col_handle in cols {
@@ -308,7 +306,6 @@ pub fn parse_detail_html(html: &str, page_url: &str) -> Option<ParsedDetail> {
         return None;
     }
 
-    // Extract fallback `published_date` and `legacy_sticky_body` from `notice-sticky-header` if present.
     let mut detail_date = None;
     let mut legacy_sticky_body = String::new();
     if let Some(sh) = sticky_handle {
@@ -341,7 +338,7 @@ fn has_class(tag: &HTMLTag, target_class: &str) -> bool {
 }
 
 /// Matches `main.py`'s `clean_text(" ".join(node.xpath(VISIBLE_DETAIL_TEXT_XPATH)))`,
-/// ignoring `<script>`, `<style>`, `<noscript>`, and `<template>` subtrees.
+/// ignoring `<script>`, `<style>`, `<noscript>`, and `<template>` subtrees while preserving UTF-8.
 fn extract_visible_detail_text(tag: &HTMLTag, parser: &Parser) -> String {
     let raw_html = tag.inner_html(parser);
     let stripped = strip_tags_with_spaces(&raw_html, true);
@@ -356,8 +353,7 @@ fn extract_spaced_inline_text(tag: &HTMLTag, parser: &Parser) -> String {
     clean_whitespace(&decoded)
 }
 
-/// Reproduces the exact `extract_clean_text_from_tag` output of version `e1a14563`
-/// on the sticky header so existing D1 rows can be re-baselined silently.
+/// Preserves valid UTF-8 text slices between HTML tags while inserting newlines for block tags.
 fn extract_legacy_multiline_text(tag: &HTMLTag, parser: &Parser) -> String {
     let raw_html = tag.inner_html(parser);
     let mut spaced = String::with_capacity(raw_html.len());
@@ -366,16 +362,21 @@ fn extract_legacy_multiline_text(tag: &HTMLTag, parser: &Parser) -> String {
     let bytes = raw_html.as_bytes();
     let lower_bytes = lower.as_bytes();
     let mut i = 0;
+    let mut text_start = 0;
 
     while i < bytes.len() {
         if bytes[i] == b'<' {
             if let Some(close_rel) = bytes[i..].iter().position(|&b| b == b'>') {
+                if text_start < i {
+                    spaced.push_str(&raw_html[text_start..i]);
+                }
                 let tag_slice = &lower_bytes[i..=i + close_rel];
                 if is_ignored_tag_open(tag_slice) {
                     if let Some(end_rel) =
                         find_closing_ignored_tag(&lower_bytes[i + close_rel + 1..])
                     {
                         i = i + close_rel + 1 + end_rel;
+                        text_start = i;
                         continue;
                     }
                 }
@@ -385,11 +386,15 @@ fn extract_legacy_multiline_text(tag: &HTMLTag, parser: &Parser) -> String {
                     spaced.push(' ');
                 }
                 i += close_rel + 1;
+                text_start = i;
                 continue;
             }
         }
-        spaced.push(bytes[i] as char);
         i += 1;
+    }
+
+    if text_start < bytes.len() {
+        spaced.push_str(&raw_html[text_start..]);
     }
 
     let decoded = html_escape::decode_html_entities(&spaced);
@@ -407,33 +412,45 @@ fn extract_legacy_multiline_text(tag: &HTMLTag, parser: &Parser) -> String {
     lines.join("\n")
 }
 
+/// Strips HTML tags by slicing `raw_html` on ASCII `<` and `>` boundaries and pushing
+/// valid UTF-8 `&str` slices (`&raw_html[text_start..i]`), never casting individual bytes to `char`.
 fn strip_tags_with_spaces(raw_html: &str, skip_ignored_blocks: bool) -> String {
     let mut out = String::with_capacity(raw_html.len());
     let lower = raw_html.to_ascii_lowercase();
     let bytes = raw_html.as_bytes();
     let lower_bytes = lower.as_bytes();
     let mut i = 0;
+    let mut text_start = 0;
 
     while i < bytes.len() {
         if bytes[i] == b'<' {
             if let Some(close_rel) = bytes[i..].iter().position(|&b| b == b'>') {
+                if text_start < i {
+                    out.push_str(&raw_html[text_start..i]);
+                }
                 let tag_slice = &lower_bytes[i..=i + close_rel];
                 if skip_ignored_blocks && is_ignored_tag_open(tag_slice) {
                     if let Some(end_rel) =
                         find_closing_ignored_tag(&lower_bytes[i + close_rel + 1..])
                     {
                         i = i + close_rel + 1 + end_rel;
+                        text_start = i;
                         continue;
                     }
                 }
                 out.push(' ');
                 i += close_rel + 1;
+                text_start = i;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
         i += 1;
     }
+
+    if text_start < bytes.len() {
+        out.push_str(&raw_html[text_start..]);
+    }
+
     out
 }
 
@@ -608,8 +625,6 @@ fn parse_date_to_iso(raw: &str) -> Option<String> {
         return None;
     }
 
-    // Scan tokens for any `(day, month, year)` triplet (handles trailing weekday like
-    // `"17 November 2026 Tuesday"` on detail pages as well as `"16 Nov 2026"` on listing cards).
     let tokens: Vec<&str> = cleaned.split_whitespace().collect();
     if tokens.len() >= 3 {
         for window in tokens.windows(3) {
@@ -658,9 +673,6 @@ pub fn normalize_notice_url(raw_href: &str) -> String {
     normalize_aiub_url(raw_href, &base_with_slash, false)
 }
 
-/// Mirrors `main.py`'s `normalize_url(href, base_url, allow_external)`:
-/// replaces `\` with `/`, resolves relative URLs, strips fragments, upgrades `http://www.aiub.edu`
-/// to `https://www.aiub.edu`, and enforces `MAX_URL_LENGTH`.
 pub fn normalize_aiub_url(raw_href: &str, base_url: &str, allow_external: bool) -> String {
     let cleaned = raw_href.replace('\\', "/");
     let trimmed = cleaned.trim();

@@ -132,8 +132,9 @@ async fn run(env: &Env) -> worker::Result<()> {
 
     // 3. Select up to MAX_DETAIL_FETCHES_PER_RUN (5) detail pages strictly from the visible notices:
     //    Priority A: Brand-new notices not in D1 yet.
-    //    Priority B: Existing notices where detail_fetched_at IS NULL (respecting retry cooldown)
-    //                OR where the listing title/description changed on page 1.
+    //    Priority B: Existing notices where detail_fetched_at IS NULL (respecting retry cooldown),
+    //                rows containing Latin-1 mojibake (`â`) that need healing, OR notices whose
+    //                listing title/description changed on page 1.
     //    Priority C: Existing notices ordered by oldest detail_checked_at (rolling edit check).
     let retry_cutoff_iso =
         (Utc::now() - Duration::minutes(DETAIL_RETRY_COOLDOWN_MINUTES)).to_rfc3339();
@@ -154,19 +155,24 @@ async fn run(env: &Env) -> worker::Result<()> {
             }
         }
 
-        // Priority B: Unfetched detail pages OR notices whose listing title/description changed
+        // Priority B: Unfetched detail pages, mojibake repair, OR listing changes
         let mut backfill_count = 0i64;
         for item in &unique_listing {
             if selected.len() >= MAX_DETAIL_FETCHES_PER_RUN {
                 break;
             }
             if let Some(row) = existing_map.get(&item.url) {
-                let listing_changed = !titles_equivalent(&item.title, &row.title)
-                    || row.description != item.description;
+                let row_has_mojibake = has_utf8_mojibake(&row.title)
+                    || has_utf8_mojibake(&row.description)
+                    || has_utf8_mojibake(&row.body_text);
+                let listing_changed = !titles_equivalent_clean(&item.title, &row.title)
+                    || clean_mojibake(&row.description) != clean_mojibake(&item.description);
                 let needs_backfill =
                     row.detail_fetched_at.is_none() && row.detail_due(&retry_cutoff_iso);
 
-                if (needs_backfill || listing_changed) && selected_set.insert(item.url.clone()) {
+                if (needs_backfill || row_has_mojibake || listing_changed)
+                    && selected_set.insert(item.url.clone())
+                {
                     selected.push(item.url.clone());
                     backfill_count += 1;
                 }
@@ -285,7 +291,10 @@ async fn run(env: &Env) -> worker::Result<()> {
         let listing_title = item.title.clone();
 
         if let Some(row) = existing {
-            if item.title.contains("...") && titles_equivalent(&item.title, &row.title) {
+            if item.title.contains("...")
+                && !has_utf8_mojibake(&row.title)
+                && titles_equivalent(&item.title, &row.title)
+            {
                 item.title = row.title.clone();
             }
             if item.published_date.is_none() && row.published_date.is_some() {
@@ -307,7 +316,8 @@ async fn run(env: &Env) -> worker::Result<()> {
                 }
                 if let Some(row) = existing {
                     if !detail.legacy_sticky_body.is_empty()
-                        && row.body_text.trim() == detail.legacy_sticky_body.trim()
+                        && clean_mojibake(row.body_text.trim())
+                            == clean_mojibake(detail.legacy_sticky_body.trim())
                     {
                         matched_legacy_sticky = true;
                     }
@@ -347,29 +357,32 @@ async fn run(env: &Env) -> worker::Result<()> {
             }
         };
 
-        // Silent hash sync for non-edit backfills (matching `main.py`'s `backfill` logic):
+        // Silent hash sync for non-edit backfills:
         // 1. First-time detail fetch (`row.detail_fetched_at.is_none()`) when listing fields didn't change.
-        // 2. Date-only or full-title backfill when listing fields are equivalent and body/attachments didn't change.
-        // 3. Re-baselining rows from version `e1a14563` whose stored `body_text` was the sticky header (`matched_legacy_sticky`).
+        // 2. Date-only, full-title, or UTF-8 mojibake (`2026â27` -> `2026–27`) healing when content is equivalent.
+        // 3. Re-baselining rows from version `e1a14563` whose stored `body_text` was the sticky header.
         let mut silent_hash_sync = false;
         if let Some(row) = existing {
             if row.sent_at.is_some() && row.last_notified_hash.as_deref() != Some(new_hash.as_str())
             {
-                let listing_unchanged = titles_equivalent(&listing_title, &row.title)
-                    && titles_equivalent(&item.title, &row.title)
-                    && row.description == item.description;
+                let listing_unchanged = titles_equivalent_clean(&listing_title, &row.title)
+                    && titles_equivalent_clean(&item.title, &row.title)
+                    && clean_mojibake(&row.description) == clean_mojibake(&item.description);
 
                 let first_detail_backfill =
                     row.detail_fetched_at.is_none() && item.detail_fetched && listing_unchanged;
 
-                let metadata_only_backfill = listing_unchanged
-                    && row.body_text == item.body_text
+                let metadata_or_mojibake_backfill = listing_unchanged
+                    && clean_mojibake(&row.body_text) == clean_mojibake(&item.body_text)
                     && row.attachments_json == item.attachments_json();
 
                 let sticky_header_rebaseline =
                     matched_legacy_sticky && item.detail_fetched && listing_unchanged;
 
-                if first_detail_backfill || metadata_only_backfill || sticky_header_rebaseline {
+                if first_detail_backfill
+                    || metadata_or_mojibake_backfill
+                    || sticky_header_rebaseline
+                {
                     silent_hash_sync = true;
                 }
             }
@@ -518,4 +531,39 @@ async fn run(env: &Env) -> worker::Result<()> {
     );
 
     Ok(())
+}
+
+/// Detects whether a string contains Latin-1 mojibake (`\u{00e2}\u{0080}` or `\u{00e2}\u{0086}`)
+/// produced by the old `bytes[i] as char` loop.
+fn has_utf8_mojibake(s: &str) -> bool {
+    s.contains("\u{00e2}\u{0080}") || s.contains("\u{00e2}\u{0086}")
+}
+
+/// Strips both real Unicode punctuation and 3-char Latin-1 mojibake sequences (`\u{00e2}\u{0080}_`)
+/// so corrupted D1 strings compare equal to clean UTF-8 strings during silent healing.
+fn clean_mojibake(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{00e2}' {
+            if let Some(&next_c) = chars.peek() {
+                if next_c == '\u{0080}' || next_c == '\u{0086}' {
+                    let _ = chars.next();
+                    let _ = chars.next();
+                    continue;
+                }
+            }
+        }
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+fn titles_equivalent_clean(listing_title: &str, cached_title: &str) -> bool {
+    if clean_mojibake(listing_title) == clean_mojibake(cached_title) {
+        return true;
+    }
+    titles_equivalent(listing_title, cached_title)
 }
