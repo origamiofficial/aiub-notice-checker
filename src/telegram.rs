@@ -58,7 +58,7 @@ async fn send_raw_message(bot_api_key: &str, chat_id: &str, text: &str) -> Resul
     let payload = SendMessagePayload {
         chat_id,
         text,
-        disable_web_page_preview: false,
+        disable_web_page_preview: true,
     };
 
     let body_json = serde_json::to_string(&payload)
