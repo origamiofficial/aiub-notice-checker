@@ -1,85 +1,390 @@
-use std::pin::pin;
-use std::time::Duration;
-
 use chrono::NaiveDate;
 use futures_util::future::{select, Either};
-use tl::{Node, Parser, ParserOptions};
-use worker::observability::{enter_span, SpanStatus};
+use std::collections::HashSet;
+use std::pin::pin;
+use std::time::Duration;
+use tl::{Node, Parser, ParserOptions, VDom};
 use worker::{
-    AbortController, Delay, Fetch, Headers, Method, Request, RequestInit, RequestRedirect,
-    Response, Result, Url,
+    url::Url, AbortController, Delay, Error, Fetch, Headers, Method, Request, RequestInit,
+    RequestRedirect, Result,
 };
 
 use crate::config::{
     BASE_HOST, BASE_URL, HTTP_TIMEOUT_MS, LIST_PAGE_SIZE, MAX_HTML_BYTES, MAX_REDIRECTS,
-    MAX_URL_LENGTH, MIN_LISTING_DATE_COVERAGE, MIN_LISTING_DESC_COVERAGE, NOTICE_PATH,
+    MAX_URL_LENGTH, NOTICE_PATH,
 };
 use crate::models::Notice;
 
-pub async fn send_with_timeout(fetch: Fetch, timeout_ms: u64) -> Result<Response> {
-    let controller = AbortController::default();
-    let signal = controller.signal();
-    let req_fut = pin!(fetch.send_with_signal(&signal));
-    let timer_fut = pin!(Delay::from(Duration::from_millis(timeout_ms)));
+const USER_AGENT: &str =
+    "Mozilla/5.0 (compatible; AIUBNoticeChecker/0.3; +https://www.aiub.edu)";
 
-    match select(req_fut, timer_fut).await {
-        Either::Left((res, _)) => res,
-        Either::Right(((), _)) => {
-            controller.abort();
-            Err(worker::Error::RustError(format!(
-                "HTTP request timed out after {timeout_ms}ms"
-            )))
+pub fn listing_page_url(page_no: usize) -> String {
+    format!(
+        "{}{}?pageNo={}&pageSize={}",
+        BASE_URL, NOTICE_PATH, page_no, LIST_PAGE_SIZE
+    )
+}
+
+/// Fetches an HTML page from AIUB with a 15-second `AbortController` + `Delay` timeout,
+/// manual redirect validation, and response size cap.
+pub async fn fetch_html(target_url: &str) -> Result<String> {
+    let mut current_url = target_url.to_string();
+
+    for _hop in 0..=MAX_REDIRECTS {
+        if current_url.len() > MAX_URL_LENGTH {
+            return Err(Error::RustError("URL exceeds maximum allowed length".into()));
+        }
+
+        let headers = Headers::new();
+        headers.set("User-Agent", USER_AGENT)?;
+        headers.set(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )?;
+        headers.set("Accept-Language", "en-US,en;q=0.9")?;
+
+        let mut init = RequestInit::new();
+        init.with_method(Method::Get)
+            .with_headers(headers)
+            .with_redirect(RequestRedirect::Manual);
+
+        let req = Request::new_with_init(&current_url, &init)?;
+        let controller = AbortController::default();
+        let signal = controller.signal();
+
+        let fetch = Fetch::Request(req);
+        let send_fut = fetch.send_with_signal(&signal);
+        let timeout_fut = Delay::from(Duration::from_millis(HTTP_TIMEOUT_MS));
+
+        let mut resp = match select(pin!(send_fut), pin!(timeout_fut)).await {
+            Either::Left((res, _)) => res?,
+            Either::Right(((), _)) => {
+                controller.abort();
+                return Err(Error::RustError(format!(
+                    "HTTP timeout after {}ms fetching {}",
+                    HTTP_TIMEOUT_MS, current_url
+                )));
+            }
+        };
+
+        let status = resp.status_code();
+        if (300..400).contains(&status) {
+            if let Some(loc) = resp.headers().get("Location")? {
+                current_url = resolve_url(&current_url, &loc);
+                continue;
+            }
+        }
+
+        if !(200..300).contains(&status) {
+            return Err(Error::RustError(format!(
+                "HTTP {} when fetching {}",
+                status, current_url
+            )));
+        }
+
+        let text = resp.text().await?;
+        if text.len() > MAX_HTML_BYTES {
+            return Err(Error::RustError(format!(
+                "HTML response too large ({} bytes) for {}",
+                text.len(),
+                current_url
+            )));
+        }
+        return Ok(text);
+    }
+
+    Err(Error::RustError(format!(
+        "Too many redirects fetching {}",
+        target_url
+    )))
+}
+
+/// Parses the AIUB notice listing HTML (`ul.event-list li` with fallback to `.notification, .card`).
+pub fn parse_listing_html(html: &str) -> Vec<Notice> {
+    let Ok(dom) = tl::parse(html, ParserOptions::default()) else {
+        return Vec::new();
+    };
+    let parser = dom.parser();
+
+    let mut item_handles = query_handles(&dom, "ul.event-list li");
+    if item_handles.is_empty() {
+        item_handles = query_handles(&dom, ".notification, .card");
+    }
+
+    let mut notices = Vec::with_capacity(item_handles.len());
+
+    for handle in item_handles {
+        let Some(node) = handle.get(parser) else {
+            continue;
+        };
+        let Some(tag) = node.as_tag() else {
+            continue;
+        };
+
+        let raw_href = find_first_attr_in_tag(tag, parser, "a.notification-link", "href")
+            .or_else(|| find_first_attr_in_tag(tag, parser, "a", "href"))
+            .unwrap_or_default();
+
+        let url = normalize_notice_url(&raw_href);
+        if url.is_empty() || !is_valid_aiub_notice_url(&url) {
+            continue;
+        }
+
+        let title = find_first_text_in_tag(tag, parser, "h2.title")
+            .or_else(|| find_first_text_in_tag(tag, parser, ".title"))
+            .or_else(|| find_first_text_in_tag(tag, parser, "h2, h3, h4, a"))
+            .map(|s| clean_whitespace(&s))
+            .unwrap_or_default();
+
+        if title.is_empty() {
+            continue;
+        }
+
+        let description = find_first_text_in_tag(tag, parser, "p.desc")
+            .or_else(|| find_first_text_in_tag(tag, parser, ".desc"))
+            .or_else(|| find_first_text_in_tag(tag, parser, "p"))
+            .map(|s| clean_whitespace(&s))
+            .unwrap_or_default();
+
+        let published_date = extract_iso_date_from_card(tag, parser);
+
+        notices.push(Notice {
+            title,
+            description,
+            url,
+            published_date,
+            body_text: String::new(),
+            attachments: Vec::new(),
+            detail_fetched: false,
+        });
+    }
+
+    notices
+}
+
+/// Parses an AIUB notice detail page without multi-step descendant combinators
+/// (`tl 0.7.8` returns `None` on selectors like `div.notice-page div.question-column`).
+pub fn parse_detail_html(html: &str, page_url: &str) -> Option<(String, Vec<String>)> {
+    let dom = tl::parse(html, ParserOptions::default()).ok()?;
+    let parser = dom.parser();
+
+    let container_handle = find_detail_container(&dom, parser)?;
+    let node = container_handle.get(parser)?;
+    let tag = node.as_tag()?;
+
+    let body_text = extract_clean_text_from_tag(tag, parser);
+    let attachments = extract_attachments_from_tag(tag, parser, page_url);
+
+    if body_text.is_empty() && attachments.is_empty() {
+        return None;
+    }
+
+    Some((body_text, attachments))
+}
+
+fn find_detail_container(dom: &VDom, parser: &Parser) -> Option<tl::NodeHandle> {
+    if let Some(notice_pages) = dom.query_selector("div.notice-page") {
+        for page_handle in notice_pages {
+            if let Some(page_node) = page_handle.get(parser) {
+                if let Some(page_tag) = page_node.as_tag() {
+                    if let Some(mut cols) = page_tag.query_selector(parser, "div.question-column") {
+                        if let Some(col_handle) = cols.next() {
+                            return Some(col_handle);
+                        }
+                    }
+                    return Some(page_handle);
+                }
+            }
         }
     }
+
+    for sel in [
+        "div.question-column",
+        "div.notice-details",
+        "div.notice-content",
+        "article",
+        "main",
+    ] {
+        if let Some(mut iter) = dom.query_selector(sel) {
+            if let Some(first) = iter.next() {
+                return Some(first);
+            }
+        }
+    }
+
+    None
 }
 
-pub fn clean_text(raw: &str) -> String {
-    let decoded = html_escape::decode_html_entities(raw);
-    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+fn extract_clean_text_from_tag(tag: &tl::HTMLTag, parser: &Parser) -> String {
+    let raw_html = tag.inner_html(parser);
+    let mut spaced = String::with_capacity(raw_html.len());
+
+    let lower = raw_html.to_ascii_lowercase();
+    let bytes = raw_html.as_bytes();
+    let lower_bytes = lower.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some(close_rel) = bytes[i..].iter().position(|&b| b == b'>') {
+                let tag_slice = &lower_bytes[i..=i + close_rel];
+                if is_script_or_style_open(tag_slice) {
+                    if let Some(end_rel) =
+                        find_closing_ignored_tag(&lower_bytes[i + close_rel + 1..])
+                    {
+                        i = i + close_rel + 1 + end_rel;
+                        continue;
+                    }
+                }
+                if is_block_tag(tag_slice) {
+                    spaced.push('\n');
+                } else {
+                    spaced.push(' ');
+                }
+                i += close_rel + 1;
+                continue;
+            }
+        }
+        spaced.push(bytes[i] as char);
+        i += 1;
+    }
+
+    let decoded = html_escape::decode_html_entities(&spaced);
+    let mut lines: Vec<String> = Vec::new();
+
+    for raw_line in decoded.lines() {
+        let cleaned = clean_whitespace(raw_line);
+        if cleaned.is_empty() {
+            continue;
+        }
+        if cleaned.eq_ignore_ascii_case("Back to Notice List")
+            || cleaned.eq_ignore_ascii_case("Notice")
+        {
+            continue;
+        }
+        lines.push(cleaned);
+    }
+
+    lines.join("\n")
 }
 
-pub fn normalize_url(href: &str, base: &str, allow_external: bool) -> Option<String> {
-    let trimmed = href.replace('\\', "/").trim().to_string();
-    if trimmed.is_empty() || trimmed.starts_with('#') {
-        return None;
+fn extract_attachments_from_tag(
+    tag: &tl::HTMLTag,
+    parser: &Parser,
+    page_url: &str,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen_urls = HashSet::new();
+
+    if let Some(anchors) = tag.query_selector(parser, "a") {
+        for handle in anchors {
+            let Some(node) = handle.get(parser) else {
+                continue;
+            };
+            let Some(a_tag) = node.as_tag() else {
+                continue;
+            };
+            let Some(raw_href) = a_tag
+                .attributes()
+                .get("href")
+                .flatten()
+                .map(|b| b.as_utf8_str().to_string())
+            else {
+                continue;
+            };
+
+            let trimmed = raw_href.trim();
+            if trimmed.is_empty()
+                || trimmed.starts_with('#')
+                || trimmed.to_ascii_lowercase().starts_with("javascript:")
+                || trimmed.to_ascii_lowercase().starts_with("mailto:")
+            {
+                continue;
+            }
+
+            let resolved = resolve_url(page_url, trimmed);
+            if resolved == page_url
+                || resolved.ends_with(NOTICE_PATH)
+                || !seen_urls.insert(resolved.clone())
+            {
+                continue;
+            }
+
+            out.push(resolved);
+        }
     }
 
-    let base_url = Url::parse(base).ok()?;
-    let mut joined = base_url.join(&trimmed).ok()?;
-    joined.set_fragment(None);
-
-    let scheme = joined.scheme();
-    if scheme != "http" && scheme != "https" {
-        return None;
-    }
-    if joined.host_str().is_none() || !joined.username().is_empty() || joined.password().is_some() {
-        return None;
-    }
-
-    let host_matches = joined
-        .host_str()
-        .map(|h| h.eq_ignore_ascii_case(BASE_HOST))
-        .unwrap_or(false);
-
-    if host_matches && scheme == "http" {
-        joined.set_scheme("https").ok()?;
-    } else if !host_matches && !allow_external {
-        return None;
-    }
-
-    let out = joined.to_string();
-    if out.len() > MAX_URL_LENGTH {
-        return None;
-    }
-    Some(out)
+    out
 }
 
-pub fn parse_date_text(raw: &str) -> Option<String> {
-    let cleaned = clean_text(raw).replace("Sept", "Sep");
-    if cleaned.is_empty() {
-        return None;
+fn query_handles(dom: &VDom, selector: &str) -> Vec<tl::NodeHandle> {
+    dom.query_selector(selector)
+        .map(|iter| iter.collect())
+        .unwrap_or_default()
+}
+
+fn find_first_attr_in_tag(
+    tag: &tl::HTMLTag,
+    parser: &Parser,
+    selector: &str,
+    attr: &str,
+) -> Option<String> {
+    let mut iter = tag.query_selector(parser, selector)?;
+    while let Some(handle) = iter.next() {
+        let node = handle.get(parser)?;
+        let inner_tag = node.as_tag()?;
+        if let Some(val) = inner_tag.attributes().get(attr).flatten() {
+            let s = val.as_utf8_str().trim().to_string();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
     }
-    for fmt in ["%d %b %Y", "%d %B %Y", "%Y-%m-%d"] {
+    None
+}
+
+fn find_first_text_in_tag(
+    tag: &tl::HTMLTag,
+    parser: &Parser,
+    selector: &str,
+) -> Option<String> {
+    let mut iter = tag.query_selector(parser, selector)?;
+    while let Some(handle) = iter.next() {
+        let node: &Node = handle.get(parser)?;
+        let raw = node.inner_text(parser);
+        let decoded = html_escape::decode_html_entities(&raw);
+        let cleaned = clean_whitespace(&decoded);
+        if !cleaned.is_empty() {
+            return Some(cleaned);
+        }
+    }
+    None
+}
+
+fn extract_iso_date_from_card(tag: &tl::HTMLTag, parser: &Parser) -> Option<String> {
+    let day = find_first_text_in_tag(tag, parser, ".day").unwrap_or_default();
+    let month = find_first_text_in_tag(tag, parser, ".month").unwrap_or_default();
+    let year = find_first_text_in_tag(tag, parser, ".year").unwrap_or_default();
+
+    if !day.is_empty() && !month.is_empty() && !year.is_empty() {
+        let combined = clean_whitespace(&format!("{day} {month} {year}"));
+        if let Some(iso) = parse_date_to_iso(&combined) {
+            return Some(iso);
+        }
+    }
+
+    if let Some(raw_time) = find_first_text_in_tag(tag, parser, "time")
+        .or_else(|| find_first_text_in_tag(tag, parser, ".date"))
+    {
+        return parse_date_to_iso(&raw_time);
+    }
+
+    None
+}
+
+fn parse_date_to_iso(raw: &str) -> Option<String> {
+    let cleaned = clean_whitespace(raw).replace(',', "");
+    for fmt in ["%d %b %Y", "%d %B %Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"] {
         if let Ok(d) = NaiveDate::parse_from_str(&cleaned, fmt) {
             return Some(d.format("%Y-%m-%d").to_string());
         }
@@ -87,419 +392,87 @@ pub fn parse_date_text(raw: &str) -> Option<String> {
     None
 }
 
-pub async fn fetch_html(url: &str) -> Result<String> {
-    let mut target = normalize_url(url, BASE_URL, false)
-        .ok_or_else(|| worker::Error::RustError(format!("Unsafe AIUB URL: {url}")))?;
-
-    for _ in 0..MAX_REDIRECTS {
-        let mut headers = Headers::new();
-        headers.set(
-            "User-Agent",
-            "aiub-notice-checker/6.2 (+https://github.com/origamiofficial/aiub-notice-checker)",
-        )?;
-        headers.set("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8")?;
-
-        let mut init = RequestInit::new();
-        init.with_method(Method::Get);
-        init.with_headers(headers);
-        init.with_redirect(RequestRedirect::Manual);
-
-        let req = Request::new_with_init(&target, &init)?;
-        let mut resp = send_with_timeout(Fetch::Request(req), HTTP_TIMEOUT_MS).await?;
-        let status = resp.status_code();
-
-        if (300..400).contains(&status) {
-            let location = resp.headers().get("Location")?.unwrap_or_default();
-            target = normalize_url(&location, &target, false).ok_or_else(|| {
-                worker::Error::RustError(format!("Unsafe redirect from {target} to {location}"))
-            })?;
-            continue;
-        }
-
-        if !(200..300).contains(&status) {
-            return Err(worker::Error::RustError(format!(
-                "AIUB HTTP {status} for {target}"
-            )));
-        }
-
-        let content_type = resp
-            .headers()
-            .get("Content-Type")?
-            .unwrap_or_default()
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-
-        if content_type != "text/html" && content_type != "application/xhtml+xml" {
-            return Err(worker::Error::RustError(format!(
-                "Unexpected Content-Type '{content_type}' for {target}"
-            )));
-        }
-
-        let bytes = resp.bytes().await?;
-        if bytes.len() > MAX_HTML_BYTES {
-            return Err(worker::Error::RustError(format!(
-                "HTML response exceeded {MAX_HTML_BYTES} bytes for {target}"
-            )));
-        }
-
-        return Ok(String::from_utf8_lossy(&bytes).into_owned());
+pub fn normalize_notice_url(raw_href: &str) -> String {
+    let trimmed = raw_href.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('#')
+        || trimmed.to_ascii_lowercase().starts_with("javascript:")
+    {
+        return String::new();
     }
 
-    Err(worker::Error::RustError(format!(
-        "Too many redirects while fetching {url}"
-    )))
-}
-
-pub fn parse_listing_page(html: &str) -> Result<Vec<Notice>> {
-    enter_span("parse_listing_html", |span| {
-        span.set_attribute("html_bytes", html.len().to_string().as_str());
-        let dom = tl::parse(html, ParserOptions::default()).map_err(|e| {
-            let msg = format!("HTML parse error: {e}");
-            span.set_status(SpanStatus::Error(Some(msg.clone())));
-            worker::Error::RustError(msg)
-        })?;
-        let parser = dom.parser();
-
-        let mut notices = Vec::new();
-        let mut seen_urls = std::collections::HashSet::new();
-
-        for card_selector in ["div.notification", "article.notification"] {
-            let Some(cards) = dom.query_selector(card_selector) else {
-                continue;
-            };
-            for handle in cards {
-                let Some(node) = handle.get(parser) else {
-                    continue;
-                };
-                let Some(tag) = node.as_tag() else {
-                    continue;
-                };
-
-                let title = first_selector_text(tag, parser, &["h2.title", "h3.title", "h2"]);
-                let description = first_selector_text(tag, parser, &["p.desc", "div.desc", "p"]);
-                let date_raw =
-                    first_selector_text(tag, parser, &["div.date-custom", "span.date-custom", "time"]);
-                let href =
-                    first_selector_attr(tag, parser, &["a.info-link", "a"], "href").unwrap_or_default();
-
-                let Some(url) = normalize_url(&href, BASE_URL, false) else {
-                    continue;
-                };
-                if title.is_empty() || !seen_urls.insert(url.clone()) {
-                    continue;
-                }
-
-                notices.push(Notice {
-                    title,
-                    description,
-                    url,
-                    published_date: parse_date_text(&date_raw),
-                    body_text: String::new(),
-                    attachments: Vec::new(),
-                    detail_fetched: false,
-                });
-            }
-            if !notices.is_empty() {
-                break;
-            }
+    let resolved = resolve_url(BASE_URL, trimmed);
+    if let Ok(mut parsed) = Url::parse(&resolved) {
+        parsed.set_fragment(None);
+        let mut s = parsed.to_string();
+        if s.ends_with('/') && parsed.path() != "/" {
+            s.pop();
         }
-
-        if notices.is_empty() {
-            let msg = "AIUB listing has no notice cards".to_string();
-            span.set_status(SpanStatus::Error(Some(msg.clone())));
-            return Err(worker::Error::RustError(msg));
-        }
-
-        if notices.len() >= 5 {
-            let dated = notices.iter().filter(|n| n.published_date.is_some()).count();
-            if (dated as f64) / (notices.len() as f64) < MIN_LISTING_DATE_COVERAGE {
-                let msg = format!("AIUB listing date coverage dropped to {dated}/{}", notices.len());
-                span.set_status(SpanStatus::Error(Some(msg.clone())));
-                return Err(worker::Error::RustError(msg));
-            }
-            let described = notices.iter().filter(|n| !n.description.is_empty()).count();
-            if (described as f64) / (notices.len() as f64) < MIN_LISTING_DESC_COVERAGE {
-                let msg = format!(
-                    "AIUB listing description coverage dropped to {described}/{}",
-                    notices.len()
-                );
-                span.set_status(SpanStatus::Error(Some(msg.clone())));
-                return Err(worker::Error::RustError(msg));
-            }
-        }
-
-        span.set_attribute("notice_count", notices.len().to_string().as_str());
-        Ok(notices)
-    })
-}
-
-pub fn parse_detail_page(html: &str, fallback: &Notice) -> Result<Notice> {
-    enter_span("parse_detail_html", |span| {
-        span.set_attribute("url", fallback.url.as_str());
-        let dom = tl::parse(html, ParserOptions::default()).map_err(|e| {
-            let msg = format!("Detail parse error: {e}");
-            span.set_status(SpanStatus::Error(Some(msg.clone())));
-            worker::Error::RustError(msg)
-        })?;
-        let parser = dom.parser();
-
-        let mut title = dom
-            .get_element_by_id("dynamicHeading")
-            .and_then(|h| h.get(parser))
-            .map(|n| clean_text(&n.inner_text(parser)))
-            .unwrap_or_default();
-
-        if title.is_empty() {
-            for sel in ["h1.header-title", "h1.title", "h1"] {
-                if let Some(mut iter) = dom.query_selector(sel) {
-                    if let Some(text) = iter
-                        .next()
-                        .and_then(|h| h.get(parser))
-                        .map(|n| clean_text(&n.inner_text(parser)))
-                        .filter(|t| !t.is_empty())
-                    {
-                        title = text;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if title.is_empty() {
-            let msg = format!("Missing heading on {}", fallback.url);
-            span.set_status(SpanStatus::Error(Some(msg.clone())));
-            return Err(worker::Error::RustError(msg));
-        }
-
-        let mut body_parts = Vec::new();
-        let mut attachments = Vec::new();
-
-        if let Some(pages) = dom.query_selector("div.notice-page") {
-            for page_handle in pages {
-                let Some(page_tag) = page_handle.get(parser).and_then(|n| n.as_tag()) else {
-                    continue;
-                };
-                if let Some(cols) = page_tag.query_selector(parser, "div.question-column") {
-                    for handle in cols {
-                        let Some(node) = handle.get(parser) else {
-                            continue;
-                        };
-                        let Some(tag) = node.as_tag() else {
-                            continue;
-                        };
-                        let is_sticky = tag
-                            .attributes()
-                            .class()
-                            .map(|c| {
-                                c.as_utf8_str()
-                                    .split_whitespace()
-                                    .any(|w| w == "notice-sticky-header")
-                            })
-                            .unwrap_or(false);
-                        if is_sticky {
-                            continue;
-                        }
-
-                        extract_node_content(
-                            node,
-                            tag,
-                            parser,
-                            &fallback.url,
-                            &mut body_parts,
-                            &mut attachments,
-                        );
-                    }
-                }
-            }
-        }
-
-        if body_parts.is_empty() && attachments.is_empty() {
-            for fallback_sel in [
-                "div.notice-details",
-                "div.notice-content",
-                "div.notice-page",
-                "article",
-            ] {
-                if let Some(containers) = dom.query_selector(fallback_sel) {
-                    for handle in containers {
-                        let Some(node) = handle.get(parser) else {
-                            continue;
-                        };
-                        let Some(tag) = node.as_tag() else {
-                            continue;
-                        };
-                        extract_node_content(
-                            node,
-                            tag,
-                            parser,
-                            &fallback.url,
-                            &mut body_parts,
-                            &mut attachments,
-                        );
-                    }
-                }
-                if !body_parts.is_empty() || !attachments.is_empty() {
-                    break;
-                }
-            }
-        }
-
-        let body_text = body_parts.join("\n\n");
-        if body_text.is_empty() && attachments.is_empty() {
-            let msg = format!("AIUB detail page has no usable content: {}", fallback.url);
-            span.set_status(SpanStatus::Error(Some(msg.clone())));
-            return Err(worker::Error::RustError(msg));
-        }
-
-        Ok(Notice {
-            title,
-            description: fallback.description.clone(),
-            url: fallback.url.clone(),
-            published_date: fallback.published_date.clone(),
-            body_text,
-            attachments,
-            detail_fetched: true,
-        })
-    })
-}
-
-pub fn listing_page_url(page_no: usize) -> String {
-    format!("{BASE_URL}{NOTICE_PATH}?pageNo={page_no}&pageSize={LIST_PAGE_SIZE}")
-}
-
-fn extract_node_content(
-    node: &Node<'_>,
-    tag: &tl::HTMLTag<'_>,
-    parser: &Parser<'_>,
-    page_url: &str,
-    body_parts: &mut Vec<String>,
-    attachments: &mut Vec<String>,
-) {
-    let mut text_buf = String::new();
-    collect_visible_text(node, parser, &mut text_buf);
-    let cleaned = clean_text(&text_buf);
-    if !cleaned.is_empty() {
-        body_parts.push(cleaned);
+        s
+    } else {
+        resolved
     }
-    collect_attachments(tag, parser, page_url, attachments);
 }
 
-fn first_selector_text(root: &tl::HTMLTag<'_>, parser: &Parser<'_>, selectors: &[&str]) -> String {
-    for selector in selectors {
-        let Some(mut iter) = root.query_selector(parser, selector) else {
-            continue;
-        };
-        if let Some(text) = iter
-            .next()
-            .and_then(|h| h.get(parser))
-            .map(|n| clean_text(&n.inner_text(parser)))
-            .filter(|t| !t.is_empty())
-        {
-            return text;
+fn is_valid_aiub_notice_url(url: &str) -> bool {
+    if url.len() > MAX_URL_LENGTH {
+        return false;
+    }
+    let Ok(parsed) = Url::parse(url) else {
+        return false;
+    };
+    if parsed.host_str() != Some(BASE_HOST) {
+        return false;
+    }
+    let path = parsed.path().trim_matches('/');
+    !path.is_empty() && parsed.path() != NOTICE_PATH
+}
+
+fn resolve_url(base: &str, href: &str) -> String {
+    if let Ok(base_url) = Url::parse(base) {
+        if let Ok(joined) = base_url.join(href) {
+            return joined.to_string();
         }
     }
-    String::new()
+    href.to_string()
 }
 
-fn first_selector_attr(
-    root: &tl::HTMLTag<'_>,
-    parser: &Parser<'_>,
-    selectors: &[&str],
-    attr: &str,
-) -> Option<String> {
-    for selector in selectors {
-        let Some(mut iter) = root.query_selector(parser, selector) else {
-            continue;
-        };
-        if let Some(val) = iter
-            .next()
-            .and_then(|h| h.get(parser))
-            .and_then(|n| n.as_tag())
-            .and_then(|t| t.attributes().get(attr).flatten())
-            .map(|v| v.as_utf8_str().into_owned())
-            .filter(|s| !s.is_empty())
-        {
-            return Some(val);
+fn clean_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn is_script_or_style_open(tag_slice: &[u8]) -> bool {
+    tag_slice.starts_with(b"<script") || tag_slice.starts_with(b"<style")
+}
+
+fn find_closing_ignored_tag(haystack: &[u8]) -> Option<usize> {
+    for target in [b"</script>".as_slice(), b"</style>".as_slice()] {
+        if let Some(pos) = haystack.windows(target.len()).position(|w| w == target) {
+            return Some(pos + target.len());
         }
     }
     None
 }
 
-fn collect_visible_text(node: &Node<'_>, parser: &Parser<'_>, out: &mut String) {
-    match node {
-        Node::Raw(bytes) => {
-            out.push_str(&bytes.as_utf8_str());
-            out.push(' ');
-        }
-        Node::Tag(tag) => {
-            let name = tag.name().as_utf8_str();
-            if matches!(
-                name.to_ascii_lowercase().as_str(),
-                "script" | "style" | "noscript" | "template"
-            ) {
-                return;
-            }
-            let is_sticky = tag
-                .attributes()
-                .class()
-                .map(|c| {
-                    c.as_utf8_str()
-                        .split_whitespace()
-                        .any(|w| w == "notice-sticky-header")
-                })
-                .unwrap_or(false);
-            if is_sticky {
-                return;
-            }
-            for child_handle in tag.children().top().iter() {
-                if let Some(child) = child_handle.get(parser) {
-                    collect_visible_text(child, parser, out);
-                }
-            }
-        }
-        Node::Comment(_) => {}
-    }
-}
-
-fn collect_attachments(
-    root: &tl::HTMLTag<'_>,
-    parser: &Parser<'_>,
-    page_url: &str,
-    out: &mut Vec<String>,
-) {
-    let mut push_href = |raw: &str| {
-        if let Some(norm) = normalize_url(raw, page_url, true) {
-            let norm_trimmed = norm.trim_end_matches('/');
-            if norm_trimmed != BASE_URL
-                && norm_trimmed != page_url.trim_end_matches('/')
-                && !out.contains(&norm)
-            {
-                out.push(norm);
-            }
-        }
-    };
-
-    if let Some(links) = root.query_selector(parser, "a[href]") {
-        for h in links {
-            if let Some(tag) = h.get(parser).and_then(|n| n.as_tag()) {
-                if let Some(Some(href)) = tag.attributes().get("href") {
-                    push_href(&href.as_utf8_str());
-                }
-            }
+fn is_block_tag(tag_slice: &[u8]) -> bool {
+    for prefix in [
+        b"<p".as_slice(),
+        b"</p>".as_slice(),
+        b"<br".as_slice(),
+        b"<div".as_slice(),
+        b"</div>".as_slice(),
+        b"<li".as_slice(),
+        b"</li>".as_slice(),
+        b"<tr".as_slice(),
+        b"</tr>".as_slice(),
+        b"<h1".as_slice(),
+        b"<h2".as_slice(),
+        b"<h3".as_slice(),
+        b"<h4".as_slice(),
+    ] {
+        if tag_slice.starts_with(prefix) {
+            return true;
         }
     }
-    if let Some(imgs) = root.query_selector(parser, "img") {
-        for h in imgs {
-            if let Some(tag) = h.get(parser).and_then(|n| n.as_tag()) {
-                for attr in ["src", "data-src"] {
-                    if let Some(Some(src)) = tag.attributes().get(attr) {
-                        push_href(&src.as_utf8_str());
-                    }
-                }
-            }
-        }
-    }
+    false
 }

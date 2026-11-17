@@ -1,197 +1,204 @@
-use chrono::{Duration, Utc};
-use worker::d1::{
-    D1Database, D1DatabaseSession, D1PreparedArgument, D1PreparedStatement, D1Result,
-    D1SessionConstraint, D1Type,
+use chrono::Utc;
+use std::collections::HashMap;
+use worker::{
+    d1::{D1Database, D1DatabaseSession, D1PreparedArgument, D1PreparedStatement, D1Type},
+    query, Result,
 };
-use worker::{query, Result};
 
-use crate::config::{D1_BIND_CHUNK_SIZE, DETAIL_RETRY_COOLDOWN_MINUTES};
+use crate::config::D1_BIND_CHUNK_SIZE;
 use crate::models::{D1Metrics, Notice, NoticeRow};
 
-pub fn utc_now_iso() -> String {
-    Utc::now().format("%Y-%m-%dT%H:%M:%S+00:00").to_string()
-}
-
-pub fn retry_cutoff_iso() -> String {
-    (Utc::now() - Duration::minutes(DETAIL_RETRY_COOLDOWN_MINUTES))
-        .format("%Y-%m-%dT%H:%M:%S+00:00")
-        .to_string()
-}
-
-pub fn start_primary_session(db: &D1Database) -> Result<D1DatabaseSession> {
-    db.with_session_constraint(D1SessionConstraint::FirstPrimary)
-}
-
-fn accumulate_meta(results: &[D1Result]) -> D1Metrics {
-    let mut metrics = D1Metrics::default();
-    for res in results {
-        if let Ok(Some(meta)) = res.meta() {
-            metrics.rows_read += meta.rows_read.unwrap_or(0);
-            metrics.rows_written += meta.rows_written.unwrap_or(0);
-        }
-    }
-    metrics
-}
-
-/// Fetches existing D1 rows strictly for the 100 active listing links
-/// using `D1Type` + `bind_refs` and a single `session.batch()` call.
+/// Loads existing D1 rows strictly for the URLs currently present in the 100-notice listing.
+/// Uses `D1PreparedStatement::bind_refs` (`worker 0.9.0`) with borrowed `D1Type` slices.
 pub async fn get_notices_by_links(
     session: &D1DatabaseSession,
     links: &[String],
-) -> Result<(Vec<NoticeRow>, D1Metrics)> {
+) -> Result<(HashMap<String, NoticeRow>, D1Metrics)> {
+    let mut map = HashMap::with_capacity(links.len());
+    let mut metrics = D1Metrics::default();
+
     if links.is_empty() {
-        return Ok((Vec::new(), D1Metrics::default()));
+        return Ok((map, metrics));
     }
 
-    let mut statements = Vec::new();
     for chunk in links.chunks(D1_BIND_CHUNK_SIZE) {
-        let placeholders = (1..=chunk.len())
-            .map(|i| format!("?{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
         let sql = format!(
             "SELECT title, description, link, published_date, body_text, attachments_json, \
              content_hash, sent_at, last_notified_hash, detail_checked_at, detail_fetched_at \
-             FROM notices WHERE link IN ({placeholders})"
+             FROM notices WHERE link IN ({})",
+            placeholders.join(", ")
         );
-        let args: Vec<D1PreparedArgument> = chunk
-            .iter()
-            .map(|l| D1PreparedArgument::new(D1Type::Text(l.as_str())))
-            .collect();
-        statements.push(session.prepare(&sql).bind_refs(&args)?);
+
+        let d1_types: Vec<D1Type> = chunk.iter().map(|l| D1Type::Text(l.as_str())).collect();
+        let args: Vec<D1PreparedArgument> = d1_types.iter().map(D1PreparedArgument::new).collect();
+
+        let stmt = session.prepare(&sql).bind_refs(&args)?;
+        let result = stmt.all().await?;
+
+        if let Ok(Some(meta)) = result.meta() {
+            metrics.rows_read += meta.rows_read.unwrap_or(0);
+            metrics.rows_written += meta.rows_written.unwrap_or(0);
+        }
+
+        let rows: Vec<NoticeRow> = result.results()?;
+        for row in rows {
+            map.insert(row.link.clone(), row);
+        }
     }
 
-    let batch_results = session.batch(statements).await?;
-    let metrics = accumulate_meta(&batch_results);
-    let mut rows = Vec::with_capacity(links.len());
-    for res in batch_results {
-        rows.extend(res.results::<NoticeRow>()?);
-    }
-    Ok((rows, metrics))
+    Ok((map, metrics))
 }
 
-/// Uses `worker::query!` to build typed INSERT/UPDATE statements only for modified notices.
+/// Builds a parameterized upsert statement using `worker::query!` (`&D1Database`).
 pub fn build_upsert_statement(
-    session: &D1DatabaseSession,
+    db: &D1Database,
     notice: &Notice,
-    new_hash: &str,
-    existing: Option<&NoticeRow>,
-    detail_checked: bool,
-    silent_backfill: bool,
-    now: &str,
-) -> Result<Option<D1PreparedStatement>> {
+    content_hash: &str,
+    detail_attempted: bool,
+) -> Result<D1PreparedStatement> {
+    let now = Utc::now().to_rfc3339();
+    let pub_date = notice.published_date.as_deref().unwrap_or("");
     let attachments_json = notice.attachments_json();
-    let checked_ts = detail_checked.then_some(now);
-    let fetched_ts = notice.detail_fetched.then_some(now);
 
-    match existing {
-        None => {
-            let stmt = query!(
-                session,
-                "INSERT INTO notices \
-                 (title, description, link, published_date, body_text, attachments_json, \
-                  content_hash, first_seen_at, last_seen_at, content_changed_at, \
-                  detail_checked_at, detail_fetched_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                &notice.title,
-                &notice.description,
-                &notice.url,
-                notice.published_date.as_deref(),
-                &notice.body_text,
-                &attachments_json,
-                new_hash,
-                now,
-                now,
-                now,
-                checked_ts,
-                fetched_ts,
-            )?;
-            Ok(Some(stmt))
-        }
-        Some(prev) if prev.content_hash != new_hash => {
-            let backfill_flag: i32 = if silent_backfill { 1 } else { 0 };
-            let stmt = query!(
-                session,
-                "UPDATE notices SET title=?1, description=?2, published_date=?3, \
-                 body_text=?4, attachments_json=?5, content_hash=?6, last_seen_at=?7, \
-                 content_changed_at=CASE WHEN ?8 = 1 THEN content_changed_at ELSE ?7 END, \
-                 last_notified_hash=CASE WHEN ?8 = 1 THEN ?6 ELSE last_notified_hash END, \
-                 notification_attempted_at=CASE WHEN ?8 = 1 THEN notification_attempted_at ELSE NULL END, \
-                 detail_checked_at=COALESCE(?9, detail_checked_at), \
-                 detail_fetched_at=COALESCE(?10, detail_fetched_at) WHERE link=?11",
-                &notice.title,
-                &notice.description,
-                notice.published_date.as_deref(),
-                &notice.body_text,
-                &attachments_json,
-                new_hash,
-                now,
-                backfill_flag,
-                checked_ts,
-                fetched_ts,
-                &notice.url,
-            )?;
-            Ok(Some(stmt))
-        }
-        Some(_) if detail_checked => {
-            let stmt = query!(
-                session,
-                "UPDATE notices SET detail_checked_at=?1, \
-                 detail_fetched_at=COALESCE(?2, detail_fetched_at) WHERE link=?3",
-                now,
-                fetched_ts,
-                &notice.url,
-            )?;
-            Ok(Some(stmt))
-        }
-        Some(_) => Ok(None),
+    if detail_attempted && notice.detail_fetched {
+        query!(
+            db,
+            "INSERT INTO notices (
+                title, description, link, published_date, body_text, attachments_json,
+                content_hash, first_seen_at, last_seen_at, detail_checked_at, detail_fetched_at,
+                content_changed_at
+            ) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, ?7, ?8, ?8, ?8, ?8, ?8)
+            ON CONFLICT(link) DO UPDATE SET
+                title = excluded.title,
+                description = excluded.description,
+                published_date = COALESCE(excluded.published_date, notices.published_date),
+                body_text = excluded.body_text,
+                attachments_json = excluded.attachments_json,
+                content_changed_at = CASE
+                    WHEN notices.content_hash != excluded.content_hash THEN excluded.content_changed_at
+                    ELSE notices.content_changed_at
+                END,
+                content_hash = excluded.content_hash,
+                last_seen_at = excluded.last_seen_at,
+                detail_checked_at = excluded.detail_checked_at,
+                detail_fetched_at = excluded.detail_fetched_at",
+            &notice.title,
+            &notice.description,
+            &notice.url,
+            pub_date,
+            &notice.body_text,
+            &attachments_json,
+            content_hash,
+            &now,
+        )
+    } else if detail_attempted {
+        query!(
+            db,
+            "INSERT INTO notices (
+                title, description, link, published_date, body_text, attachments_json,
+                content_hash, first_seen_at, last_seen_at, detail_checked_at, detail_fetched_at,
+                content_changed_at
+            ) VALUES (?1, ?2, ?3, NULLIF(?4, ''), '', '[]', ?5, ?6, ?6, ?6, NULL, ?6)
+            ON CONFLICT(link) DO UPDATE SET
+                title = excluded.title,
+                description = excluded.description,
+                published_date = COALESCE(excluded.published_date, notices.published_date),
+                content_changed_at = CASE
+                    WHEN notices.content_hash != excluded.content_hash THEN excluded.content_changed_at
+                    ELSE notices.content_changed_at
+                END,
+                content_hash = excluded.content_hash,
+                last_seen_at = excluded.last_seen_at,
+                detail_checked_at = excluded.detail_checked_at",
+            &notice.title,
+            &notice.description,
+            &notice.url,
+            pub_date,
+            content_hash,
+            &now,
+        )
+    } else {
+        query!(
+            db,
+            "INSERT INTO notices (
+                title, description, link, published_date, body_text, attachments_json,
+                content_hash, first_seen_at, last_seen_at, detail_checked_at, detail_fetched_at,
+                content_changed_at
+            ) VALUES (?1, ?2, ?3, NULLIF(?4, ''), '', '[]', ?5, ?6, ?6, NULL, NULL, ?6)
+            ON CONFLICT(link) DO UPDATE SET
+                title = excluded.title,
+                description = excluded.description,
+                published_date = COALESCE(excluded.published_date, notices.published_date),
+                content_changed_at = CASE
+                    WHEN notices.content_hash != excluded.content_hash THEN excluded.content_changed_at
+                    ELSE notices.content_changed_at
+                END,
+                content_hash = excluded.content_hash,
+                last_seen_at = excluded.last_seen_at",
+            &notice.title,
+            &notice.description,
+            &notice.url,
+            pub_date,
+            content_hash,
+            &now,
+        )
     }
 }
 
+/// Executes a batch of prepared statements on the `D1DatabaseSession` and aggregates `D1Metrics`.
 pub async fn execute_batch(
     session: &D1DatabaseSession,
     statements: Vec<D1PreparedStatement>,
 ) -> Result<D1Metrics> {
+    let mut metrics = D1Metrics::default();
     if statements.is_empty() {
-        return Ok(D1Metrics::default());
+        return Ok(metrics);
     }
-    let mut totals = D1Metrics::default();
+
     for chunk in statements.chunks(D1_BIND_CHUNK_SIZE) {
-        let res = session.batch(chunk.to_vec()).await?;
-        let chunk_metrics = accumulate_meta(&res);
-        totals.rows_read += chunk_metrics.rows_read;
-        totals.rows_written += chunk_metrics.rows_written;
+        let results = session.batch(chunk.to_vec()).await?;
+        for res in results {
+            if let Ok(Some(meta)) = res.meta() {
+                metrics.rows_read += meta.rows_read.unwrap_or(0);
+                metrics.rows_written += meta.rows_written.unwrap_or(0);
+            }
+        }
     }
-    Ok(totals)
+
+    Ok(metrics)
 }
 
-pub async fn mark_notification_attempt(session: &D1DatabaseSession, link: &str) -> Result<()> {
-    let now = utc_now_iso();
-    query!(
-        session,
+/// Records the timestamp of a Telegram send attempt.
+pub async fn mark_notification_attempt(
+    db: &D1Database,
+    session: &D1DatabaseSession,
+    link: &str,
+) -> Result<D1Metrics> {
+    let now = Utc::now().to_rfc3339();
+    let stmt = query!(
+        db,
         "UPDATE notices SET notification_attempted_at=?1 WHERE link=?2",
         &now,
         link,
-    )?
-    .run()
-    .await?;
-    Ok(())
+    )?;
+    execute_batch(session, vec![stmt]).await
 }
 
+/// Marks a notice as notified for the given `content_hash`.
 pub async fn mark_notified(
+    db: &D1Database,
     session: &D1DatabaseSession,
     link: &str,
     content_hash: &str,
-) -> Result<()> {
-    let now = utc_now_iso();
-    query!(
-        session,
+) -> Result<D1Metrics> {
+    let now = Utc::now().to_rfc3339();
+    let stmt = query!(
+        db,
         "UPDATE notices SET sent_at=COALESCE(sent_at, ?1), last_notified_hash=?2 WHERE link=?3",
         &now,
         content_hash,
         link,
-    )?
-    .run()
-    .await?;
-    Ok(())
+    )?;
+    execute_batch(session, vec![stmt]).await
 }
