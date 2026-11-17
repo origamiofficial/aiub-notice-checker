@@ -99,16 +99,22 @@ pub async fn fetch_html(target_url: &str) -> Result<String> {
     )))
 }
 
-/// Parses the AIUB notice listing HTML (`ul.event-list li` with fallback to `.notification, .card`).
+/// Parses the AIUB notice listing HTML by selecting `ul.event-list` first and then `li`
+/// inside it (avoiding descendant space combinators in `tl 0.7.8`).
 pub fn parse_listing_html(html: &str) -> Vec<Notice> {
     let Ok(dom) = tl::parse(html, ParserOptions::default()) else {
         return Vec::new();
     };
     let parser = dom.parser();
 
-    let mut item_handles = query_handles(&dom, "ul.event-list li");
+    let mut item_handles = find_listing_card_handles(&dom, parser);
     if item_handles.is_empty() {
-        item_handles = query_handles(&dom, ".notification, .card");
+        for fallback in [".notification", ".card"] {
+            item_handles = query_handles(&dom, fallback);
+            if !item_handles.is_empty() {
+                break;
+            }
+        }
     }
 
     let mut notices = Vec::with_capacity(item_handles.len());
@@ -132,7 +138,10 @@ pub fn parse_listing_html(html: &str) -> Vec<Notice> {
 
         let title = find_first_text_in_tag(tag, parser, "h2.title")
             .or_else(|| find_first_text_in_tag(tag, parser, ".title"))
-            .or_else(|| find_first_text_in_tag(tag, parser, "h2, h3, h4, a"))
+            .or_else(|| find_first_text_in_tag(tag, parser, "h2"))
+            .or_else(|| find_first_text_in_tag(tag, parser, "h3"))
+            .or_else(|| find_first_text_in_tag(tag, parser, "h4"))
+            .or_else(|| find_first_text_in_tag(tag, parser, "a"))
             .map(|s| clean_whitespace(&s))
             .unwrap_or_default();
 
@@ -162,8 +171,23 @@ pub fn parse_listing_html(html: &str) -> Vec<Notice> {
     notices
 }
 
-/// Parses an AIUB notice detail page without multi-step descendant combinators
-/// (`tl 0.7.8` returns `None` on selectors like `div.notice-page div.question-column`).
+fn find_listing_card_handles(dom: &VDom, parser: &Parser) -> Vec<tl::NodeHandle> {
+    let mut out = Vec::new();
+    if let Some(lists) = dom.query_selector("ul.event-list") {
+        for ul_handle in lists {
+            if let Some(ul_node) = ul_handle.get(parser) {
+                if let Some(ul_tag) = ul_node.as_tag() {
+                    if let Some(items) = ul_tag.query_selector(parser, "li") {
+                        out.extend(items);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Parses an AIUB notice detail page without multi-step descendant combinators.
 pub fn parse_detail_html(html: &str, page_url: &str) -> Option<(String, Vec<String>)> {
     let dom = tl::parse(html, ParserOptions::default()).ok()?;
     let parser = dom.parser();
@@ -362,6 +386,15 @@ fn find_first_text_in_tag(
 }
 
 fn extract_iso_date_from_card(tag: &tl::HTMLTag, parser: &Parser) -> Option<String> {
+    // 1. Check `<time datetime="...">` attribute if present
+    if let Some(dt_attr) = find_first_attr_in_tag(tag, parser, "time", "datetime") {
+        let prefix: String = dt_attr.chars().take(10).collect();
+        if let Some(iso) = parse_date_to_iso(&prefix).or_else(|| parse_date_to_iso(&dt_attr)) {
+            return Some(iso);
+        }
+    }
+
+    // 2. Check `.day`, `.month`, `.year` spans inside `<li>`
     let day = find_first_text_in_tag(tag, parser, ".day").unwrap_or_default();
     let month = find_first_text_in_tag(tag, parser, ".month").unwrap_or_default();
     let year = find_first_text_in_tag(tag, parser, ".year").unwrap_or_default();
@@ -373,10 +406,13 @@ fn extract_iso_date_from_card(tag: &tl::HTMLTag, parser: &Parser) -> Option<Stri
         }
     }
 
+    // 3. Fallback to `<time>` or `.date` inner text
     if let Some(raw_time) = find_first_text_in_tag(tag, parser, "time")
         .or_else(|| find_first_text_in_tag(tag, parser, ".date"))
     {
-        return parse_date_to_iso(&raw_time);
+        if let Some(iso) = parse_date_to_iso(&raw_time) {
+            return Some(iso);
+        }
     }
 
     None
@@ -389,7 +425,41 @@ fn parse_date_to_iso(raw: &str) -> Option<String> {
             return Some(d.format("%Y-%m-%d").to_string());
         }
     }
+
+    // Case-insensitive token fallback (e.g. "16 Nov 2026" or "16 NOV 2026")
+    let parts: Vec<&str> = cleaned.split_whitespace().collect();
+    if parts.len() >= 3 {
+        if let (Ok(day), Some(month), Ok(year)) = (
+            parts[0].parse::<u32>(),
+            month_number(parts[1]),
+            parts[2].parse::<i32>(),
+        ) {
+            if let Some(d) = NaiveDate::from_ymd_opt(year, month, day) {
+                return Some(d.format("%Y-%m-%d").to_string());
+            }
+        }
+    }
+
     None
+}
+
+fn month_number(s: &str) -> Option<u32> {
+    let lower = s.trim_matches('.').to_ascii_lowercase();
+    match lower.as_str() {
+        "jan" | "january" => Some(1),
+        "feb" | "february" => Some(2),
+        "mar" | "march" => Some(3),
+        "apr" | "april" => Some(4),
+        "may" => Some(5),
+        "jun" | "june" => Some(6),
+        "jul" | "july" => Some(7),
+        "aug" | "august" => Some(8),
+        "sep" | "sept" | "september" => Some(9),
+        "oct" | "october" => Some(10),
+        "nov" | "november" => Some(11),
+        "dec" | "december" => Some(12),
+        _ => None,
+    }
 }
 
 pub fn normalize_notice_url(raw_href: &str) -> String {

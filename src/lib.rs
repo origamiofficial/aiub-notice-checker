@@ -45,7 +45,7 @@ async fn run(env: &Env) -> worker::Result<()> {
     let session = database.with_session(Some("first-primary"))?;
     let mut total_d1 = D1Metrics::default();
 
-    // 1. Fetch the 100 latest notices on listing page 1.
+    // 1. Fetch the latest notices on listing page 1.
     let listing_notices: Vec<Notice> = enter_span_async("fetch_listing", |span| async move {
         let listing_url = scraper::listing_page_url(1);
         span.set_attribute("url", listing_url.as_str());
@@ -82,7 +82,7 @@ async fn run(env: &Env) -> worker::Result<()> {
         }
     }
 
-    // Listing coverage sanity check (warns if date or description selectors degrade).
+    // Listing coverage sanity check.
     let total_listed = unique_listing.len() as f64;
     let date_coverage = unique_listing
         .iter()
@@ -105,11 +105,11 @@ async fn run(env: &Env) -> worker::Result<()> {
 
     let links: Vec<String> = unique_listing.iter().map(|n| n.url.clone()).collect();
 
-    // 2. Load existing D1 rows strictly for the current 100 notices.
+    // 2. Load existing D1 rows strictly for the current page 1 notices.
     let session_ref = &session;
     let links_ref = &links;
     let (existing_map, read_metrics) =
-        enter_span_async("load_existing_100_from_d1", |span| async move {
+        enter_span_async("load_existing_from_d1", |span| async move {
             span.set_attribute("queried_links", links_ref.len() as i64);
             match db::get_notices_by_links(session_ref, links_ref).await {
                 Ok((map, m)) => {
@@ -129,10 +129,11 @@ async fn run(env: &Env) -> worker::Result<()> {
     total_d1.rows_read += read_metrics.rows_read;
     total_d1.rows_written += read_metrics.rows_written;
 
-    // 3. Select up to MAX_DETAIL_FETCHES_PER_RUN (5) detail pages strictly from the 100 notices:
+    // 3. Select up to MAX_DETAIL_FETCHES_PER_RUN (5) detail pages strictly from the visible notices:
     //    Priority A: Brand-new notices not in D1 yet.
-    //    Priority B: Existing notices in the 100 where detail_fetched_at IS NULL and retry cooldown elapsed.
-    //    Priority C: Existing notices in the 100 ordered by oldest detail_checked_at (rolling edit check).
+    //    Priority B: Existing notices where detail_fetched_at IS NULL (respecting retry cooldown)
+    //                OR where the listing title/description changed on page 1.
+    //    Priority C: Existing notices ordered by oldest detail_checked_at (rolling edit check).
     let retry_cutoff_iso =
         (Utc::now() - Duration::minutes(DETAIL_RETRY_COOLDOWN_MINUTES)).to_rfc3339();
 
@@ -152,24 +153,26 @@ async fn run(env: &Env) -> worker::Result<()> {
             }
         }
 
-        // Priority B: Unfetched detail pages in the 100 (respecting retry cooldown)
+        // Priority B: Unfetched detail pages OR notices whose listing title/description changed
         let mut backfill_count = 0i64;
         for item in &unique_listing {
             if selected.len() >= MAX_DETAIL_FETCHES_PER_RUN {
                 break;
             }
             if let Some(row) = existing_map.get(&item.url) {
-                if row.detail_fetched_at.is_none()
-                    && row.detail_due(&retry_cutoff_iso)
-                    && selected_set.insert(item.url.clone())
-                {
+                let listing_changed = !titles_equivalent(&item.title, &row.title)
+                    || row.description != item.description;
+                let needs_backfill =
+                    row.detail_fetched_at.is_none() && row.detail_due(&retry_cutoff_iso);
+
+                if (needs_backfill || listing_changed) && selected_set.insert(item.url.clone()) {
                     selected.push(item.url.clone());
                     backfill_count += 1;
                 }
             }
         }
 
-        // Priority C: Rolling edit check across the 100 notices (oldest detail_checked_at first)
+        // Priority C: Rolling edit check across visible notices (oldest detail_checked_at first)
         let mut rotation_count = 0i64;
         if selected.len() < MAX_DETAIL_FETCHES_PER_RUN {
             let mut candidates: Vec<&NoticeRow> = existing_map
@@ -269,12 +272,11 @@ async fn run(env: &Env) -> worker::Result<()> {
 
     let mut statements = Vec::new();
     let mut notifications: Vec<PendingNotification> = Vec::new();
-    let mut silent_backfills = 0usize;
+    let mut silent_sync_links: Vec<(String, String)> = Vec::new();
 
     for mut item in unique_listing {
         let existing = existing_map.get(&item.url);
 
-        // Preserve full cached title if the listing title was truncated with "..."
         if let Some(row) = existing {
             if item.title.contains("...") && titles_equivalent(&item.title, &row.title) {
                 item.title = row.title.clone();
@@ -324,20 +326,29 @@ async fn run(env: &Env) -> worker::Result<()> {
             }
         };
 
-        // Silent backfill check: if a notice was already notified before its detail page was
-        // ever fetched, and its listing fields haven't changed, update last_notified_hash
-        // silently so the first detail backfill doesn't fire a false [EDITED] alert.
+        // Silent hash sync for two non-edit backfill cases:
+        // 1. First-time detail fetch (`row.detail_fetched_at.is_none()`) when listing fields didn't change.
+        // 2. Date-only backfill (`row.published_date != item.published_date`) when title, description,
+        //    body_text, and attachments are identical.
         let mut silent_hash_sync = false;
         if let Some(row) = existing {
-            if row.sent_at.is_some()
-                && row.detail_fetched_at.is_none()
-                && item.detail_fetched
-                && titles_equivalent(&item.title, &row.title)
-                && row.description == item.description
-                && row.published_date == item.published_date
+            if row.sent_at.is_some() && row.last_notified_hash.as_deref() != Some(new_hash.as_str())
             {
-                silent_hash_sync = true;
-                silent_backfills += 1;
+                let first_detail_backfill = row.detail_fetched_at.is_none()
+                    && item.detail_fetched
+                    && titles_equivalent(&item.title, &row.title)
+                    && row.description == item.description
+                    && row.published_date == item.published_date;
+
+                let date_only_backfill = row.published_date != item.published_date
+                    && titles_equivalent(&item.title, &row.title)
+                    && row.description == item.description
+                    && row.body_text == item.body_text
+                    && row.attachments_json == item.attachments_json();
+
+                if first_detail_backfill || date_only_backfill {
+                    silent_hash_sync = true;
+                }
             }
         }
 
@@ -347,16 +358,12 @@ async fn run(env: &Env) -> worker::Result<()> {
         }
 
         if silent_hash_sync {
-            let m = db::mark_notified(&database, &session, &item.url, &new_hash).await?;
-            total_d1.rows_read += m.rows_read;
-            total_d1.rows_written += m.rows_written;
+            silent_sync_links.push((item.url.clone(), new_hash));
             continue;
         }
 
         match existing {
             None => {
-                // Brand-new notice: send immediately if detail was fetched (or attempted),
-                // otherwise wait 5 minutes for the next run's detail budget.
                 if item.detail_fetched || detail_attempted {
                     notifications.push(PendingNotification {
                         notice: item,
@@ -374,7 +381,11 @@ async fn run(env: &Env) -> worker::Result<()> {
                             is_edited: false,
                         });
                     }
-                } else if row.last_notified_hash.as_deref() != Some(new_hash.as_str()) {
+                } else if detail_attempted
+                    && row.last_notified_hash.as_deref() != Some(new_hash.as_str())
+                {
+                    // Only fire [EDITED] after the detail page has been checked in this run,
+                    // preventing two separate [EDITED] alerts for a single notice update.
                     notifications.push(PendingNotification {
                         notice: item,
                         content_hash: new_hash,
@@ -384,6 +395,8 @@ async fn run(env: &Env) -> worker::Result<()> {
             }
         }
     }
+
+    let silent_backfills = silent_sync_links.len();
 
     // 6. Execute D1 batch upserts on the session.
     if !statements.is_empty() {
@@ -400,6 +413,13 @@ async fn run(env: &Env) -> worker::Result<()> {
 
         total_d1.rows_read += batch_metrics.rows_read;
         total_d1.rows_written += batch_metrics.rows_written;
+    }
+
+    // Apply silent hash updates after the batch upsert completes.
+    for (url, hash) in silent_sync_links {
+        let m = db::mark_notified(&database, &session, &url, &hash).await?;
+        total_d1.rows_read += m.rows_read;
+        total_d1.rows_written += m.rows_written;
     }
 
     // 7. Dispatch queued Telegram notifications (oldest-first).
