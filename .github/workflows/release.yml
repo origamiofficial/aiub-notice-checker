@@ -235,6 +235,7 @@ jobs:
         run: |
           NEW_VERSION="${{ steps.version.outputs.version }}"
           PREV_VERSION="${{ steps.version.outputs.previous_version }}"
+          PREV_TAG="${{ steps.version.outputs.previous_tag }}"
           NOTICE_COUNT="${{ steps.benchmark.outputs.notice_count }}"
           DURATION_MS="${{ steps.benchmark.outputs.duration_ms }}"
           WITHIN_24H="${{ steps.version.outputs.within_24h }}"
@@ -242,6 +243,18 @@ jobs:
           BUMP_TYPE="minor"
           if [[ "$WITHIN_24H" == "true" ]]; then
             BUMP_TYPE="hotfix (patch)"
+          fi
+
+          # Extract commit changelog between previous tag and HEAD^ (excluding the release commit)
+          CHANGES=""
+          if [[ -n "$PREV_TAG" ]] && git rev-parse --verify "refs/tags/$PREV_TAG" &>/dev/null; then
+            CHANGES=$(git log "${PREV_TAG}..HEAD^" --pretty=format:"- %h %s" --no-merges 2>/dev/null || true)
+          elif [[ -n "$PREV_VERSION" ]] && git rev-parse --verify "refs/tags/v$PREV_VERSION" &>/dev/null; then
+            CHANGES=$(git log "v${PREV_VERSION}..HEAD^" --pretty=format:"- %h %s" --no-merges 2>/dev/null || true)
+          fi
+
+          if [[ -z "$CHANGES" ]]; then
+            CHANGES="- Routine release with all checks passing"
           fi
 
           cat > release-notes.md <<EOF
@@ -256,7 +269,7 @@ jobs:
           - **Benchmark artifact:** attached as \`scrape-benchmark.json\`
 
           ### Changes
-          $(git log "v${PREV_VERSION}..HEAD" --oneline --no-merges 2>/dev/null || echo "Initial release")
+          ${CHANGES}
 
           ---
           *Automated release by GitHub Actions*

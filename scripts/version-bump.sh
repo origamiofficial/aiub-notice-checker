@@ -209,5 +209,6 @@ fi
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   echo "version=${NEW_VERSION}" >> "$GITHUB_OUTPUT"
   echo "within_24h=${within_24h}" >> "$GITHUB_OUTPUT"
-  echo "previous_version=${current_version}" >> "$GITHUB_OUTPUT"
+  echo "previous_version=${BASE_MAJOR}.${BASE_MINOR}.${BASE_PATCH}" >> "$GITHUB_OUTPUT"
+  echo "previous_tag=${BEST_TAG}" >> "$GITHUB_OUTPUT"
 fi
