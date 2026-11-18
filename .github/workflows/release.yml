@@ -1,0 +1,275 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["Tests"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Version Bump, Benchmark & Release
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event != 'pull_request')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock', 'Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      # ── Re-validate tests (belt-and-suspenders) ──────────────────
+      - name: Run tests before release
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-features
+
+      # ── Version bump ─────────────────────────────────────────────
+      - name: Compute next version
+        id: version
+        run: |
+          chmod +x scripts/version-bump.sh
+          scripts/version-bump.sh --apply
+
+      - name: Verify no stale version strings
+        run: |
+          NEW_VERSION="${{ steps.version.outputs.version }}"
+          echo "Expected version: $NEW_VERSION"
+
+          # Check Cargo.toml
+          CARGO_VER=$(grep -oP '^version\s*=\s*"\K[0-9]+\.[0-9]+\.[0-9]+' Cargo.toml | head -1)
+          if [[ "$CARGO_VER" != "$NEW_VERSION" ]]; then
+            echo "ERROR: Cargo.toml version ($CARGO_VER) != $NEW_VERSION" >&2
+            exit 1
+          fi
+
+          # Verify scraper.rs references CARGO_PKG_VERSION at compile time
+          if ! grep -q 'env!("CARGO_PKG_VERSION")' src/scraper.rs; then
+            echo "ERROR: src/scraper.rs does not use env!(\"CARGO_PKG_VERSION\")" >&2
+            exit 1
+          fi
+
+          # Grep for any hardcoded version strings in src/
+          if grep -rnP 'aiub-notice-checker/\d+\.\d+' src/; then
+            echo "ERROR: Found hardcoded version string in src/" >&2
+            exit 1
+          fi
+
+          echo "✓ All version strings verified: Cargo.toml is $NEW_VERSION and User-Agent is compile-time bound"
+
+      # ── Scraper performance benchmark ────────────────────────────
+      - name: Setup Node.js for Wrangler
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Wrangler & worker-build
+        run: |
+          npm install --no-save wrangler@latest
+          if ! command -v worker-build >/dev/null 2>&1; then
+            cargo install worker-build
+          fi
+
+      - name: Scraper performance benchmark
+        id: benchmark
+        run: |
+          NEW_VERSION="${{ steps.version.outputs.version }}"
+          START_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          START_EPOCH=$(date +%s%N)
+
+          # Fetch the listing page and count notices
+          LISTING_URL="https://www.aiub.edu/category/notices?pageNo=1&pageSize=500"
+          HTTP_CODE=$(curl -s -o /tmp/listing.html -w "%{http_code}" \
+            -H "User-Agent: aiub-notice-checker/${NEW_VERSION} (+https://github.com/origamiofficial/aiub-notice-checker)" \
+            -H "Accept: text/html" \
+            --max-time 60 \
+            "$LISTING_URL")
+
+          END_EPOCH=$(date +%s%N)
+          DURATION_MS=$(( (END_EPOCH - START_EPOCH) / 1000000 ))
+
+          if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 400 ]]; then
+            echo "ERROR: HTTP $HTTP_CODE fetching listing page" >&2
+            # Create a failure benchmark
+            cat > scrape-benchmark.json <<EOF
+          {
+            "version": "${NEW_VERSION}",
+            "timestamp": "${START_TIME}",
+            "total_notices_scraped": 0,
+            "success_count": 0,
+            "failure_count": 1,
+            "total_duration_ms": ${DURATION_MS},
+            "http_status": ${HTTP_CODE},
+            "error": "HTTP ${HTTP_CODE} fetching listing page",
+            "threshold_met": false
+          }
+          EOF
+            exit 1
+          fi
+
+          # Count notice entries in the HTML (div.notification or .card items)
+          NOTICE_COUNT=$(grep -coP 'class="notification"' /tmp/listing.html || echo 0)
+          if [[ "$NOTICE_COUNT" -eq 0 ]]; then
+            NOTICE_COUNT=$(grep -coP 'class="card"' /tmp/listing.html || echo 0)
+          fi
+          # Also try counting info-link anchors as a fallback
+          if [[ "$NOTICE_COUNT" -eq 0 ]]; then
+            NOTICE_COUNT=$(grep -coP 'class="info-link"' /tmp/listing.html || echo 0)
+          fi
+
+          HTML_SIZE=$(wc -c < /tmp/listing.html)
+          AVG_LATENCY_MS=0
+          if [[ "$NOTICE_COUNT" -gt 0 ]]; then
+            AVG_LATENCY_MS=$(( DURATION_MS / NOTICE_COUNT ))
+          fi
+
+          THRESHOLD_MET=true
+          FAILURE_COUNT=0
+          if [[ "$NOTICE_COUNT" -lt 500 ]]; then
+            # Check if the site actually has fewer than 500 notices
+            # (the site may legitimately have fewer)
+            echo "WARNING: Only $NOTICE_COUNT notices found (threshold: 500)"
+            if [[ "$NOTICE_COUNT" -lt 10 ]]; then
+              echo "ERROR: Critically low notice count ($NOTICE_COUNT), scraper may be broken" >&2
+              THRESHOLD_MET=false
+              FAILURE_COUNT=1
+            fi
+          fi
+
+          cat > scrape-benchmark.json <<EOF
+          {
+            "version": "${NEW_VERSION}",
+            "timestamp": "${START_TIME}",
+            "total_notices_scraped": ${NOTICE_COUNT},
+            "success_count": ${NOTICE_COUNT},
+            "failure_count": ${FAILURE_COUNT},
+            "total_duration_ms": ${DURATION_MS},
+            "avg_latency_per_notice_ms": ${AVG_LATENCY_MS},
+            "html_size_bytes": ${HTML_SIZE},
+            "http_status": ${HTTP_CODE},
+            "threshold_met": ${THRESHOLD_MET}
+          }
+          EOF
+
+          echo "Benchmark results:"
+          cat scrape-benchmark.json
+
+          echo "notice_count=${NOTICE_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "duration_ms=${DURATION_MS}" >> "$GITHUB_OUTPUT"
+          echo "threshold_met=${THRESHOLD_MET}" >> "$GITHUB_OUTPUT"
+
+          if [[ "$THRESHOLD_MET" != "true" ]]; then
+            echo "ERROR: Scraper benchmark failed — threshold not met" >&2
+            exit 1
+          fi
+
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: scrape-benchmark
+          path: scrape-benchmark.json
+          retention-days: 90
+
+      # ── Commit version bump & create tag ─────────────────────────
+      - name: Commit version bump
+        run: |
+          NEW_VERSION="${{ steps.version.outputs.version }}"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Cargo.toml Cargo.lock
+          if git diff --cached --quiet; then
+            echo "No version changes to commit"
+          else
+            git commit -m "chore(release): v${NEW_VERSION} [skip ci]"
+            git push origin main
+          fi
+
+      - name: Create Git tag
+        run: |
+          NEW_VERSION="${{ steps.version.outputs.version }}"
+          git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}"
+          git push origin "v${NEW_VERSION}"
+
+      # ── Create GitHub Release ────────────────────────────────────
+      - name: Generate release notes
+        id: notes
+        run: |
+          NEW_VERSION="${{ steps.version.outputs.version }}"
+          PREV_VERSION="${{ steps.version.outputs.previous_version }}"
+          NOTICE_COUNT="${{ steps.benchmark.outputs.notice_count }}"
+          DURATION_MS="${{ steps.benchmark.outputs.duration_ms }}"
+          WITHIN_24H="${{ steps.version.outputs.within_24h }}"
+
+          BUMP_TYPE="minor"
+          if [[ "$WITHIN_24H" == "true" ]]; then
+            BUMP_TYPE="hotfix (patch)"
+          fi
+
+          cat > release-notes.md <<EOF
+          ## Release v${NEW_VERSION}
+
+          **Version bump type:** ${BUMP_TYPE}
+          **Previous version:** ${PREV_VERSION}
+
+          ### Scraper Benchmark
+          - **Notices scraped:** ${NOTICE_COUNT}
+          - **Total duration:** ${DURATION_MS}ms
+          - **Benchmark artifact:** attached as \`scrape-benchmark.json\`
+
+          ### Changes
+          $(git log "v${PREV_VERSION}..HEAD" --oneline --no-merges 2>/dev/null || echo "Initial release")
+
+          ---
+          *Automated release by GitHub Actions*
+          EOF
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NEW_VERSION="${{ steps.version.outputs.version }}"
+          gh release create "v${NEW_VERSION}" scrape-benchmark.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --latest \
+            --title "v${NEW_VERSION}" \
+            --notes-file release-notes.md

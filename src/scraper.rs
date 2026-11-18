@@ -15,8 +15,11 @@ use crate::config::{
 };
 use crate::models::Notice;
 
-const USER_AGENT: &str =
-    "aiub-notice-checker/5.4 (+https://github.com/origamiofficial/aiub-notice-checker)";
+pub(crate) const USER_AGENT: &str = concat!(
+    "aiub-notice-checker/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://github.com/origamiofficial/aiub-notice-checker)"
+);
 
 #[derive(Debug, Clone)]
 pub struct ParsedDetail {
@@ -43,7 +46,9 @@ pub async fn fetch_html(target_url: &str) -> Result<String> {
 
     for _hop in 0..=MAX_REDIRECTS {
         if current_url.len() > MAX_URL_LENGTH {
-            return Err(Error::RustError("URL exceeds maximum allowed length".into()));
+            return Err(Error::RustError(
+                "URL exceeds maximum allowed length".into(),
+            ));
         }
 
         let headers = Headers::new();
@@ -298,7 +303,13 @@ pub fn parse_detail_html(html: &str, page_url: &str) -> Option<ParsedDetail> {
             body_parts.push(part_text);
         }
 
-        extract_attachments_from_tag(tag, parser, page_url, &mut attachments, &mut seen_attachments);
+        extract_attachments_from_tag(
+            tag,
+            parser,
+            page_url,
+            &mut attachments,
+            &mut seen_attachments,
+        );
     }
 
     let body_text = body_parts.join("\n\n");
@@ -550,8 +561,8 @@ fn find_first_attr_in_tag(
     selector: &str,
     attr: &str,
 ) -> Option<String> {
-    let mut iter = tag.query_selector(parser, selector)?;
-    while let Some(handle) = iter.next() {
+    let iter = tag.query_selector(parser, selector)?;
+    for handle in iter {
         let node = handle.get(parser)?;
         let inner_tag = node.as_tag()?;
         if let Some(val) = get_attr_str(inner_tag, attr) {
@@ -562,8 +573,8 @@ fn find_first_attr_in_tag(
 }
 
 fn find_first_text_in_tag(tag: &HTMLTag, parser: &Parser, selector: &str) -> Option<String> {
-    let mut iter = tag.query_selector(parser, selector)?;
-    while let Some(handle) = iter.next() {
+    let iter = tag.query_selector(parser, selector)?;
+    for handle in iter {
         let node: &Node = handle.get(parser)?;
         let raw = if let Some(inner_tag) = node.as_tag() {
             extract_spaced_inline_text(inner_tag, parser)

@@ -1,6 +1,22 @@
-__pycache__/
-*.py[cod]
-.venv/
-.stable-release/
-.wrangler
+# Rust build artifacts
 target/
+*.wasm
+
+# Wrangler
+.wrangler/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node (Wrangler)
+node_modules/
+package-lock.json

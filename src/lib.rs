@@ -2,8 +2,7 @@ use chrono::{Duration, Utc};
 use futures_util::stream::{self, StreamExt};
 use std::collections::{HashMap, HashSet};
 use worker::{
-    console_error, console_log, console_warn,
-    event,
+    console_error, console_log, console_warn, event,
     observability::{enter_span, enter_span_async, SpanStatus},
     signal::is_near_cpu_limit,
     Env, ScheduleContext, ScheduledEvent,
@@ -14,6 +13,9 @@ mod db;
 mod models;
 mod scraper;
 mod telegram;
+#[cfg(test)]
+mod tests;
+pub mod version;
 
 use config::{
     Secrets, DETAIL_FAILURE_MIN_SAMPLE, DETAIL_FAILURE_RATIO, DETAIL_RETRY_COOLDOWN_MINUTES,

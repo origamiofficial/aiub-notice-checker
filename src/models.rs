@@ -143,6 +143,6 @@ pub fn format_notice_message(notice: &Notice, edited: bool) -> String {
     let available = TELEGRAM_MAX_MESSAGE_LEN
         .saturating_sub(header.chars().count())
         .saturating_sub(suffix.chars().count());
-    let body = truncate_text(raw_body, available.min(1600).max(4));
+    let body = truncate_text(raw_body, available.clamp(4, 1600));
     format!("{header}{body}{suffix}")
 }
