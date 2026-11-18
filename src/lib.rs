@@ -187,7 +187,10 @@ async fn run(env: &Env) -> worker::Result<()> {
                     Ok::<(HashMap<String, NoticeRow>, D1Metrics), worker::Error>((map, m))
                 }
                 Err(err) => {
-                    console_error!("[D1 Query Failed] Failed to query existing notices: {}", err);
+                    console_error!(
+                        "[D1 Query Failed] Failed to query existing notices: {}",
+                        err
+                    );
                     span.set_status(SpanStatus::Error(Some(err.to_string())));
                     Err(err)
                 }
@@ -397,7 +400,8 @@ async fn run(env: &Env) -> worker::Result<()> {
         }
     }
 
-    let total_failed = detail_http_error_count + detail_parse_error_count + detail_cpu_skipped_count;
+    let total_failed =
+        detail_http_error_count + detail_parse_error_count + detail_cpu_skipped_count;
     if attempted_count >= DETAIL_FAILURE_MIN_SAMPLE
         && (total_failed as f64 / attempted_count as f64) >= DETAIL_FAILURE_RATIO
     {

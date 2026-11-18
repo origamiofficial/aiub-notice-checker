@@ -192,10 +192,7 @@ mod scraper_tests {
             clean_whitespace("Bangladesh\u{00AD} SET B EXAM"),
             "Bangladesh SET B EXAM"
         );
-        assert_eq!(
-            clean_whitespace("Bangladesh\u{00AD}SET"),
-            "BangladeshSET"
-        );
+        assert_eq!(clean_whitespace("Bangladesh\u{00AD}SET"), "BangladeshSET");
         // Left-to-right mark (U+200E) and Right-to-left mark (U+200F)
         assert_eq!(
             clean_whitespace("\u{200E}Admission & Registration Procedure"),
@@ -409,7 +406,8 @@ mod scraper_tests {
 
     #[test]
     fn parse_detail_with_reason_reports_missing_question_column() {
-        let html = "<html><body><div class='notice-page'><p>No question column</p></div></body></html>";
+        let html =
+            "<html><body><div class='notice-page'><p>No question column</p></div></body></html>";
         let err = parse_detail_with_reason(html, "https://www.aiub.edu/test")
             .expect_err("should return Err when question-column is missing");
         assert_eq!(err, "missing non-sticky question-column container");
@@ -878,7 +876,9 @@ mod model_tests {
         assert!(!is_meaningful_text("no description available"));
         assert!(!is_meaningful_text("No description"));
         assert!(!is_meaningful_text("Please click the link for details."));
-        assert!(is_meaningful_text("Classes are suspended today due to weather."));
+        assert!(is_meaningful_text(
+            "Classes are suspended today due to weather."
+        ));
         assert!(is_meaningful_text("Registration deadline extended."));
     }
 
