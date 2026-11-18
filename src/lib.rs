@@ -348,14 +348,27 @@ async fn run(env: &Env) -> worker::Result<()> {
 
         let new_hash = item.content_hash();
 
-        let needs_db_write = match existing {
-            None => true,
+        // Determine whether this row needs a full upsert or just a lightweight timestamp update.
+        // When a rotation detail-check confirms the content hasn't changed (hash, title,
+        // description, published_date all identical), we skip the heavy INSERT ... ON CONFLICT
+        // that rewrites indexed columns, cutting steady-state D1 writes by ~1/3.
+        let (needs_db_write, use_lightweight_update) = match existing {
+            None => (true, false),
             Some(row) => {
-                detail_attempted
-                    || row.content_hash != new_hash
+                let content_changed = row.content_hash != new_hash
                     || row.title != item.title
                     || row.description != item.description
-                    || row.published_date != item.published_date
+                    || row.published_date != item.published_date;
+
+                if detail_attempted && !content_changed {
+                    // Detail was checked but nothing changed → lightweight timestamp-only update.
+                    (true, true)
+                } else if detail_attempted || content_changed {
+                    // Detail attempted with changes, or listing metadata changed → full upsert.
+                    (true, false)
+                } else {
+                    (false, false)
+                }
             }
         };
 
@@ -391,8 +404,15 @@ async fn run(env: &Env) -> worker::Result<()> {
         }
 
         if needs_db_write {
-            let stmt = db::build_upsert_statement(&database, &item, &new_hash, detail_attempted)?;
-            statements.push(stmt);
+            if use_lightweight_update {
+                let stmt =
+                    db::build_lightweight_detail_update(&database, &item.url, item.detail_fetched)?;
+                statements.push(stmt);
+            } else {
+                let stmt =
+                    db::build_upsert_statement(&database, &item, &new_hash, detail_attempted)?;
+                statements.push(stmt);
+            }
         }
 
         if silent_hash_sync {

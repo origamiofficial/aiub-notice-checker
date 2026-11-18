@@ -146,6 +146,34 @@ pub fn build_upsert_statement(
     }
 }
 
+/// Builds a lightweight UPDATE that only touches timestamp columns, leaving indexed
+/// fields (`published_date`, `content_hash`, etc.) untouched.  Used when a rotation
+/// detail-check confirms the content hasn't changed, cutting D1 `rows_written` from
+/// ~3 (b-tree rewrites on indexed columns) to 1.
+pub fn build_lightweight_detail_update(
+    db: &D1Database,
+    link: &str,
+    detail_fetched: bool,
+) -> Result<D1PreparedStatement> {
+    let now = Utc::now().to_rfc3339();
+    if detail_fetched {
+        query!(
+            db,
+            "UPDATE notices SET last_seen_at = ?1, detail_checked_at = ?1, \
+             detail_fetched_at = COALESCE(?1, detail_fetched_at) WHERE link = ?2",
+            &now,
+            link,
+        )
+    } else {
+        query!(
+            db,
+            "UPDATE notices SET last_seen_at = ?1, detail_checked_at = ?1 WHERE link = ?2",
+            &now,
+            link,
+        )
+    }
+}
+
 /// Executes a batch of prepared statements on the `D1DatabaseSession` and aggregates `D1Metrics`.
 pub async fn execute_batch(
     session: &D1DatabaseSession,
