@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 
 use crate::config::TELEGRAM_MAX_MESSAGE_LEN;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Notice {
     pub title: String,
     pub description: String,

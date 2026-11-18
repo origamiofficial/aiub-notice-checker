@@ -8,10 +8,10 @@ use worker::{
     Env, ScheduleContext, ScheduledEvent,
 };
 
-mod config;
+pub mod config;
 mod db;
-mod models;
-mod scraper;
+pub mod models;
+pub mod scraper;
 mod telegram;
 #[cfg(test)]
 mod tests;

@@ -20,3 +20,7 @@ Thumbs.db
 # Node (Wrangler)
 node_modules/
 package-lock.json
+
+# Artifacts & temp files
+scrape-benchmark.json
+*.html

@@ -113,10 +113,9 @@ jobs:
         id: benchmark
         run: |
           NEW_VERSION="${{ steps.version.outputs.version }}"
-          START_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           START_EPOCH=$(date +%s%N)
 
-          # Fetch the listing page and count notices
+          # Fetch 500 notices listing page from AIUB
           LISTING_URL="https://www.aiub.edu/category/notices?pageNo=1&pageSize=500"
           HTTP_CODE=$(curl -s -o /tmp/listing.html -w "%{http_code}" \
             -H "User-Agent: aiub-notice-checker/${NEW_VERSION} (+https://github.com/origamiofficial/aiub-notice-checker)" \
@@ -129,76 +128,36 @@ jobs:
 
           if [[ "$HTTP_CODE" -lt 200 || "$HTTP_CODE" -ge 400 ]]; then
             echo "ERROR: HTTP $HTTP_CODE fetching listing page" >&2
-            # Create a failure benchmark
             cat > scrape-benchmark.json <<EOF
           {
             "version": "${NEW_VERSION}",
-            "timestamp": "${START_TIME}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "total_notices_scraped": 0,
             "success_count": 0,
             "failure_count": 1,
             "total_duration_ms": ${DURATION_MS},
             "http_status": ${HTTP_CODE},
             "error": "HTTP ${HTTP_CODE} fetching listing page",
-            "threshold_met": false
+            "threshold_met": false,
+            "notices": []
           }
           EOF
             exit 1
           fi
 
-          # Count notice entries in the HTML (div.notification or .card items)
-          NOTICE_COUNT=$(grep -coP 'class="notification"' /tmp/listing.html || echo 0)
-          if [[ "$NOTICE_COUNT" -eq 0 ]]; then
-            NOTICE_COUNT=$(grep -coP 'class="card"' /tmp/listing.html || echo 0)
-          fi
-          # Also try counting info-link anchors as a fallback
-          if [[ "$NOTICE_COUNT" -eq 0 ]]; then
-            NOTICE_COUNT=$(grep -coP 'class="info-link"' /tmp/listing.html || echo 0)
-          fi
+          # Run our compiled Rust benchmark parser on the fetched HTML
+          cargo run --release --bin benchmark -- /tmp/listing.html "${NEW_VERSION}" "${DURATION_MS}" scrape-benchmark.json
 
-          HTML_SIZE=$(wc -c < /tmp/listing.html)
-          AVG_LATENCY_MS=0
-          if [[ "$NOTICE_COUNT" -gt 0 ]]; then
-            AVG_LATENCY_MS=$(( DURATION_MS / NOTICE_COUNT ))
-          fi
-
-          THRESHOLD_MET=true
-          FAILURE_COUNT=0
-          if [[ "$NOTICE_COUNT" -lt 500 ]]; then
-            # Check if the site actually has fewer than 500 notices
-            # (the site may legitimately have fewer)
-            echo "WARNING: Only $NOTICE_COUNT notices found (threshold: 500)"
-            if [[ "$NOTICE_COUNT" -lt 10 ]]; then
-              echo "ERROR: Critically low notice count ($NOTICE_COUNT), scraper may be broken" >&2
-              THRESHOLD_MET=false
-              FAILURE_COUNT=1
-            fi
-          fi
-
-          cat > scrape-benchmark.json <<EOF
-          {
-            "version": "${NEW_VERSION}",
-            "timestamp": "${START_TIME}",
-            "total_notices_scraped": ${NOTICE_COUNT},
-            "success_count": ${NOTICE_COUNT},
-            "failure_count": ${FAILURE_COUNT},
-            "total_duration_ms": ${DURATION_MS},
-            "avg_latency_per_notice_ms": ${AVG_LATENCY_MS},
-            "html_size_bytes": ${HTML_SIZE},
-            "http_status": ${HTTP_CODE},
-            "threshold_met": ${THRESHOLD_MET}
-          }
-          EOF
-
-          echo "Benchmark results:"
-          cat scrape-benchmark.json
+          # Extract summary metrics from the generated JSON
+          NOTICE_COUNT=$(grep -oP '"total_notices_scraped":\s*\K[0-9]+' scrape-benchmark.json | head -1)
+          THRESHOLD_MET=$(grep -oP '"threshold_met":\s*\K[a-z]+' scrape-benchmark.json | head -1)
 
           echo "notice_count=${NOTICE_COUNT}" >> "$GITHUB_OUTPUT"
           echo "duration_ms=${DURATION_MS}" >> "$GITHUB_OUTPUT"
           echo "threshold_met=${THRESHOLD_MET}" >> "$GITHUB_OUTPUT"
 
           if [[ "$THRESHOLD_MET" != "true" ]]; then
-            echo "ERROR: Scraper benchmark failed — threshold not met" >&2
+            echo "ERROR: Scraper benchmark failed — threshold not met ($NOTICE_COUNT notices)" >&2
             exit 1
           fi
 
