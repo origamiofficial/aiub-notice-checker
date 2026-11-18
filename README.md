@@ -6,6 +6,7 @@
 
 [![Build & Test](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/test.yml/badge.svg)](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/test.yml)
 [![Deploy Worker](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/deploy.yml/badge.svg)](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/deploy.yml)
+[![Release](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/release.yml/badge.svg)](https://github.com/origamiofficial/aiub-notice-checker/actions/workflows/release.yml)
 [![Rust Edition](https://img.shields.io/badge/rust-2021-orange.svg?logo=rust)](https://www.rust-lang.org/)
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
@@ -19,6 +20,7 @@
 [Getting Started](#-getting-started) •
 [Configuration](#-configuration) •
 [Deployment](#-deployment) •
+[Release & Benchmarks](#-release-pipeline--benchmarking) •
 [Observability](#-observability--resilience) •
 [Community](#-community--channels) •
 [Contributing](#-contributing)
@@ -44,12 +46,21 @@ By running as a serverless Rust Worker on Cloudflare's global edge network, the 
 
 - ⚡ **Zero-Overhead Edge Execution:** Compiled to `wasm32-unknown-unknown` via Rust for sub-millisecond execution times and minimal memory footprint.
 - ⏰ **Deterministic Cron Scheduling:** Cloudflare Worker cron triggers invoke the pipeline every 5 minutes (`*/5 * * * *`) with strict consistency.
+- 🛡️ **Empty-Database Cold-Start Guard:** Automatically detects fresh database initialization or D1 resets; if D1 is empty and notices are found ($\ge 10$), it silently seeds the archive without flooding Telegram subscribers.
 - 🔍 **Intelligent Content Hashing:** Uses cryptographic SHA-256 signatures across titles, descriptions, bodies, and attachment sets to detect both newly issued notices and updates to existing entries.
-- 🛡️ **Edge Persistence (Cloudflare D1):** Leverages serverless SQLite with primary session consistency (`first-primary`) to avoid read-after-write anomalies across edge regions.
-- 🚦 **Rate-Limited Telegram Pacing:** Dispatches announcements sequentially with pacing delays and exponential retry mechanisms to strictly comply with Telegram Bot API limits.
+- 🗄️ **Optimized D1 Writes & Lightweight Updates:** Skips costly B-tree index rewrites on unchanged rotation rows; uses lightweight timestamp-only SQL updates to slash steady-state D1 `rows_written` by ~33%.
+- 🎯 **3-Tier Detail Fetch Prioritization:** Respects free-tier CPU constraints by capping detail page fetches at 5 per run with bounded concurrency of 3:
+  - **Priority A:** Brand-new notices discovered on page 1.
+  - **Priority B:** Unfetched detail pages, mojibake repair candidates, or notices whose listing title/description changed.
+  - **Priority C:** Rolling round-robin rotation (oldest `detail_checked_at` first) to continuously monitor older visible notices for retroactive updates.
+- 🖼️ **Attachment-First Delivery for Image Notices:** When notices contain only scanned flyers or PDF banners without descriptive text, the bot automatically surfaces the direct image/PDF URL in Telegram rather than generic placeholders.
+- 🧹 **Word & CMS Control Character Sanitization:** Actively purges invisible Unicode artifacts (soft hyphens `\u{00AD}`, directional marks `\u{200E}`/`\u{200F}`, zero-width joiners `\u{200B}`..=`\u{200D}`, and BOMs `\u{FEFF}`) common in copy-pasted notices.
+- 🚫 **Meaningful Content Filtering:** Intelligently identifies and suppresses CMS boilerplate like `"No description available"` or `"Please click the link for details."` so attachments and clean summaries take priority.
 - 🩹 **Silent Mojibake & Encoding Self-Healing:** Seamlessly detects and repairs legacy UTF-8/Latin-1 double-encoded characters without triggering duplicate "Notice Edited" notifications.
-- 🚨 **DOM Drift & Health Safeguards:** Employs sample validation thresholds; if the university site changes its layout or drops parsing coverage, executions pause safely and alert administrators.
+- 🚨 **Granular Diagnostics & Health Alerts:** Categorizes failures into DOM layout changes, upstream AIUB timeouts, or Worker CPU limits, sending structured diagnostic reports to administrators.
+- 🚦 **Rate-Limited Telegram Pacing:** Dispatches announcements sequentially with 1-second pacing delays and exponential retry mechanisms to strictly comply with Telegram Bot API limits.
 - ⏱️ **CPU Limit Awareness:** Continuously checks execution budget via `is_near_cpu_limit()` to gracefully defer pending tasks to subsequent runs before edge quotas expire.
+- 📊 **Automated Scraper Benchmarking:** Validates parser throughput and coverage against 500 live notices on every version release.
 
 ---
 
@@ -58,37 +69,37 @@ By running as a serverless Rust Worker on Cloudflare's global edge network, the 
 ```mermaid
 flowchart TD
     subgraph Schedule ["⏰ Edge Trigger"]
-        Cron["Cloudflare Cron Trigger<br/><code>*/5 * * * *</code>"]
+        Cron["Cloudflare Cron Trigger<br/>Every 5 minutes"]
     end
 
     subgraph Worker ["🦀 Rust Cloudflare Worker (WASM)"]
-        Scraper["HTML Scraper & Parser<br/>(<code>tl</code> DOM Engine)"]
-        Reconciler["State Reconciler &<br/>SHA-256 Hash Differ"]
+        Scraper["HTML Scraper & Parser<br/>tl DOM Engine"]
+        Reconciler["State Reconciler &<br/>SHA-256 Differ"]
         RateLimiter["Telegram Pacer &<br/>Circuit Breaker"]
     end
 
     subgraph External ["🌐 External Targets"]
-        AIUB["AIUB Notices Portal<br/><code>aiub.edu/category/notices</code>"]
-        TelegramAPI["Telegram Bot API<br/><code>api.telegram.org</code>"]
+        AIUB["AIUB Notices Portal<br/>aiub.edu/category/notices"]
+        TelegramAPI["Telegram Bot API<br/>api.telegram.org"]
     end
 
     subgraph Storage ["💾 Cloudflare D1 (Edge SQLite)"]
-        D1[("Session-Consistent DB<br/><code>notices</code> & <code>app_state</code>")]
+        D1[("Session-Consistent DB<br/>notices & app_state tables")]
     end
 
     subgraph Delivery ["📢 Channels"]
-        Subscribers["Telegram Channel<br/>(<code>@aiubnotice</code>)"]
-        Admin["Admin Chat<br/>(DOM Drift / Health Alerts)"]
+        Subscribers["Telegram Channel<br/>@aiubnotice"]
+        Admin["Admin Chat<br/>DOM Drift & Health Alerts"]
     end
 
-    Cron -->|Triggers every 5 min| Scraper
+    Cron -->|Triggers scheduled check| Scraper
     Scraper -->|Fetches latest notices| AIUB
     Scraper -->|Extracts metadata & links| Reconciler
-    Reconciler <-->|Reads & Upserts (first-primary session)| D1
+    Reconciler <-->|Reads & writes state: first-primary| D1
     Reconciler -->|Queues new & edited notices| RateLimiter
-    RateLimiter -->|Dispatches with rate limits & retries| TelegramAPI
+    RateLimiter -->|Dispatches with pacing & retries| TelegramAPI
     TelegramAPI -->|Broadcasts notice alerts| Subscribers
-    RateLimiter -.->|Sends parser/circuit break alerts| Admin
+    RateLimiter -.->|Sends parser & error alerts| Admin
 ```
 
 ---
@@ -100,10 +111,11 @@ flowchart TD
 | **Language** | [Rust](https://www.rust-lang.org/) (Edition 2021) | Core application logic, type safety, and memory management |
 | **Target Runtime** | [Cloudflare Workers](https://workers.cloudflare.com/) (`wasm32`) | Serverless WebAssembly runtime executing on Cloudflare edge |
 | **Database** | [Cloudflare D1](https://developers.cloudflare.com/d1/) | Serverless edge SQLite database with session consistency |
-| **Parser** | [`tl`](https://crates.io/crates/tl) | High-performance, zero-allocation native HTML/DOM parser |
-| **Hashing** | [`sha2`](https://crates.io/crates/sha2) & [`hex`](https://crates.io/crates/hex) | Cryptographic SHA-256 state differencing |
+| **Parser** | [`tl`](https://crates.io/crates/tl) (v0.7.8) | High-performance, zero-allocation native HTML/DOM parser |
+| **HTML Sanitizer** | [`html-escape`](https://crates.io/crates/html-escape) (v0.3) | Entity decoding and invisible character stripping |
+| **Hashing** | [`sha2`](https://crates.io/crates/sha2) (v0.11) & [`hex`](https://crates.io/crates/hex) | Cryptographic SHA-256 state differencing |
 | **Build & Deploy** | [`wrangler`](https://developers.cloudflare.com/workers/wrangler/) & [`worker-build`](https://crates.io/crates/worker-build) | Cloudflare developer tooling with panic unwinding support |
-| **CI / CD** | GitHub Actions | Automated formatting, Clippy lints, unit testing, and continuous deployment |
+| **CI / CD** | GitHub Actions | Automated formatting, Clippy lints, unit testing, and chained deployment |
 
 ---
 
@@ -152,6 +164,17 @@ command = "worker-build --release --panic-unwind"
 crons = ["*/5 * * * *"]
 
 [observability]
+enabled = true
+
+[observability.traces]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+persist = true
+
+[observability.issues]
 enabled = true
 
 [[d1_databases]]
@@ -245,7 +268,7 @@ npx wrangler dev --test-scheduled
 In another terminal, manually dispatch a scheduled event to verify execution:
 
 ```bash
-curl "http://localhost:8787/__scheduled?cron=*+*+*+*+*"
+curl "http://localhost:8787/__scheduled"
 ```
 
 ---
@@ -253,6 +276,9 @@ curl "http://localhost:8787/__scheduled?cron=*+*+*+*+*"
 ## 🚢 Deployment
 
 ### Manual Deployment via Wrangler CLI
+
+> [!TIP]
+> If you are deploying this Worker to your own Cloudflare account, run `npx wrangler d1 create aiub-notices` first and update the `database_id` in `wrangler.toml` with your new database UUID.
 
 1. **Log in to Cloudflare:**
    ```bash
@@ -277,23 +303,45 @@ curl "http://localhost:8787/__scheduled?cron=*+*+*+*+*"
    ```
 
 <details>
-<summary><strong>🤖 Automated CI/CD (GitHub Actions)</strong></summary>
+<summary><strong>🤖 Automated CI/CD (Chained GitHub Actions)</strong></summary>
 
-The project includes pre-configured workflows under `.github/workflows/deploy.yml` that build and deploy automatically on merges to `main`.
+Deployment is fully automated through `.github/workflows/deploy.yml`, which triggers via `workflow_run` strictly after the `Tests` pipeline passes on `main`:
+
+```mermaid
+flowchart LR
+    Push[Push to main] --> Tests[Workflow: Tests<br/>fmt, clippy, test, wasm check]
+    Tests -->|On Success| Deploy[Workflow: Deploy Worker<br/>wrangler d1 migrate & deploy]
+```
 
 Configure the following secrets in **GitHub Repository Settings ➔ Secrets and variables ➔ Actions**:
 - `CLOUDFLARE_API_TOKEN`: Cloudflare API token with `Workers:Edit` and `D1:Edit` permissions.
 - `CLOUDFLARE_ACCOUNT_ID`: Your Cloudflare Account ID.
 
-All other runtime secrets (`TELEGRAM_*`) reside directly in Cloudflare Secrets and remain persistent across deployments.
+Runtime secrets (`TELEGRAM_*`) remain persisted in Cloudflare Secrets across all deployments.
 </details>
+
+---
+
+## 📦 Release Pipeline & Benchmarking
+
+The repository includes an automated release workflow (`.github/workflows/release.yml`) implementing a **single-digit rolling semver** scheme (`src/version.rs` and `scripts/version-bump.sh`):
+
+- **Release Rolling Window (24h):**
+  - Releases within 24 hours of the previous release increment the patch version $Z$ (e.g. `6.0.3` $\to$ `6.0.4`).
+  - Releases after 24 hours increment the minor version $Y$ and reset patch $Z$ to 0 (e.g. `6.0.4` $\to$ `6.1.0`).
+  - Digits $Y$ and $Z$ roll over when exceeding 9 ($Z > 9 \implies Z=0, Y+=1$; $Y > 9 \implies Y=0, X+=1$).
+- **Live 500-Notice Benchmark Validation:**
+  Before publishing, the release workflow fetches the live AIUB notice listing (`pageSize=500`) and executes the native benchmark binary (`src/bin/benchmark.rs`):
+  ```bash
+  cargo run --release --bin benchmark -- <html_file> <version> <duration_ms> <output_json>
+  ```
+  The workflow asserts that all 500 notices parse successfully, measures average latency per notice, generates `scrape-benchmark.json`, and attaches the compiled `worker-bundle.zip` to the GitHub Release.
 
 ---
 
 ## 💬 Message Format & Sample Output
 
-When a new notice is detected, the bot dispatches an alert with markdown formatting and direct links:
-
+### Standard Text Notice
 ```text
 Final Exam Routine Fall 2026-2027
 
@@ -304,8 +352,18 @@ The students of the Undergraduate and Graduate programs are hereby informed that
 https://www.aiub.edu/category/notices/final-exam-routine-fall-2026-2027
 ```
 
-If an existing notice is updated on the university site (such as modified exam dates or altered PDF attachments), an `[EDITED]` tag is prepended:
+### Image-Only / Flyer Notice (Attachment-First)
+```text
+MBA Course Waiver Announcements
 
+Date: 18 Nov 2026
+
+https://www.aiub.edu/Files/Uploads/webp/notice-mba-waivers.webp
+
+https://www.aiub.edu/category/notices/mba-course-waiver-announcements
+```
+
+### Edited Notice Alert
 ```text
 [EDITED] Revised Final Exam Routine Fall 2026-2027
 
@@ -316,12 +374,29 @@ Notice update: The exam schedule for CSE 4101 has been rescheduled to Room 3201.
 https://www.aiub.edu/category/notices/final-exam-routine-fall-2026-2027
 ```
 
+### Operational Admin Alert (DOM Drift & Diagnostics)
+```text
+AIUB Notice
+
+⚠️ Most sampled detail pages failed DOM validation. The site parser may need an update.
+
+Diagnostics:
+• Sampled pages: 5
+• DOM parse failed: 4
+• HTTP/Network errors: 1
+• Succeeded: 0
+• CPU skipped: 0
+
+Failed URLs:
+• https://www.aiub.edu/category/notices/sample-notice (DOM: missing non-sticky question-column container)
+```
+
 ---
 
 ## 🩺 Observability & Resilience
 
-- **Distributed Traces:** Employs Cloudflare Workers Tracing with named span instrumentation (`fetch_listing`, `load_existing_from_d1`, `fetch_detail_pages`, `d1_batch_upsert`, `dispatch_telegram_notifications`).
-- **Circuit Breaker:** If sampled detail pages fail parsing validation at a rate $\ge 80\%$, the Worker aborts state modification and alerts the admin chat of suspected upstream DOM layout restructuring.
+- **Distributed Traces:** Employs Cloudflare Workers Tracing with named span instrumentation (`fetch_listing`, `load_existing_from_d1`, `select_detail_targets`, `fetch_detail_pages`, `d1_batch_upsert`, `dispatch_telegram_notifications`).
+- **Circuit Breaker:** If sampled detail pages fail parsing validation at a rate $\ge 80\%$ (minimum 4 samples), the Worker aborts state modification and alerts the admin chat with full diagnostics.
 - **Backpressure Protection:** In each 5-minute cycle, detail page fetching is capped at `MAX_DETAIL_FETCHES_PER_RUN = 5` with concurrency set to 3. Telegram transmissions are paced to 1-second intervals with a maximum of 10 messages per batch to avoid downstream rate limits.
 - **Log Aggregation:** View live tail logs using Wrangler:
   ```bash
@@ -341,7 +416,7 @@ Follow the automated feeds directly on social platforms:
 
 ## 🧪 Testing & Quality Assurance
 
-Run the complete offline test and linting suite locally:
+The codebase includes an extensive test suite (`src/tests.rs`) covering parser regressions, date parsing, HTML entity sanitization, Unicode control character stripping, and D1 metric assertions:
 
 ```bash
 # Check formatting
@@ -350,7 +425,7 @@ cargo fmt --check
 # Run Clippy with zero-warning tolerance
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Execute unit and integration tests
+# Execute unit and integration tests (89 tests)
 cargo test --all-features
 
 # Verify WebAssembly compilation target
@@ -364,19 +439,29 @@ cargo check --target wasm32-unknown-unknown
 ```text
 aiub-notice-checker/
 ├── .github/
+│   ├── dependabot.yml                 # Automated dependency updates for Cargo and Actions
 │   └── workflows/
-│       ├── test.yml                   # CI pipeline: fmt, clippy, unit tests, wasm check
-│       └── deploy.yml                 # Automated Cloudflare Worker deployment
+│       ├── clean-old-workflow-runs.yml # Weekly scheduled cleanup of historical CI runs
+│       ├── codeql.yml                 # CodeQL security scanning analysis
+│       ├── dependency-review.yml      # PR dependency review action
+│       ├── deploy.yml                 # Chained deployment: runs after test.yml succeeds
+│       ├── release.yml                # Automated version bump, 500-notice benchmark, and GitHub Release
+│       └── test.yml                   # CI pipeline: fmt, clippy, 89 unit tests, wasm check
 ├── migrations/
 │   └── 0001_init.sql                  # Cloudflare D1 initial schema and indexes
+├── scripts/
+│   └── version-bump.sh                # Shell script implementing 24h rolling semver bump
 ├── src/
+│   ├── bin/
+│   │   └── benchmark.rs               # Standalone binary for 500-notice scraper benchmarking
 │   ├── config.rs                      # Constants, limits, tuning thresholds, and secrets
-│   ├── db.rs                          # D1 query builders, batch executions, and state setters
-│   ├── lib.rs                         # Worker entrypoint, cron dispatcher, and orchestrator
+│   ├── db.rs                          # D1 query builders, lightweight updates, batch statements
+│   ├── lib.rs                         # Worker entrypoint, cron dispatcher, diagnostics & circuit breaker
 │   ├── models.rs                      # Notice data models, hashing logic, and text formatting
 │   ├── scraper.rs                     # HTML fetching, redirect handling, and tl DOM parsing
 │   ├── telegram.rs                    # Telegram Bot API client, rate-limit handler, and retries
-│   └── tests.rs                       # Comprehensive unit and regression test suite
+│   ├── tests.rs                       # Comprehensive unit and regression test suite (89 tests)
+│   └── version.rs                     # Single-digit rolling semver rollover calculation logic
 ├── Cargo.toml                         # Rust crate manifest, dependencies, and release profiles
 ├── LICENSE                            # MIT License
 ├── README.md                          # Project documentation
