@@ -288,6 +288,17 @@ async fn run(env: &Env) -> worker::Result<()> {
     let mut notifications: Vec<PendingNotification> = Vec::new();
     let mut silent_sync_links: Vec<(String, String)> = Vec::new();
 
+    // Cold-start guard: if D1 is completely empty and we scraped a full page of notices,
+    // this is a fresh database seed — write all rows silently without spamming Telegram.
+    // Mirrors the `first_run` logic from the legacy Python `main.py` (lines 371-387).
+    let is_empty_db_seed = existing_map.is_empty() && unique_listing.len() >= 10;
+    if is_empty_db_seed {
+        console_log!(
+            "Empty-database cold-start detected ({} notices). Seeding silently without Telegram notifications.",
+            unique_listing.len()
+        );
+    }
+
     for mut item in unique_listing {
         let existing = existing_map.get(&item.url);
         let listing_title = item.title.clone();
@@ -417,6 +428,13 @@ async fn run(env: &Env) -> worker::Result<()> {
 
         if silent_hash_sync {
             silent_sync_links.push((item.url.clone(), new_hash));
+            continue;
+        }
+
+        // During a cold-start seed, all brand-new rows are written to D1 above
+        // but no Telegram notifications are queued — prevents flooding the channel
+        // with 50 notices when D1 is reset or a fresh database is bound.
+        if is_empty_db_seed {
             continue;
         }
 
