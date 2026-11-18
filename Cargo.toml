@@ -13,7 +13,7 @@ hex = "0.4"
 html-escape = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 tl = "0.7.8"
 worker = { version = "0.9.0", features = ["d1"] }
 
