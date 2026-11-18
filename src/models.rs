@@ -136,6 +136,10 @@ pub fn format_notice_message(notice: &Notice, edited: bool) -> String {
         notice.body_text.as_str()
     } else if !notice.description.is_empty() {
         notice.description.as_str()
+    } else if let Some(first_attachment) = notice.attachments.first() {
+        // Surface the first attachment (image/PDF) so students can open it directly
+        // from Telegram without visiting the AIUB website.
+        first_attachment.as_str()
     } else {
         "Please click the link for details."
     };

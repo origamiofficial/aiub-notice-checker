@@ -691,6 +691,31 @@ mod model_tests {
     }
 
     #[test]
+    fn format_notice_message_surfaces_attachment_when_no_body() {
+        let notice = Notice {
+            title: "MBA Course Waivers".to_string(),
+            description: "".to_string(),
+            url: "https://www.aiub.edu/notice/mba-waivers".to_string(),
+            published_date: Some("2026-11-18".to_string()),
+            body_text: "".to_string(),
+            attachments: vec![
+                "https://www.aiub.edu/Files/Uploads/webp/notice-mba-waivers.webp".to_string(),
+            ],
+            detail_fetched: true,
+        };
+        let msg = format_notice_message(&notice, false);
+        assert!(
+            msg.contains("notice-mba-waivers.webp"),
+            "should surface attachment URL when body and description are empty, got: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("Please click the link for details."),
+            "should NOT show generic placeholder when attachment is available"
+        );
+    }
+
+    #[test]
     fn format_notice_message_respects_max_length() {
         let notice = Notice {
             title: "Length Test".to_string(),
