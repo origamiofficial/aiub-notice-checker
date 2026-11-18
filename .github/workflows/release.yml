@@ -215,7 +215,7 @@ jobs:
 
       - name: Upload benchmark artifact
         if: steps.check_changes.outputs.has_worker_changes == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: scrape-benchmark
           path: scrape-benchmark.json
@@ -240,7 +240,7 @@ jobs:
 
       - name: Upload compiled worker artifact
         if: steps.check_changes.outputs.has_worker_changes == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: compiled-worker
           path: |
