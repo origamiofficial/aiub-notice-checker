@@ -23,7 +23,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Note: CodeQL does not natively support Rust as a first-class language.
       # This workflow uses the "actions" language to scan workflow files for
