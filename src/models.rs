@@ -123,6 +123,17 @@ pub fn display_date(iso_date: Option<&str>) -> String {
     }
 }
 
+pub fn is_meaningful_text(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let stripped = trimmed.trim_end_matches('.');
+    !stripped.eq_ignore_ascii_case("no description available")
+        && !stripped.eq_ignore_ascii_case("no description")
+        && !stripped.eq_ignore_ascii_case("please click the link for details")
+}
+
 pub fn format_notice_message(notice: &Notice, edited: bool) -> String {
     let prefix = if edited { "[EDITED] " } else { "" };
     let header = format!(
@@ -132,11 +143,11 @@ pub fn format_notice_message(notice: &Notice, edited: bool) -> String {
     );
     let suffix = format!("\n\n{}", notice.url);
 
-    let raw_body = if !notice.body_text.is_empty() {
+    let raw_body = if is_meaningful_text(&notice.body_text) {
         notice.body_text.as_str()
-    } else if !notice.description.is_empty() {
+    } else if is_meaningful_text(&notice.description) {
         notice.description.as_str()
-    } else if let Some(first_attachment) = notice.attachments.first() {
+    } else if let Some(first_attachment) = notice.attachments.iter().find(|s| !s.trim().is_empty()) {
         // Surface the first attachment (image/PDF) so students can open it directly
         // from Telegram without visiting the AIUB website.
         first_attachment.as_str()

@@ -758,6 +758,67 @@ mod model_tests {
     }
 
     #[test]
+    fn format_notice_message_treats_placeholder_desc_as_empty_and_surfaces_attachment() {
+        let notice = Notice {
+            title: "Poster Competition".to_string(),
+            description: "No description available".to_string(),
+            url: "https://www.aiub.edu/notice/poster".to_string(),
+            published_date: Some("2026-08-13".to_string()),
+            body_text: "".to_string(),
+            attachments: vec![
+                "https://www.aiub.edu/Files/Uploads/webp/poster-competition.webp".to_string(),
+            ],
+            detail_fetched: true,
+        };
+        let msg = format_notice_message(&notice, false);
+        assert!(
+            msg.contains("poster-competition.webp"),
+            "should surface attachment URL when description is 'No description available', got: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("No description available"),
+            "should NOT show literal 'No description available' fallback in Telegram"
+        );
+    }
+
+    #[test]
+    fn format_notice_message_treats_placeholder_desc_with_period_as_empty() {
+        let notice = Notice {
+            title: "Poster Competition Without Attachment".to_string(),
+            description: "No description available.".to_string(),
+            url: "https://www.aiub.edu/notice/poster".to_string(),
+            published_date: Some("2026-08-13".to_string()),
+            body_text: "".to_string(),
+            attachments: vec![],
+            detail_fetched: true,
+        };
+        let msg = format_notice_message(&notice, false);
+        assert!(
+            msg.contains("Please click the link for details."),
+            "should fall back to generic click link text when no attachment and placeholder desc"
+        );
+        assert!(
+            !msg.contains("No description available"),
+            "should NOT show literal 'No description available' fallback"
+        );
+    }
+
+    #[test]
+    fn is_meaningful_text_detects_placeholders() {
+        use crate::models::is_meaningful_text;
+        assert!(!is_meaningful_text(""));
+        assert!(!is_meaningful_text("   "));
+        assert!(!is_meaningful_text("No description available"));
+        assert!(!is_meaningful_text("No description available."));
+        assert!(!is_meaningful_text("no description available"));
+        assert!(!is_meaningful_text("No description"));
+        assert!(!is_meaningful_text("Please click the link for details."));
+        assert!(is_meaningful_text("Classes are suspended today due to weather."));
+        assert!(is_meaningful_text("Registration deadline extended."));
+    }
+
+    #[test]
     fn format_notice_message_respects_max_length() {
         let notice = Notice {
             title: "Length Test".to_string(),
