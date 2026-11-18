@@ -6,6 +6,12 @@ on:
     types: [completed]
     branches: [main]
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Force release even if no worker code changes detected"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -37,13 +43,53 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      # ── Smart check: only proceed if Worker files changed since last release ──
+      - name: Detect Cloudflare Worker changes
+        id: check_changes
+        run: |
+          git fetch --tags origin
+          LATEST_TAG=$(git tag -l 'v[0-9]*' '[0-9]*' --sort=-v:refname | head -n 1 || true)
+          echo "Latest release tag: ${LATEST_TAG:-<none>}"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.force }}" == "true" ]]; then
+            echo "Forced release triggered via workflow_dispatch."
+            echo "has_worker_changes=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ -n "$LATEST_TAG" ]]; then
+            if git diff --quiet "$LATEST_TAG" HEAD -- src/ migrations/ Cargo.toml Cargo.lock wrangler.toml; then
+              echo "No Cloudflare Worker files (src/, migrations/, Cargo.toml, Cargo.lock, wrangler.toml) changed since $LATEST_TAG."
+              echo "Skipping release to prevent releasing non-worker changes."
+              echo "has_worker_changes=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "Cloudflare Worker changes detected since previous release."
+          echo "has_worker_changes=true" >> "$GITHUB_OUTPUT"
+
+      # ── Setup toolchains ─────────────────────────────────────────
       - name: Setup Rust stable toolchain
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
 
+      - name: Setup Rust nightly for worker-build --panic-unwind
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: wasm32-unknown-unknown
+
+      - name: Set stable as default toolchain
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
+        run: rustup default stable
+
       - name: Cache Cargo dependencies
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -58,6 +104,7 @@ jobs:
 
       # ── Re-validate tests (belt-and-suspenders) ──────────────────
       - name: Run tests before release
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
         run: |
           cargo fmt --check
           cargo clippy --all-targets --all-features -- -D warnings
@@ -65,12 +112,14 @@ jobs:
 
       # ── Version bump ─────────────────────────────────────────────
       - name: Compute next version
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
         id: version
         run: |
           chmod +x scripts/version-bump.sh
           scripts/version-bump.sh --apply
 
       - name: Verify no stale version strings
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
         run: |
           NEW_VERSION="${{ steps.version.outputs.version }}"
           echo "Expected version: $NEW_VERSION"
@@ -98,11 +147,13 @@ jobs:
 
       # ── Scraper performance benchmark ────────────────────────────
       - name: Setup Node.js for Wrangler
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "22"
 
       - name: Install Wrangler & worker-build
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
         run: |
           npm install --no-save wrangler@latest
           if ! command -v worker-build >/dev/null 2>&1; then
@@ -110,6 +161,7 @@ jobs:
           fi
 
       - name: Scraper performance benchmark
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
         id: benchmark
         run: |
           NEW_VERSION="${{ steps.version.outputs.version }}"
@@ -162,14 +214,43 @@ jobs:
           fi
 
       - name: Upload benchmark artifact
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: scrape-benchmark
           path: scrape-benchmark.json
           retention-days: 90
 
+      # ── Compile Cloudflare Worker script & bundle ────────────────
+      - name: Compile Cloudflare Worker script & bundle
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
+        run: |
+          worker-build --release --panic-unwind
+
+          if [[ ! -d "build" || ! -f "build/index.js" ]]; then
+            echo "ERROR: worker-build failed to generate build/index.js" >&2
+            exit 1
+          fi
+
+          echo "Compiled Worker files in build/:"
+          ls -la build/
+
+          # Package compiled worker bundle into a zip archive
+          zip -r worker-bundle.zip build/ wrangler.toml
+
+      - name: Upload compiled worker artifact
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiled-worker
+          path: |
+            build/
+            worker-bundle.zip
+          retention-days: 90
+
       # ── Commit version bump & create tag ─────────────────────────
       - name: Commit version bump
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
         run: |
           NEW_VERSION="${{ steps.version.outputs.version }}"
           git config user.name 'github-actions[bot]'
@@ -183,13 +264,15 @@ jobs:
           fi
 
       - name: Create Git tag
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
         run: |
           NEW_VERSION="${{ steps.version.outputs.version }}"
           git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}"
           git push origin "v${NEW_VERSION}"
 
-      # ── Create GitHub Release ────────────────────────────────────
+      # ── Create GitHub Release with compiled worker & benchmark ───
       - name: Generate release notes
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
         id: notes
         run: |
           NEW_VERSION="${{ steps.version.outputs.version }}"
@@ -222,6 +305,11 @@ jobs:
           **Version bump type:** ${BUMP_TYPE}
           **Previous version:** ${PREV_VERSION}
 
+          ### Release Assets
+          - \`worker-index.js\`: Compiled Cloudflare Worker JavaScript script
+          - \`worker-bundle.zip\`: Complete compiled Worker bundle (JavaScript + WebAssembly + config)
+          - \`scrape-benchmark.json\`: Scraper benchmark containing all 500 notices
+
           ### Scraper Benchmark
           - **Notices scraped:** ${NOTICE_COUNT}
           - **Total duration:** ${DURATION_MS}ms
@@ -235,11 +323,33 @@ jobs:
           EOF
 
       - name: Create GitHub Release
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           NEW_VERSION="${{ steps.version.outputs.version }}"
-          gh release create "v${NEW_VERSION}" scrape-benchmark.json \
+
+          # Collect assets:
+          # 1. Benchmark json (with all 500 parsed notices)
+          # 2. Worker bundle zip
+          # 3. Compiled worker JavaScript entrypoint
+          # 4. Compiled WebAssembly module (if present)
+          RELEASE_ASSETS=("scrape-benchmark.json" "worker-bundle.zip")
+
+          if [[ -f "build/index.js" ]]; then
+            cp "build/index.js" "worker-index.js"
+            RELEASE_ASSETS+=("worker-index.js")
+          fi
+
+          for wasm_file in build/*.wasm; do
+            if [[ -f "$wasm_file" ]]; then
+              RELEASE_ASSETS+=("$wasm_file")
+            fi
+          done
+
+          echo "Publishing release v${NEW_VERSION} with assets: ${RELEASE_ASSETS[*]}"
+
+          gh release create "v${NEW_VERSION}" "${RELEASE_ASSETS[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --latest \

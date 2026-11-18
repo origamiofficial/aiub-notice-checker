@@ -3,11 +3,20 @@ name: Tests
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - "**.md"
-      - "LICENSE"
+    paths:
+      - "src/**"
+      - "migrations/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "wrangler.toml"
   pull_request:
     branches: [main]
+    paths:
+      - "src/**"
+      - "migrations/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "wrangler.toml"
   workflow_dispatch:
 
 permissions:
