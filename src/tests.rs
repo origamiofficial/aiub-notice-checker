@@ -7,7 +7,8 @@
 #[cfg(test)]
 mod scraper_tests {
     use crate::scraper::{
-        normalize_aiub_url, normalize_notice_url, parse_detail_html, parse_listing_html, USER_AGENT,
+        normalize_aiub_url, normalize_notice_url, parse_detail_html, parse_detail_with_reason,
+        parse_listing_html, USER_AGENT,
     };
 
     #[test]
@@ -359,6 +360,47 @@ mod scraper_tests {
             detail.legacy_sticky_body.contains("Sticky header text"),
             "legacy_sticky_body should contain sticky header text"
         );
+    }
+
+    #[test]
+    fn parse_detail_with_reason_reports_empty_html() {
+        let err = parse_detail_with_reason("", "https://www.aiub.edu/test")
+            .expect_err("should return Err on empty html");
+        assert_eq!(err, "HTML content is empty");
+    }
+
+    #[test]
+    fn parse_detail_with_reason_reports_missing_question_column() {
+        let html = "<html><body><div class='notice-page'><p>No question column</p></div></body></html>";
+        let err = parse_detail_with_reason(html, "https://www.aiub.edu/test")
+            .expect_err("should return Err when question-column is missing");
+        assert_eq!(err, "missing non-sticky question-column container");
+    }
+
+    #[test]
+    fn parse_detail_with_reason_reports_empty_content_in_question_column() {
+        let html = "<html><body><div class='notice-page'><div class='question-column'>   </div></div></body></html>";
+        let err = parse_detail_with_reason(html, "https://www.aiub.edu/test")
+            .expect_err("should return Err when question-column has no text or attachments");
+        assert_eq!(err, "question-column contained no text or attachments");
+    }
+
+    #[test]
+    fn parse_detail_with_reason_succeeds_on_valid_detail() {
+        let html = r#"
+        <html><body>
+        <h1 id="dynamicHeading">Notice Heading</h1>
+        <div class="notice-page">
+            <div class="question-column">
+                <p>Valid text</p>
+            </div>
+        </div>
+        </body></html>
+        "#;
+        let detail = parse_detail_with_reason(html, "https://www.aiub.edu/test")
+            .expect("should succeed on valid detail");
+        assert_eq!(detail.title, Some("Notice Heading".to_string()));
+        assert_eq!(detail.body_text, "Valid text");
     }
 
     // ── URL normalization ────────────────────────────────────────────
@@ -815,7 +857,9 @@ mod notice_row_tests {
 
 #[cfg(test)]
 mod lib_tests {
-    use crate::{clean_mojibake, has_utf8_mojibake, titles_equivalent_clean};
+    use crate::{
+        clean_mojibake, format_detail_failure_alert, has_utf8_mojibake, titles_equivalent_clean,
+    };
 
     #[test]
     fn has_utf8_mojibake_detects_latin1_sequences() {
@@ -856,6 +900,37 @@ mod lib_tests {
     #[test]
     fn titles_equivalent_clean_different() {
         assert!(!titles_equivalent_clean("Title A", "Title B"));
+    }
+
+    #[test]
+    fn format_detail_failure_alert_prefers_dom_when_parser_errors_dominate() {
+        let diags = vec![
+            "https://www.aiub.edu/notice1 (DOM: missing non-sticky question-column container, len=85000)".to_string(),
+        ];
+        let msg = format_detail_failure_alert(5, 1, 4, 0, 0, &diags);
+        assert!(msg.contains("failed DOM validation"));
+        assert!(msg.contains("DOM parse failed: 4"));
+        assert!(msg.contains("HTTP/Network errors: 1"));
+        assert!(msg.contains("notice1"));
+    }
+
+    #[test]
+    fn format_detail_failure_alert_prefers_network_when_http_errors_dominate() {
+        let diags = vec![
+            "https://www.aiub.edu/notice1 (HTTP: HTTP 503 when fetching https://www.aiub.edu/notice1)".to_string(),
+        ];
+        let msg = format_detail_failure_alert(5, 5, 0, 0, 0, &diags);
+        assert!(msg.contains("upstream AIUB server or network errors"));
+        assert!(msg.contains("DOM parse failed: 0"));
+        assert!(msg.contains("HTTP/Network errors: 5"));
+        assert!(msg.contains("notice1"));
+    }
+
+    #[test]
+    fn format_detail_failure_alert_cpu_limits() {
+        let diags = vec![];
+        let msg = format_detail_failure_alert(5, 0, 0, 0, 5, &diags);
+        assert!(msg.contains("approached CPU limits"));
     }
 }
 

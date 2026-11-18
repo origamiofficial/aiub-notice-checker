@@ -23,9 +23,70 @@ use config::{
     MIN_LISTING_DESC_COVERAGE,
 };
 use models::{titles_equivalent, D1Metrics, Notice, NoticeRow};
-use scraper::ParsedDetail;
+use scraper::{DetailFetchOutcome, ParsedDetail};
 
 const DETAIL_CONCURRENCY: usize = 3;
+
+/// Formats an actionable admin alert distinguishing DOM parser failures from upstream AIUB/network errors.
+pub fn format_detail_failure_alert(
+    attempted_count: usize,
+    http_error_count: usize,
+    parse_error_count: usize,
+    succeeded_count: usize,
+    cpu_skipped_count: usize,
+    failure_diagnostics: &[String],
+) -> String {
+    if parse_error_count >= 1 && parse_error_count >= http_error_count {
+        let mut msg = format!(
+            "AIUB Notice\n\n⚠️ Most sampled detail pages failed DOM validation. The site parser may need an update.\n\n\
+             Diagnostics:\n\
+             • Sampled pages: {}\n\
+             • DOM parse failed: {}\n\
+             • HTTP/Network errors: {}\n\
+             • Succeeded: {}\n\
+             • CPU skipped: {}",
+            attempted_count,
+            parse_error_count,
+            http_error_count,
+            succeeded_count,
+            cpu_skipped_count
+        );
+        if !failure_diagnostics.is_empty() {
+            msg.push_str("\n\nFailed URLs:\n");
+            for diag in failure_diagnostics.iter().take(3) {
+                msg.push_str(&format!("• {diag}\n"));
+            }
+        }
+        msg
+    } else if http_error_count > 0 {
+        let mut msg = format!(
+            "AIUB Notice\n\n⚠️ Detail page fetch failed due to upstream AIUB server or network errors (AIUB may be down or timing out).\n\n\
+             Diagnostics:\n\
+             • Sampled pages: {}\n\
+             • HTTP/Network errors: {}\n\
+             • DOM parse failed: {}\n\
+             • Succeeded: {}\n\
+             • CPU skipped: {}",
+            attempted_count,
+            http_error_count,
+            parse_error_count,
+            succeeded_count,
+            cpu_skipped_count
+        );
+        if !failure_diagnostics.is_empty() {
+            msg.push_str("\n\nFailed URLs:\n");
+            for diag in failure_diagnostics.iter().take(3) {
+                msg.push_str(&format!("• {diag}\n"));
+            }
+        }
+        msg
+    } else {
+        format!(
+            "AIUB Notice\n\n⚠️ Detail page fetches deferred: Cloudflare Worker approached CPU limits ({} skipped).",
+            cpu_skipped_count
+        )
+    }
+}
 
 #[event(scheduled)]
 pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
@@ -55,19 +116,23 @@ async fn run(env: &Env) -> worker::Result<()> {
         let html = match scraper::fetch_html(&listing_url).await {
             Ok(h) => h,
             Err(err) => {
+                console_error!("[Listing Fetch Failed] url={}, error={}", listing_url, err);
                 span.set_status(SpanStatus::Error(Some(err.to_string())));
                 return Err(err);
             }
         };
         let parsed = scraper::parse_listing_html(&html);
         span.set_attribute("notices_found", parsed.len() as i64);
+        span.set_attribute("html_bytes", html.len() as i64);
         span.set_status(SpanStatus::Ok);
         Ok::<Vec<Notice>, worker::Error>(parsed)
     })
     .await?;
 
     if listing_notices.is_empty() {
-        console_warn!("No notices parsed on listing page 1; alerting admin if configured.");
+        console_warn!(
+            "[Listing Parse Failed] 0 notices parsed from listing page 1. DOM layout may have changed."
+        );
         let _ = telegram::send_admin_alert(
             &secrets,
             "⚠️ AIUB Notice Checker: 0 notices found on listing page 1. DOM layout may have changed.",
@@ -122,6 +187,7 @@ async fn run(env: &Env) -> worker::Result<()> {
                     Ok::<(HashMap<String, NoticeRow>, D1Metrics), worker::Error>((map, m))
                 }
                 Err(err) => {
+                    console_error!("[D1 Query Failed] Failed to query existing notices: {}", err);
                     span.set_status(SpanStatus::Error(Some(err.to_string())));
                     Err(err)
                 }
@@ -219,27 +285,39 @@ async fn run(env: &Env) -> worker::Result<()> {
     let detail_results = enter_span_async("fetch_detail_pages", |span| async move {
         span.set_attribute("requested", targets_ref.len() as i64);
 
-        let fetched: Vec<(String, Option<ParsedDetail>)> =
+        let fetched: Vec<(String, DetailFetchOutcome)> =
             stream::iter(targets_ref.iter().cloned())
                 .map(|link| async move {
                     if is_near_cpu_limit() {
                         console_warn!(
-                            "Near CPU limit before fetching detail page {}; skipping.",
+                            "[Detail Fetch Skipped] Near CPU limit before fetching detail page {}; deferring.",
                             link
                         );
-                        return (link, None);
+                        return (link, DetailFetchOutcome::CpuSkipped);
                     }
                     match scraper::fetch_html(&link).await {
                         Ok(html) => {
-                            let parsed = scraper::parse_detail_html(&html, &link);
-                            if parsed.is_none() {
-                                console_warn!("Detail parse returned empty for {}", link);
+                            let html_len = html.len();
+                            match scraper::parse_detail_with_reason(&html, &link) {
+                                Ok(parsed) => (link, DetailFetchOutcome::Success(parsed)),
+                                Err(reason) => {
+                                    console_warn!(
+                                        "[Detail Parse Failed] link={}, reason={}, html_len={}",
+                                        link,
+                                        reason,
+                                        html_len
+                                    );
+                                    (link, DetailFetchOutcome::ParseError { reason, html_len })
+                                }
                             }
-                            (link, parsed)
                         }
                         Err(err) => {
-                            console_warn!("Detail HTTP fetch failed for {}: {}", link, err);
-                            (link, None)
+                            console_warn!(
+                                "[Detail HTTP Failed] link={}, error={}",
+                                link,
+                                err
+                            );
+                            (link, DetailFetchOutcome::HttpError(err.to_string()))
                         }
                     }
                 })
@@ -247,34 +325,111 @@ async fn run(env: &Env) -> worker::Result<()> {
                 .collect()
                 .await;
 
-        let ok_count = fetched.iter().filter(|(_, res)| res.is_some()).count();
-        span.set_attribute("succeeded", ok_count as i64);
-        span.set_status(SpanStatus::Ok);
+        let mut succeeded = 0usize;
+        let mut http_errs = 0usize;
+        let mut parse_errs = 0usize;
+        let mut cpu_skips = 0usize;
+
+        for (_, outcome) in &fetched {
+            match outcome {
+                DetailFetchOutcome::Success(_) => succeeded += 1,
+                DetailFetchOutcome::HttpError(_) => http_errs += 1,
+                DetailFetchOutcome::ParseError { .. } => parse_errs += 1,
+                DetailFetchOutcome::CpuSkipped => cpu_skips += 1,
+            }
+        }
+
+        span.set_attribute("succeeded", succeeded as i64);
+        span.set_attribute("http_errors", http_errs as i64);
+        span.set_attribute("parse_errors", parse_errs as i64);
+        span.set_attribute("cpu_skipped", cpu_skips as i64);
+
+        if parse_errs > 0 || http_errs > 0 {
+            span.set_status(SpanStatus::Error(Some(format!(
+                "{}/{} succeeded (http_errors={}, parse_errors={}, cpu_skipped={})",
+                succeeded,
+                targets_ref.len(),
+                http_errs,
+                parse_errs,
+                cpu_skips
+            ))));
+        } else {
+            span.set_status(SpanStatus::Ok);
+        }
+
+        console_log!(
+            "[Detail Fetch Summary] requested={}, succeeded={}, http_errors={}, parse_errors={}, cpu_skipped={}",
+            targets_ref.len(),
+            succeeded,
+            http_errs,
+            parse_errs,
+            cpu_skips
+        );
+
         fetched
     })
     .await;
 
     let attempted_count = detail_results.len();
-    let failed_count = detail_results.iter().filter(|(_, r)| r.is_none()).count();
+    let mut detail_succeeded_count = 0usize;
+    let mut detail_http_error_count = 0usize;
+    let mut detail_parse_error_count = 0usize;
+    let mut detail_cpu_skipped_count = 0usize;
+    let mut failure_diagnostics: Vec<String> = Vec::new();
+
+    for (link, outcome) in &detail_results {
+        match outcome {
+            DetailFetchOutcome::Success(_) => {
+                detail_succeeded_count += 1;
+            }
+            DetailFetchOutcome::HttpError(err) => {
+                detail_http_error_count += 1;
+                failure_diagnostics.push(format!("{link} (HTTP: {err})"));
+            }
+            DetailFetchOutcome::ParseError { reason, html_len } => {
+                detail_parse_error_count += 1;
+                failure_diagnostics.push(format!("{link} (DOM: {reason}, len={html_len})"));
+            }
+            DetailFetchOutcome::CpuSkipped => {
+                detail_cpu_skipped_count += 1;
+                failure_diagnostics.push(format!("{link} (CPU: limit approached, deferred)"));
+            }
+        }
+    }
+
+    let total_failed = detail_http_error_count + detail_parse_error_count + detail_cpu_skipped_count;
     if attempted_count >= DETAIL_FAILURE_MIN_SAMPLE
-        && (failed_count as f64 / attempted_count as f64) >= DETAIL_FAILURE_RATIO
+        && (total_failed as f64 / attempted_count as f64) >= DETAIL_FAILURE_RATIO
     {
         console_warn!(
-            "High detail page failure rate: {}/{} failed",
-            failed_count,
-            attempted_count
+            "High detail page failure rate: {}/{} failed (http_errors={}, parse_errors={}, cpu_skipped={})",
+            total_failed,
+            attempted_count,
+            detail_http_error_count,
+            detail_parse_error_count,
+            detail_cpu_skipped_count
         );
-        let _ = telegram::send_admin_alert(
-            &secrets,
-            "AIUB Notice\n\nMost sampled detail pages failed validation. The site parser may need an update.",
-        )
-        .await;
+
+        let alert_message = format_detail_failure_alert(
+            attempted_count,
+            detail_http_error_count,
+            detail_parse_error_count,
+            detail_succeeded_count,
+            detail_cpu_skipped_count,
+            &failure_diagnostics,
+        );
+
+        let _ = telegram::send_admin_alert(&secrets, &alert_message).await;
     }
 
     let mut detail_map: HashMap<String, Option<ParsedDetail>> =
         HashMap::with_capacity(detail_results.len());
     for (link, outcome) in detail_results {
-        detail_map.insert(link, outcome);
+        let opt = match outcome {
+            DetailFetchOutcome::Success(detail) => Some(detail),
+            _ => None,
+        };
+        detail_map.insert(link, opt);
     }
 
     // 5. Reconcile state, compute hashes, build D1 batch upserts, and queue notifications.
@@ -477,11 +632,23 @@ async fn run(env: &Env) -> worker::Result<()> {
         let stmt_count = statements.len();
         let batch_metrics = enter_span_async("d1_batch_upsert", |span| async move {
             span.set_attribute("statements", stmt_count as i64);
-            let m = db::execute_batch(session_ref, statements).await?;
-            span.set_attribute("rows_read", m.rows_read as i64);
-            span.set_attribute("rows_written", m.rows_written as i64);
-            span.set_status(SpanStatus::Ok);
-            Ok::<D1Metrics, worker::Error>(m)
+            match db::execute_batch(session_ref, statements).await {
+                Ok(m) => {
+                    span.set_attribute("rows_read", m.rows_read as i64);
+                    span.set_attribute("rows_written", m.rows_written as i64);
+                    span.set_status(SpanStatus::Ok);
+                    Ok::<D1Metrics, worker::Error>(m)
+                }
+                Err(err) => {
+                    console_error!(
+                        "[D1 Batch Upsert Failed] Batch upsert of {} statements failed: {}",
+                        stmt_count,
+                        err
+                    );
+                    span.set_status(SpanStatus::Error(Some(err.to_string())));
+                    Err(err)
+                }
+            }
         })
         .await?;
 
@@ -506,11 +673,16 @@ async fn run(env: &Env) -> worker::Result<()> {
             enter_span_async("dispatch_telegram_notifications", |span| async move {
                 span.set_attribute("queued", notifications.len() as i64);
                 let mut sent_count = 0usize;
+                let mut deferred_count = 0usize;
+                let mut failed_count = 0usize;
                 let mut metrics = D1Metrics::default();
 
                 for item in notifications.into_iter().take(MAX_TELEGRAM_SENDS_PER_RUN) {
                     if is_near_cpu_limit() {
-                        console_warn!("Near CPU limit during Telegram dispatch; deferring remaining.");
+                        console_warn!(
+                            "[Telegram Deferred] Near CPU limit during Telegram dispatch; deferring remaining."
+                        );
+                        deferred_count += 1;
                         break;
                     }
 
@@ -538,23 +710,31 @@ async fn run(env: &Env) -> worker::Result<()> {
                         }
                         Ok(false) => {
                             console_warn!(
-                                "Telegram deferred notice {} due to rate limit; will retry next run.",
+                                "[Telegram Deferred] Rate limit hit for notice {}; deferring to next run.",
                                 item.notice.url
                             );
+                            deferred_count += 1;
                             break;
                         }
                         Err(err) => {
                             console_error!(
-                                "Telegram send failed for {}: {}",
+                                "[Telegram Send Failed] Telegram send failed for {}: {}",
                                 item.notice.url,
                                 err
                             );
+                            failed_count += 1;
                         }
                     }
                 }
 
                 span.set_attribute("sent", sent_count as i64);
-                span.set_status(SpanStatus::Ok);
+                span.set_attribute("deferred", deferred_count as i64);
+                span.set_attribute("failed", failed_count as i64);
+                if failed_count > 0 {
+                    span.set_status(SpanStatus::Error(Some(format!("{failed_count} sends failed"))));
+                } else {
+                    span.set_status(SpanStatus::Ok);
+                }
                 Ok::<D1Metrics, worker::Error>(metrics)
             })
             .await?;
@@ -564,10 +744,13 @@ async fn run(env: &Env) -> worker::Result<()> {
     }
 
     console_log!(
-        "[Run Summary] rows_read={}, rows_written={}, silent_backfills={}",
+        "[Run Summary] rows_read={}, rows_written={}, silent_backfills={}, detail_succeeded={}, detail_http_errors={}, detail_parse_errors={}",
         total_d1.rows_read,
         total_d1.rows_written,
-        silent_backfills
+        silent_backfills,
+        detail_succeeded_count,
+        detail_http_error_count,
+        detail_parse_error_count
     );
 
     Ok(())

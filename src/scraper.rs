@@ -21,7 +21,7 @@ pub(crate) const USER_AGENT: &str = concat!(
     " (+https://github.com/origamiofficial/aiub-notice-checker)"
 );
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedDetail {
     pub title: Option<String>,
     pub published_date: Option<String>,
@@ -30,6 +30,22 @@ pub struct ParsedDetail {
     /// Text extracted from the first `div.question-column.notice-sticky-header` so existing
     /// D1 rows populated by version `e1a14563` can be upgraded silently without false `[EDITED]` alerts.
     pub legacy_sticky_body: String,
+}
+
+/// Represents the granular outcome of attempting to fetch and parse an AIUB notice detail page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetailFetchOutcome {
+    /// HTTP 200 OK and DOM parser successfully extracted notice content.
+    Success(ParsedDetail),
+    /// HTTP error, timeout, network failure, or non-2xx status code.
+    HttpError(String),
+    /// HTTP 200 OK received, but DOM parsing returned empty or missing selectors.
+    ParseError {
+        reason: &'static str,
+        html_len: usize,
+    },
+    /// Deferred before fetch because the Cloudflare Worker approached its CPU budget.
+    CpuSkipped,
 }
 
 pub fn listing_page_url(page_no: usize) -> String {
@@ -210,7 +226,18 @@ fn find_listing_li_handles(dom: &VDom, parser: &Parser) -> Vec<tl::NodeHandle> {
 /// - Body text and attachments (`a[href]`, `img[src]`, `img[data-src]`) from all
 ///   `div.question-column` inside `div.notice-page` that do NOT have class `notice-sticky-header`.
 pub fn parse_detail_html(html: &str, page_url: &str) -> Option<ParsedDetail> {
-    let dom = tl::parse(html, ParserOptions::default()).ok()?;
+    parse_detail_with_reason(html, page_url).ok()
+}
+
+/// Parses an AIUB notice detail page, returning a specific error reason if parsing/validation fails.
+pub fn parse_detail_with_reason(html: &str, page_url: &str) -> Result<ParsedDetail, &'static str> {
+    if html.trim().is_empty() {
+        return Err("HTML content is empty");
+    }
+
+    let Ok(dom) = tl::parse(html, ParserOptions::default()) else {
+        return Err("HTML tokenization failed");
+    };
     let parser = dom.parser();
 
     // 1. Extract full untruncated title from `h1#dynamicHeading` (`DETAIL_TITLE_XPATH` in `main.py`).
@@ -283,7 +310,7 @@ pub fn parse_detail_html(html: &str, page_url: &str) -> Option<ParsedDetail> {
     }
 
     if body_handles.is_empty() {
-        return None;
+        return Err("missing non-sticky question-column container");
     }
 
     let mut body_parts: Vec<String> = Vec::new();
@@ -314,7 +341,7 @@ pub fn parse_detail_html(html: &str, page_url: &str) -> Option<ParsedDetail> {
 
     let body_text = body_parts.join("\n\n");
     if body_text.is_empty() && attachments.is_empty() {
-        return None;
+        return Err("question-column contained no text or attachments");
     }
 
     let mut detail_date = None;
@@ -328,7 +355,7 @@ pub fn parse_detail_html(html: &str, page_url: &str) -> Option<ParsedDetail> {
         }
     }
 
-    Some(ParsedDetail {
+    Ok(ParsedDetail {
         title: detail_title,
         published_date: detail_date,
         body_text,
