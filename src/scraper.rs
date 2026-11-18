@@ -775,8 +775,35 @@ fn is_valid_aiub_notice_url(url: &str) -> bool {
     !path.is_empty() && parsed.path() != NOTICE_PATH
 }
 
-fn clean_whitespace(input: &str) -> String {
-    input.split_whitespace().collect::<Vec<_>>().join(" ")
+#[inline]
+pub(crate) fn is_invisible_control_char(c: char) -> bool {
+    matches!(c, '\u{00AD}' | '\u{200B}'..='\u{200F}' | '\u{FEFF}')
+}
+
+pub(crate) fn clean_whitespace(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_whitespace = true; // trims leading whitespace
+
+    for c in input.chars() {
+        if is_invisible_control_char(c) {
+            continue;
+        }
+        if c.is_whitespace() {
+            if !in_whitespace {
+                out.push(' ');
+                in_whitespace = true;
+            }
+        } else {
+            out.push(c);
+            in_whitespace = false;
+        }
+    }
+
+    if in_whitespace && !out.is_empty() {
+        out.pop(); // remove trailing space if one was pushed
+    }
+
+    out
 }
 
 fn is_ignored_tag_open(tag_slice: &[u8]) -> bool {

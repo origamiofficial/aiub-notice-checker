@@ -184,6 +184,44 @@ mod scraper_tests {
         assert_eq!(notices[0].description, "Desc with extra spaces");
     }
 
+    #[test]
+    fn clean_whitespace_strips_word_and_cms_invisible_chars() {
+        use crate::scraper::clean_whitespace;
+        // Soft hyphen (U+00AD)
+        assert_eq!(
+            clean_whitespace("Bangladesh\u{00AD} SET B EXAM"),
+            "Bangladesh SET B EXAM"
+        );
+        assert_eq!(
+            clean_whitespace("Bangladesh\u{00AD}SET"),
+            "BangladeshSET"
+        );
+        // Left-to-right mark (U+200E) and Right-to-left mark (U+200F)
+        assert_eq!(
+            clean_whitespace("\u{200E}Admission & Registration Procedure"),
+            "Admission & Registration Procedure"
+        );
+        assert_eq!(
+            clean_whitespace("Procedure\u{200F} Schedule"),
+            "Procedure Schedule"
+        );
+        // Zero-width space, non-joiner, joiner (U+200B..=U+200D)
+        assert_eq!(
+            clean_whitespace("Word\u{200B}with\u{200C}zero\u{200D}width"),
+            "Wordwithzerowidth"
+        );
+        // Byte order mark (U+FEFF)
+        assert_eq!(
+            clean_whitespace("\u{FEFF}Leading BOM and \u{FEFF}middle BOM"),
+            "Leading BOM and middle BOM"
+        );
+        // Only invisible chars
+        assert_eq!(
+            clean_whitespace("\u{00AD}\u{200B}\u{200C}\u{200D}\u{200E}\u{200F}\u{FEFF}"),
+            ""
+        );
+    }
+
     // ── Date parsing ─────────────────────────────────────────────────
 
     #[test]
@@ -401,6 +439,32 @@ mod scraper_tests {
             .expect("should succeed on valid detail");
         assert_eq!(detail.title, Some("Notice Heading".to_string()));
         assert_eq!(detail.body_text, "Valid text");
+    }
+
+    #[test]
+    fn parse_detail_strips_invisible_unicode_entities() {
+        let html = r#"
+        <html><body>
+        <h1 id="dynamicHeading">&lrm;Admission &amp; Registration Procedure</h1>
+        <div class="notice-page">
+            <div class="question-column">
+                <p>American International University &ndash; Bangladesh&shy; SET B EXAM</p>
+            </div>
+        </div>
+        </body></html>
+        "#;
+        let detail = parse_detail_with_reason(html, "https://www.aiub.edu/test")
+            .expect("should succeed on valid detail");
+        assert_eq!(
+            detail.title,
+            Some("Admission & Registration Procedure".to_string())
+        );
+        assert!(!detail.title.as_ref().unwrap().contains('\u{200E}'));
+        assert_eq!(
+            detail.body_text,
+            "American International University – Bangladesh SET B EXAM"
+        );
+        assert!(!detail.body_text.contains('\u{00AD}'));
     }
 
     // ── URL normalization ────────────────────────────────────────────
