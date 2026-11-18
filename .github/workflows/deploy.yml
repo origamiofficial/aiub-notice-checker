@@ -1,15 +1,10 @@
 name: Deploy AIUB Notice Checker Worker
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - "src/**"
-      - "migrations/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "wrangler.toml"
+  workflow_run:
+    workflows: ["Tests"]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -22,6 +17,10 @@ concurrency:
 jobs:
   deploy:
     name: Build & Deploy Worker
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event != 'pull_request')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -32,6 +31,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
       - name: Setup Rust stable & wasm32 target
         uses: dtolnay/rust-toolchain@stable
