@@ -30,11 +30,11 @@ jobs:
       # security issues, and relies on `cargo clippy` in the test workflow
       # for Rust-level static analysis.
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4
         with:
           languages: actions
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4
         with:
           category: "/language:actions"
