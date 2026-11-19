@@ -2,7 +2,7 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::TELEGRAM_MAX_MESSAGE_LEN;
+use crate::config::{FACEBOOK_MAX_MESSAGE_LEN, TELEGRAM_MAX_MESSAGE_LEN};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Notice {
@@ -62,10 +62,12 @@ pub struct NoticeRow {
     pub body_text: String,
     pub attachments_json: String,
     pub content_hash: String,
-    pub sent_at: Option<String>,
-    pub last_notified_hash: Option<String>,
+    pub tg_sent_at: Option<String>,
+    pub tg_last_notified_hash: Option<String>,
     pub detail_checked_at: Option<String>,
     pub detail_fetched_at: Option<String>,
+    pub fb_sent_at: Option<String>,
+    pub fb_last_notified_hash: Option<String>,
 }
 
 impl NoticeRow {
@@ -161,4 +163,84 @@ pub fn format_notice_message(notice: &Notice, edited: bool) -> String {
         .saturating_sub(suffix.chars().count());
     let body = truncate_text(raw_body, available.clamp(4, 1600));
     format!("{header}{body}{suffix}")
+}
+
+/// Formats a notice for Facebook's `/{page-id}/feed` `message` field.
+/// Strictly plain text: zero HTML tags, zero Markdown syntax.
+/// Omits `link` and `picture` parameters so Facebook treats this as a status update.
+/// Surrounds all URLs with clean whitespace and blank lines.
+/// Preserves attachment URLs and the main AIUB notice link untruncated at the bottom.
+pub fn format_facebook_message(notice: &Notice, edited: bool) -> String {
+    let prefix = if edited { "[EDITED] " } else { "" };
+    let title = truncate_text(&notice.title, 500);
+    let date = display_date(notice.published_date.as_deref());
+
+    let header = format!("{prefix}{title}\n\nDate: {date}");
+    let notice_url = notice.url.trim();
+
+    let valid_attachments: Vec<&str> = notice
+        .attachments
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let text_content = if is_meaningful_text(&notice.body_text) {
+        Some(notice.body_text.trim())
+    } else if is_meaningful_text(&notice.description) {
+        Some(notice.description.trim())
+    } else {
+        None
+    };
+
+    // Construct footer (attachments + notice URL), each on its own line
+    let mut footer_parts = Vec::new();
+    for att in &valid_attachments {
+        footer_parts.push(*att);
+    }
+    footer_parts.push(notice_url);
+    let footer = footer_parts.join("\n\n");
+
+    let full_content = match (text_content, valid_attachments.is_empty()) {
+        (Some(body), true) => {
+            // Standard text notice without attachments
+            format!("{header}\n\n{body}\n\n{notice_url}")
+        }
+        (Some(body), false) => {
+            // Standard text notice with attachments
+            format!("{header}\n\n{body}\n\n{footer}")
+        }
+        (None, false) => {
+            // Image-only / flyer notice (attachment-first)
+            format!("{header}\n\n{footer}")
+        }
+        (None, true) => {
+            // No body and no attachments
+            format!("{header}\n\nPlease click the link for details.\n\n{notice_url}")
+        }
+    };
+
+    if full_content.chars().count() <= FACEBOOK_MAX_MESSAGE_LEN {
+        return full_content;
+    }
+
+    // Defensive truncation: truncate body text, but preserve header, attachments, and notice URL
+    let suffix = format!("\n\n{footer}");
+    let suffix_chars = suffix.chars().count();
+    let header_chars = header.chars().count();
+    let fixed_overhead = header_chars + suffix_chars + 4; // "\n\n" + "\n\n"
+
+    let available_body_chars = FACEBOOK_MAX_MESSAGE_LEN.saturating_sub(fixed_overhead);
+    let truncated = if let Some(body) = text_content {
+        let truncated_body = truncate_text(body, available_body_chars.max(10));
+        format!("{header}\n\n{truncated_body}{suffix}")
+    } else {
+        truncate_text(&full_content, FACEBOOK_MAX_MESSAGE_LEN)
+    };
+
+    if truncated.chars().count() > FACEBOOK_MAX_MESSAGE_LEN {
+        truncate_text(&truncated, FACEBOOK_MAX_MESSAGE_LEN)
+    } else {
+        truncated
+    }
 }

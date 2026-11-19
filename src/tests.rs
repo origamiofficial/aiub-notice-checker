@@ -915,10 +915,12 @@ mod notice_row_tests {
             body_text: "".to_string(),
             attachments_json: "[]".to_string(),
             content_hash: "abc".to_string(),
-            sent_at: None,
-            last_notified_hash: None,
+            tg_sent_at: None,
+            tg_last_notified_hash: None,
             detail_checked_at: detail_checked_at.map(String::from),
             detail_fetched_at: detail_fetched_at.map(String::from),
+            fb_sent_at: None,
+            fb_last_notified_hash: None,
         }
     }
 
@@ -1092,6 +1094,16 @@ mod config_tests {
         assert!((0.0..=1.0).contains(&MIN_LISTING_DESC_COVERAGE));
         assert!((0.0..=1.0).contains(&DETAIL_FAILURE_RATIO));
         assert!(TELEGRAM_MAX_MESSAGE_LEN > 100);
+
+        // Facebook configuration checks
+        assert_eq!(FACEBOOK_GRAPH_API_VERSION, "v27.0");
+        assert!(MAX_FACEBOOK_SENDS_PER_RUN > 0 && MAX_FACEBOOK_SENDS_PER_RUN <= 10);
+        assert!(FACEBOOK_PACE_MS >= 1000);
+        assert!(FACEBOOK_MAX_MESSAGE_LEN >= 1000);
+        assert!(FACEBOOK_BUC_USAGE_THRESHOLD_PCT >= 50 && FACEBOOK_BUC_USAGE_THRESHOLD_PCT <= 100);
+        assert!(FACEBOOK_RATE_LIMIT_COOLDOWN_FALLBACK_MINS > 0);
+        assert!(FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS > 0);
+        assert!(FACEBOOK_ADMIN_ALERT_DEBOUNCE_HOURS > 0);
     }
 }
 
@@ -1176,5 +1188,365 @@ mod version_tests {
         // Large major version: 12.9.0 -> 13.0.0
         let v = ReleaseVersion::new(12, 9, 0).unwrap().next(false);
         assert_eq!(v.to_string(), "13.0.0");
+    }
+}
+
+#[cfg(test)]
+mod facebook_tests {
+    use crate::config::FACEBOOK_MAX_MESSAGE_LEN;
+    use crate::facebook::{classify_meta_error, parse_buc_usage_header, MetaErrorAction};
+    use crate::models::{format_facebook_message, Notice};
+
+    #[test]
+    fn format_facebook_message_standard_text_notice() {
+        let notice = Notice {
+            title: "Midterm Exam Schedule".to_string(),
+            description: "Listing description".to_string(),
+            url: "https://www.aiub.edu/notice/midterm-schedule".to_string(),
+            published_date: Some("2026-11-15".to_string()),
+            body_text: "All midterm exams will be held as per the published routine.".to_string(),
+            attachments: vec![],
+            detail_fetched: true,
+        };
+
+        let msg = format_facebook_message(&notice, false);
+        assert!(!msg.contains("[EDITED]"));
+        assert!(msg.starts_with("Midterm Exam Schedule\n\nDate: 15 Nov 2026\n\n"));
+        assert!(msg.contains("All midterm exams will be held as per the published routine."));
+        assert!(msg.ends_with("\n\nhttps://www.aiub.edu/notice/midterm-schedule"));
+        // Confirm zero HTML or markdown formatting leaks
+        assert!(!msg.contains('<') && !msg.contains('>'));
+        assert!(!msg.contains("**") && !msg.contains("__"));
+    }
+
+    #[test]
+    fn format_facebook_message_image_only_flyer_notice() {
+        let notice = Notice {
+            title: "Campus Job Fair 2026".to_string(),
+            description: "No description available".to_string(),
+            url: "https://www.aiub.edu/notice/job-fair-2026".to_string(),
+            published_date: Some("2026-11-20".to_string()),
+            body_text: "".to_string(),
+            attachments: vec![
+                "https://www.aiub.edu/Files/Uploads/webp/job-fair-banner.webp".to_string(),
+                "https://www.aiub.edu/Files/Uploads/job-fair-schedule.pdf".to_string(),
+            ],
+            detail_fetched: true,
+        };
+
+        let msg = format_facebook_message(&notice, false);
+        assert!(!msg.contains("No description available"));
+        assert!(!msg.contains("Please click the link for details."));
+        // Both attachments should appear on their own lines
+        assert!(msg.contains("https://www.aiub.edu/Files/Uploads/webp/job-fair-banner.webp"));
+        assert!(msg.contains("https://www.aiub.edu/Files/Uploads/job-fair-schedule.pdf"));
+        assert!(msg.ends_with("https://www.aiub.edu/notice/job-fair-2026"));
+    }
+
+    #[test]
+    fn format_facebook_message_edited_notice_alert() {
+        let notice = Notice {
+            title: "Revised Class Schedule".to_string(),
+            description: "".to_string(),
+            url: "https://www.aiub.edu/notice/revised-schedule".to_string(),
+            published_date: Some("2026-11-18".to_string()),
+            body_text: "Room allocations updated for Annex 3.".to_string(),
+            attachments: vec![],
+            detail_fetched: true,
+        };
+
+        let msg = format_facebook_message(&notice, true);
+        assert!(msg.starts_with("[EDITED] Revised Class Schedule"));
+    }
+
+    #[test]
+    fn format_facebook_message_protects_clickable_links_spacing() {
+        let notice = Notice {
+            title: "Link Spacing Test".to_string(),
+            description: "".to_string(),
+            url: "https://www.aiub.edu/notice/link-test".to_string(),
+            published_date: None,
+            body_text: "Body text.".to_string(),
+            attachments: vec!["https://www.aiub.edu/flyer.jpg".to_string()],
+            detail_fetched: true,
+        };
+
+        let msg = format_facebook_message(&notice, false);
+        // Ensure no punctuation or bracket is attached to the URLs
+        assert!(!msg.contains("https://www.aiub.edu/notice/link-test."));
+        assert!(!msg.contains("https://www.aiub.edu/notice/link-test)"));
+        assert!(!msg.contains("https://www.aiub.edu/flyer.jpg."));
+        assert!(!msg.contains("https://www.aiub.edu/flyer.jpg)"));
+    }
+
+    #[test]
+    fn format_facebook_message_defensive_length_cap_preserves_urls() {
+        let notice = Notice {
+            title: "Very Long Notice".to_string(),
+            description: "".to_string(),
+            url: "https://www.aiub.edu/notice/long-notice".to_string(),
+            published_date: Some("2026-11-19".to_string()),
+            body_text: "Lorem ipsum dolor sit amet. ".repeat(300),
+            attachments: vec!["https://www.aiub.edu/uploads/flyer.webp".to_string()],
+            detail_fetched: true,
+        };
+
+        let msg = format_facebook_message(&notice, false);
+        assert!(
+            msg.chars().count() <= FACEBOOK_MAX_MESSAGE_LEN,
+            "Message length {} exceeds max {}",
+            msg.chars().count(),
+            FACEBOOK_MAX_MESSAGE_LEN
+        );
+        // Ellipsis appended to truncated body
+        assert!(msg.contains("..."));
+        // Attachment and notice URLs preserved untruncated
+        assert!(msg.contains("https://www.aiub.edu/uploads/flyer.webp"));
+        assert!(msg.ends_with("https://www.aiub.edu/notice/long-notice"));
+    }
+
+    #[test]
+    fn format_facebook_message_empty_body_fallback() {
+        let notice = Notice {
+            title: "Empty Notice".to_string(),
+            description: "".to_string(),
+            url: "https://www.aiub.edu/notice/empty".to_string(),
+            published_date: None,
+            body_text: "".to_string(),
+            attachments: vec![],
+            detail_fetched: false,
+        };
+
+        let msg = format_facebook_message(&notice, false);
+        assert!(msg.contains("Please click the link for details."));
+        assert!(msg.ends_with("https://www.aiub.edu/notice/empty"));
+    }
+
+    // ── Meta rate-limit header parsing ───────────────────────────────
+
+    #[test]
+    fn parse_buc_usage_header_valid_pages_format() {
+        let header = r#"{"1234567890":[{"type":"pages","call_count":45,"total_cputime":30,"total_time":20,"estimated_time_to_regain_access":0}]}"#;
+        let usage = parse_buc_usage_header(header).expect("valid BUC header");
+        assert_eq!(usage.call_count, 45);
+        assert_eq!(usage.total_cputime, 30);
+        assert_eq!(usage.total_time, 20);
+        assert_eq!(usage.estimated_time_to_regain_access, 0);
+        assert_eq!(usage.max_usage(), 45);
+        assert!(!usage.is_approaching_limit());
+    }
+
+    #[test]
+    fn parse_buc_usage_header_approaching_limit() {
+        let header = r#"{"1234567890":[{"type":"pages","call_count":82,"total_cputime":50,"total_time":40,"estimated_time_to_regain_access":15}]}"#;
+        let usage = parse_buc_usage_header(header).expect("valid BUC header");
+        assert!(usage.is_approaching_limit());
+        assert_eq!(usage.max_usage(), 82);
+        assert_eq!(usage.estimated_time_to_regain_access, 15);
+    }
+
+    #[test]
+    fn parse_buc_usage_header_flat_app_usage() {
+        let header = r#"{"call_count":85,"total_cputime":10,"total_time":15}"#;
+        let usage = parse_buc_usage_header(header).expect("valid app usage");
+        assert_eq!(usage.call_count, 85);
+        assert!(usage.is_approaching_limit());
+        assert_eq!(usage.max_usage(), 85);
+    }
+
+    #[test]
+    fn parse_buc_usage_header_malformed() {
+        assert!(parse_buc_usage_header("").is_none());
+        assert!(parse_buc_usage_header("not json").is_none());
+        assert!(parse_buc_usage_header("[]").is_none());
+        assert!(parse_buc_usage_header("{}").is_none());
+    }
+
+    // ── Meta error classification ────────────────────────────────────
+
+    #[test]
+    fn classify_rate_limit_error_codes() {
+        for code in [80001, 32, 4, 17, 341, 613] {
+            assert_eq!(
+                classify_meta_error(code, None),
+                MetaErrorAction::RateLimitCooldown {
+                    estimated_minutes: 0
+                },
+                "Code {code} should be classified as RateLimitCooldown"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_policy_spam_block_code_368() {
+        assert_eq!(classify_meta_error(368, None), MetaErrorAction::SpamBlock);
+    }
+
+    #[test]
+    fn classify_duplicate_post_code_506() {
+        assert_eq!(
+            classify_meta_error(506, None),
+            MetaErrorAction::DuplicatePost
+        );
+    }
+
+    #[test]
+    fn classify_auth_failure_codes() {
+        assert_eq!(
+            classify_meta_error(190, Some(458)),
+            MetaErrorAction::AuthFailure {
+                code: 190,
+                subcode: Some(458)
+            }
+        );
+        assert_eq!(
+            classify_meta_error(102, Some(463)),
+            MetaErrorAction::AuthFailure {
+                code: 102,
+                subcode: Some(463)
+            }
+        );
+    }
+
+    #[test]
+    fn classify_permission_error_codes() {
+        assert_eq!(
+            classify_meta_error(10, None),
+            MetaErrorAction::PermissionError { code: 10 }
+        );
+        for code in 200..=299 {
+            assert_eq!(
+                classify_meta_error(code, None),
+                MetaErrorAction::PermissionError { code }
+            );
+        }
+    }
+
+    #[test]
+    fn classify_transient_error_codes() {
+        assert_eq!(
+            classify_meta_error(1, None),
+            MetaErrorAction::TransientError
+        );
+        assert_eq!(
+            classify_meta_error(2, None),
+            MetaErrorAction::TransientError
+        );
+    }
+
+    #[test]
+    fn classify_unknown_error_code() {
+        assert_eq!(
+            classify_meta_error(99999, None),
+            MetaErrorAction::Unknown { code: 99999 }
+        );
+    }
+
+    // ── Facebook secrets & graceful feature gating ───────────────────
+
+    #[test]
+    fn facebook_secrets_from_raw_handles_missing_or_empty() {
+        use crate::config::FacebookSecrets;
+
+        assert_eq!(FacebookSecrets::from_raw(None, None), None);
+        assert_eq!(FacebookSecrets::from_raw(Some("123"), None), None);
+        assert_eq!(FacebookSecrets::from_raw(None, Some("token")), None);
+        assert_eq!(FacebookSecrets::from_raw(Some(""), Some("token")), None);
+        assert_eq!(FacebookSecrets::from_raw(Some("   "), Some("token")), None);
+        assert_eq!(FacebookSecrets::from_raw(Some("123"), Some("")), None);
+        assert_eq!(FacebookSecrets::from_raw(Some("123"), Some("   ")), None);
+
+        let valid = FacebookSecrets::from_raw(Some(" 1234567890 "), Some(" EAAB...token "));
+        assert_eq!(
+            valid,
+            Some(FacebookSecrets {
+                page_id: "1234567890".to_string(),
+                page_access_token: "EAAB...token".to_string(),
+            })
+        );
+    }
+
+    // ── D1 schema backfill & cold-start queueing behavior ────────────
+
+    #[test]
+    fn migration_sql_contains_backfill_and_column_renames() {
+        let migration_sql = include_str!("../migrations/0002_facebook_and_tg_rename.sql");
+
+        // Verify Telegram column renames
+        assert!(migration_sql.contains("ALTER TABLE notices RENAME COLUMN sent_at TO tg_sent_at;"));
+        assert!(migration_sql.contains(
+            "ALTER TABLE notices RENAME COLUMN last_notified_hash TO tg_last_notified_hash;"
+        ));
+        assert!(migration_sql.contains("ALTER TABLE notices RENAME COLUMN notification_attempted_at TO tg_notification_attempted_at;"));
+
+        // Verify Facebook column additions
+        assert!(migration_sql.contains("ALTER TABLE notices ADD COLUMN fb_sent_at TEXT;"));
+        assert!(
+            migration_sql.contains("ALTER TABLE notices ADD COLUMN fb_last_notified_hash TEXT;")
+        );
+        assert!(migration_sql
+            .contains("ALTER TABLE notices ADD COLUMN fb_notification_attempted_at TEXT;"));
+        assert!(migration_sql.contains("ALTER TABLE notices ADD COLUMN fb_post_id TEXT;"));
+
+        // Verify historical backfill preventing archive flood
+        assert!(migration_sql.contains("UPDATE notices"));
+        assert!(migration_sql.contains("SET fb_sent_at = tg_sent_at,"));
+        assert!(migration_sql.contains("fb_last_notified_hash = tg_last_notified_hash"));
+        assert!(migration_sql.contains("WHERE tg_sent_at IS NOT NULL;"));
+    }
+
+    #[test]
+    fn independent_dispatch_queueing_behavior() {
+        use crate::models::NoticeRow;
+
+        let make_test_row = |tg_sent: Option<&str>,
+                             fb_sent: Option<&str>,
+                             tg_hash: Option<&str>,
+                             fb_hash: Option<&str>| {
+            NoticeRow {
+                title: "Test Notice".to_string(),
+                description: "Test Desc".to_string(),
+                link: "https://www.aiub.edu/notice/1".to_string(),
+                published_date: Some("2026-11-20".to_string()),
+                body_text: "Body".to_string(),
+                attachments_json: "[]".to_string(),
+                content_hash: "hash_v1".to_string(),
+                tg_sent_at: tg_sent.map(String::from),
+                tg_last_notified_hash: tg_hash.map(String::from),
+                detail_checked_at: Some("2026-11-20T00:00:00Z".to_string()),
+                detail_fetched_at: Some("2026-11-20T00:00:00Z".to_string()),
+                fb_sent_at: fb_sent.map(String::from),
+                fb_last_notified_hash: fb_hash.map(String::from),
+            }
+        };
+
+        // Case 1: Backfilled historical row — neither Telegram nor Facebook should dispatch
+        let row_backfilled = make_test_row(
+            Some("2026-11-19T00:00:00Z"),
+            Some("2026-11-19T00:00:00Z"),
+            Some("hash_v1"),
+            Some("hash_v1"),
+        );
+        let current_hash = "hash_v1";
+        let tg_needs = row_backfilled.tg_sent_at.is_none()
+            || row_backfilled.tg_last_notified_hash.as_deref() != Some(current_hash);
+        let fb_needs = row_backfilled.fb_sent_at.is_none()
+            || row_backfilled.fb_last_notified_hash.as_deref() != Some(current_hash);
+        assert!(!tg_needs, "Backfilled row must not trigger Telegram send");
+        assert!(!fb_needs, "Backfilled row must not trigger Facebook send");
+
+        // Case 2: Telegram succeeded, Facebook failed/paused previously — only Facebook should dispatch
+        let row_tg_only = make_test_row(Some("2026-11-20T00:00:00Z"), None, Some("hash_v1"), None);
+        let tg_needs = row_tg_only.tg_sent_at.is_none();
+        let fb_needs = row_tg_only.fb_sent_at.is_none();
+        assert!(!tg_needs, "Telegram already sent, must not re-send");
+        assert!(fb_needs, "Facebook has not sent, must dispatch");
+
+        // Case 3: Notice content changed (hash_v2) — both should dispatch as [EDITED]
+        let current_hash_v2 = "hash_v2";
+        let tg_edited = row_backfilled.tg_last_notified_hash.as_deref() != Some(current_hash_v2);
+        let fb_edited = row_backfilled.fb_last_notified_hash.as_deref() != Some(current_hash_v2);
+        assert!(tg_edited, "Telegram must trigger for edited notice");
+        assert!(fb_edited, "Facebook must trigger for edited notice");
     }
 }

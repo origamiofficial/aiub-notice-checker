@@ -1,4 +1,4 @@
-use worker::{Env, Error, Result};
+use worker::{console_log, Env, Error, Result};
 
 pub const BASE_URL: &str = "https://www.aiub.edu";
 pub const BASE_HOST: &str = "www.aiub.edu";
@@ -25,10 +25,43 @@ pub const TELEGRAM_PACE_MS: u64 = 1_000;
 pub const TELEGRAM_MAX_RETRIES: usize = 2;
 pub const TELEGRAM_MAX_RETRY_WAIT_SECS: u64 = 10;
 
+// Facebook Graph API configuration
+pub const FACEBOOK_GRAPH_API_VERSION: &str = "v27.0";
+pub const MAX_FACEBOOK_SENDS_PER_RUN: usize = 5;
+pub const FACEBOOK_PACE_MS: u64 = 1_500;
+pub const FACEBOOK_MAX_MESSAGE_LEN: usize = 4_500;
+pub const FACEBOOK_BUC_USAGE_THRESHOLD_PCT: u8 = 80;
+pub const FACEBOOK_RATE_LIMIT_COOLDOWN_FALLBACK_MINS: i64 = 60;
+pub const FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS: i64 = 12;
+pub const FACEBOOK_ADMIN_ALERT_DEBOUNCE_HOURS: i64 = 6;
+pub const FACEBOOK_TRANSIENT_RETRY_WAIT_MS: u64 = 2_000;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FacebookSecrets {
+    pub page_id: String,
+    pub page_access_token: String,
+}
+
+impl FacebookSecrets {
+    pub fn from_raw(page_id: Option<&str>, page_access_token: Option<&str>) -> Option<Self> {
+        let pid = page_id?.trim();
+        let tok = page_access_token?.trim();
+        if pid.is_empty() || tok.is_empty() {
+            return None;
+        }
+        Some(Self {
+            page_id: pid.to_string(),
+            page_access_token: tok.to_string(),
+        })
+    }
+}
+
+#[derive(Clone)]
 pub struct Secrets {
     pub telegram_bot_api_key: String,
     pub telegram_chat_id: String,
     pub telegram_admin_chat_id: Option<String>,
+    pub facebook: Option<FacebookSecrets>,
 }
 
 impl Secrets {
@@ -55,10 +88,22 @@ impl Secrets {
             .map(|s| s.to_string())
             .filter(|s| !s.trim().is_empty());
 
+        let fb_page_id = env.secret("FACEBOOK_PAGE_ID").ok().map(|s| s.to_string());
+        let fb_token = env
+            .secret("FACEBOOK_PAGE_ACCESS_TOKEN")
+            .ok()
+            .map(|s| s.to_string());
+
+        let facebook = FacebookSecrets::from_raw(fb_page_id.as_deref(), fb_token.as_deref());
+        if facebook.is_none() {
+            console_log!("Facebook secrets (FACEBOOK_PAGE_ID / FACEBOOK_PAGE_ACCESS_TOKEN) not configured; skipping Facebook dispatch.");
+        }
+
         Ok(Self {
             telegram_bot_api_key,
             telegram_chat_id,
             telegram_admin_chat_id,
+            facebook,
         })
     }
 }

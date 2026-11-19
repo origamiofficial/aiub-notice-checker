@@ -10,6 +10,7 @@ use worker::{
 
 pub mod config;
 mod db;
+pub mod facebook;
 pub mod models;
 pub mod scraper;
 mod telegram;
@@ -19,10 +20,10 @@ pub mod version;
 
 use config::{
     Secrets, DETAIL_FAILURE_MIN_SAMPLE, DETAIL_FAILURE_RATIO, DETAIL_RETRY_COOLDOWN_MINUTES,
-    MAX_DETAIL_FETCHES_PER_RUN, MAX_TELEGRAM_SENDS_PER_RUN, MIN_LISTING_DATE_COVERAGE,
-    MIN_LISTING_DESC_COVERAGE,
+    FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS, MAX_DETAIL_FETCHES_PER_RUN, MAX_FACEBOOK_SENDS_PER_RUN,
+    MAX_TELEGRAM_SENDS_PER_RUN, MIN_LISTING_DATE_COVERAGE, MIN_LISTING_DESC_COVERAGE,
 };
-use models::{titles_equivalent, D1Metrics, Notice, NoticeRow};
+use models::{format_facebook_message, titles_equivalent, D1Metrics, Notice, NoticeRow};
 use scraper::{DetailFetchOutcome, ParsedDetail};
 
 const DETAIL_CONCURRENCY: usize = 3;
@@ -444,16 +445,17 @@ async fn run(env: &Env) -> worker::Result<()> {
     }
 
     let mut statements = Vec::new();
-    let mut notifications: Vec<PendingNotification> = Vec::new();
+    let mut tg_notifications: Vec<PendingNotification> = Vec::new();
+    let mut fb_notifications: Vec<PendingNotification> = Vec::new();
     let mut silent_sync_links: Vec<(String, String)> = Vec::new();
 
     // Cold-start guard: if D1 is completely empty and we scraped a full page of notices,
-    // this is a fresh database seed — write all rows silently without spamming Telegram.
-    // Mirrors the `first_run` logic from the legacy Python `main.py` (lines 371-387).
+    // this is a fresh database seed — write all rows silently and populate tracking columns
+    // so neither Telegram nor Facebook are flooded.
     let is_empty_db_seed = existing_map.is_empty() && unique_listing.len() >= 10;
     if is_empty_db_seed {
         console_log!(
-            "Empty-database cold-start detected ({} notices). Seeding silently without Telegram notifications.",
+            "Empty-database cold-start detected ({} notices). Seeding silently without Telegram or Facebook notifications.",
             unique_listing.len()
         );
     }
@@ -519,9 +521,6 @@ async fn run(env: &Env) -> worker::Result<()> {
         let new_hash = item.content_hash();
 
         // Determine whether this row needs a full upsert or just a lightweight timestamp update.
-        // When a rotation detail-check confirms the content hasn't changed (hash, title,
-        // description, published_date all identical), we skip the heavy INSERT ... ON CONFLICT
-        // that rewrites indexed columns, cutting steady-state D1 writes by ~1/3.
         let (needs_db_write, use_lightweight_update) = match existing {
             None => (true, false),
             Some(row) => {
@@ -531,10 +530,8 @@ async fn run(env: &Env) -> worker::Result<()> {
                     || row.published_date != item.published_date;
 
                 if detail_attempted && !content_changed {
-                    // Detail was checked but nothing changed → lightweight timestamp-only update.
                     (true, true)
                 } else if detail_attempted || content_changed {
-                    // Detail attempted with changes, or listing metadata changed → full upsert.
                     (true, false)
                 } else {
                     (false, false)
@@ -544,12 +541,16 @@ async fn run(env: &Env) -> worker::Result<()> {
 
         // Silent hash sync for non-edit backfills:
         // 1. First-time detail fetch (`row.detail_fetched_at.is_none()`) when listing fields didn't change.
-        // 2. Date-only, full-title, or UTF-8 mojibake (`2026â27` -> `2026–27`) healing when content is equivalent.
+        // 2. Date-only, full-title, or UTF-8 mojibake healing when content is equivalent.
         // 3. Re-baselining rows from version `e1a14563` whose stored `body_text` was the sticky header.
         let mut silent_hash_sync = false;
         if let Some(row) = existing {
-            if row.sent_at.is_some() && row.last_notified_hash.as_deref() != Some(new_hash.as_str())
-            {
+            let tg_needs_sync = row.tg_sent_at.is_some()
+                && row.tg_last_notified_hash.as_deref() != Some(new_hash.as_str());
+            let fb_needs_sync = row.fb_sent_at.is_some()
+                && row.fb_last_notified_hash.as_deref() != Some(new_hash.as_str());
+
+            if tg_needs_sync || fb_needs_sync {
                 let listing_unchanged = titles_equivalent_clean(&listing_title, &row.title)
                     && titles_equivalent_clean(&item.title, &row.title)
                     && clean_mojibake(&row.description) == clean_mojibake(&item.description);
@@ -590,9 +591,8 @@ async fn run(env: &Env) -> worker::Result<()> {
             continue;
         }
 
-        // During a cold-start seed, all brand-new rows are written to D1 above
-        // but no Telegram notifications are queued — prevents flooding the channel
-        // with 50 notices when D1 is reset or a fresh database is bound.
+        // During a cold-start seed, all brand-new rows are written to D1
+        // but no notifications are queued for either platform.
         if is_empty_db_seed {
             continue;
         }
@@ -600,7 +600,12 @@ async fn run(env: &Env) -> worker::Result<()> {
         match existing {
             None => {
                 if item.detail_fetched || detail_attempted {
-                    notifications.push(PendingNotification {
+                    tg_notifications.push(PendingNotification {
+                        notice: item.clone(),
+                        content_hash: new_hash.clone(),
+                        is_edited: false,
+                    });
+                    fb_notifications.push(PendingNotification {
                         notice: item,
                         content_hash: new_hash,
                         is_edited: false,
@@ -608,18 +613,38 @@ async fn run(env: &Env) -> worker::Result<()> {
                 }
             }
             Some(row) => {
-                if row.sent_at.is_none() {
+                // Telegram notification eligibility
+                if row.tg_sent_at.is_none() {
                     if item.detail_fetched || detail_attempted || row.detail_checked_at.is_some() {
-                        notifications.push(PendingNotification {
+                        tg_notifications.push(PendingNotification {
+                            notice: item.clone(),
+                            content_hash: new_hash.clone(),
+                            is_edited: false,
+                        });
+                    }
+                } else if detail_attempted
+                    && row.tg_last_notified_hash.as_deref() != Some(new_hash.as_str())
+                {
+                    tg_notifications.push(PendingNotification {
+                        notice: item.clone(),
+                        content_hash: new_hash.clone(),
+                        is_edited: true,
+                    });
+                }
+
+                // Facebook notification eligibility (fully independent tracking)
+                if row.fb_sent_at.is_none() {
+                    if item.detail_fetched || detail_attempted || row.detail_checked_at.is_some() {
+                        fb_notifications.push(PendingNotification {
                             notice: item,
                             content_hash: new_hash,
                             is_edited: false,
                         });
                     }
                 } else if detail_attempted
-                    && row.last_notified_hash.as_deref() != Some(new_hash.as_str())
+                    && row.fb_last_notified_hash.as_deref() != Some(new_hash.as_str())
                 {
-                    notifications.push(PendingNotification {
+                    fb_notifications.push(PendingNotification {
                         notice: item,
                         content_hash: new_hash,
                         is_edited: true,
@@ -660,28 +685,52 @@ async fn run(env: &Env) -> worker::Result<()> {
         total_d1.rows_written += batch_metrics.rows_written;
     }
 
+    // Cold-start seed: populate tracking fields for both platforms so subsequent runs
+    // never flood historical notices onto Telegram or Facebook.
+    if is_empty_db_seed {
+        let now = Utc::now().to_rfc3339();
+        let mut seed_stmts = Vec::with_capacity(links.len());
+        for link in &links {
+            let stmt = worker::query!(
+                &database,
+                "UPDATE notices SET tg_sent_at = ?1, tg_last_notified_hash = content_hash, \
+                 fb_sent_at = ?1, fb_last_notified_hash = content_hash WHERE link = ?2",
+                &now,
+                link,
+            )?;
+            seed_stmts.push(stmt);
+        }
+        let seed_metrics = db::execute_batch(&session, seed_stmts).await?;
+        total_d1.rows_read += seed_metrics.rows_read;
+        total_d1.rows_written += seed_metrics.rows_written;
+    }
+
     // Apply silent hash updates after the batch upsert completes.
     for (url, hash) in silent_sync_links {
-        let m = db::mark_notified(&database, &session, &url, &hash).await?;
+        let m = db::mark_tg_notified(&database, &session, &url, &hash).await?;
         total_d1.rows_read += m.rows_read;
         total_d1.rows_written += m.rows_written;
+
+        let m_fb = db::mark_fb_hash_sync(&database, &session, &url, &hash).await?;
+        total_d1.rows_read += m_fb.rows_read;
+        total_d1.rows_written += m_fb.rows_written;
     }
 
     // 7. Dispatch queued Telegram notifications (oldest-first).
-    if !notifications.is_empty() {
-        notifications.reverse();
+    if !tg_notifications.is_empty() {
+        tg_notifications.reverse();
         let db_ref = &database;
         let secrets_ref = &secrets;
 
         let notify_metrics =
             enter_span_async("dispatch_telegram_notifications", |span| async move {
-                span.set_attribute("queued", notifications.len() as i64);
+                span.set_attribute("queued", tg_notifications.len() as i64);
                 let mut sent_count = 0usize;
                 let mut deferred_count = 0usize;
                 let mut failed_count = 0usize;
                 let mut metrics = D1Metrics::default();
 
-                for item in notifications.into_iter().take(MAX_TELEGRAM_SENDS_PER_RUN) {
+                for item in tg_notifications.into_iter().take(MAX_TELEGRAM_SENDS_PER_RUN) {
                     if is_near_cpu_limit() {
                         console_warn!(
                             "[Telegram Deferred] Near CPU limit during Telegram dispatch; deferring remaining."
@@ -691,7 +740,7 @@ async fn run(env: &Env) -> worker::Result<()> {
                     }
 
                     if let Ok(m) =
-                        db::mark_notification_attempt(db_ref, session_ref, &item.notice.url).await
+                        db::mark_tg_notification_attempt(db_ref, session_ref, &item.notice.url).await
                     {
                         metrics.rows_read += m.rows_read;
                         metrics.rows_written += m.rows_written;
@@ -701,7 +750,7 @@ async fn run(env: &Env) -> worker::Result<()> {
                         .await
                     {
                         Ok(true) => {
-                            let m = db::mark_notified(
+                            let m = db::mark_tg_notified(
                                 db_ref,
                                 session_ref,
                                 &item.notice.url,
@@ -745,6 +794,230 @@ async fn run(env: &Env) -> worker::Result<()> {
 
         total_d1.rows_read += notify_metrics.rows_read;
         total_d1.rows_written += notify_metrics.rows_written;
+    }
+
+    // 8. Dispatch queued Facebook notifications (oldest-first, independent phase).
+    if let Some(fb_secrets) = &secrets.facebook {
+        if !fb_notifications.is_empty() {
+            fb_notifications.reverse();
+            let db_ref = &database;
+            let secrets_ref = &secrets;
+            let fb_secrets_ref = fb_secrets;
+
+            let fb_metrics =
+                enter_span_async("dispatch_facebook_notifications", |span| async move {
+                    span.set_attribute("queued", fb_notifications.len() as i64);
+
+                    let (paused, pause_reason) = facebook::is_facebook_paused(session_ref).await?;
+                    if paused {
+                        console_log!(
+                            "[Facebook Dispatch Skipped] {}",
+                            pause_reason.as_deref().unwrap_or("paused")
+                        );
+                        span.set_attribute(
+                            "skipped_reason",
+                            pause_reason.unwrap_or_else(|| "paused".to_string()),
+                        );
+                        span.set_status(SpanStatus::Ok);
+                        return Ok::<D1Metrics, worker::Error>(D1Metrics::default());
+                    }
+
+                    let mut sent_count = 0usize;
+                    let mut deferred_count = 0usize;
+                    let mut failed_count = 0usize;
+                    let mut metrics = D1Metrics::default();
+
+                    for item in fb_notifications.into_iter().take(MAX_FACEBOOK_SENDS_PER_RUN) {
+                        if is_near_cpu_limit() {
+                            console_warn!(
+                                "[Facebook Deferred] Near CPU limit during Facebook dispatch; deferring remaining."
+                            );
+                            deferred_count += 1;
+                            break;
+                        }
+
+                        if let Ok(m) =
+                            db::mark_fb_notification_attempt(db_ref, session_ref, &item.notice.url)
+                                .await
+                        {
+                            metrics.rows_read += m.rows_read;
+                            metrics.rows_written += m.rows_written;
+                        }
+
+                        let message = format_facebook_message(&item.notice, item.is_edited);
+                        let post_outcome = facebook::publish_post(fb_secrets_ref, &message).await;
+
+                        match post_outcome {
+                            Ok(facebook::FacebookPostResult::Success { post_id, usage }) => {
+                                let m = db::mark_fb_notified(
+                                    db_ref,
+                                    session_ref,
+                                    &item.notice.url,
+                                    &item.content_hash,
+                                    &post_id,
+                                )
+                                .await?;
+                                metrics.rows_read += m.rows_read;
+                                metrics.rows_written += m.rows_written;
+                                sent_count += 1;
+
+                                if let Some(u) = usage {
+                                    if u.is_approaching_limit() {
+                                        let until = (Utc::now() + Duration::minutes(15)).to_rfc3339();
+                                        let _ = db::set_app_state(
+                                            db_ref,
+                                            session_ref,
+                                            "fb_cooldown_until",
+                                            &until,
+                                        )
+                                        .await;
+                                        console_warn!(
+                                            "[Facebook BUC High] Usage reached {}%; cooling down until {}.",
+                                            u.max_usage(),
+                                            until
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(facebook::FacebookPostResult::RateLimited { cooldown_minutes }) => {
+                                let until = (Utc::now() + Duration::minutes(cooldown_minutes)).to_rfc3339();
+                                let _ = db::set_app_state(
+                                    db_ref,
+                                    session_ref,
+                                    "fb_cooldown_until",
+                                    &until,
+                                )
+                                .await;
+                                console_warn!(
+                                    "[Facebook Rate Limited] Setting cooldown until {} ({} mins).",
+                                    until,
+                                    cooldown_minutes
+                                );
+                                let _ = facebook::send_debounced_fb_admin_alert(
+                                    db_ref,
+                                    session_ref,
+                                    secrets_ref,
+                                    "rate_limit",
+                                    &format!(
+                                        "⚠️ AIUB Notice Facebook: Rate limit reached. Dispatch paused until {until}."
+                                    ),
+                                )
+                                .await;
+                                deferred_count += 1;
+                                break;
+                            }
+                            Ok(facebook::FacebookPostResult::SpamBlocked) => {
+                                let until = (Utc::now()
+                                    + Duration::hours(FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS))
+                                .to_rfc3339();
+                                let _ = db::set_app_state(
+                                    db_ref,
+                                    session_ref,
+                                    "fb_cooldown_until",
+                                    &until,
+                                )
+                                .await;
+                                console_error!(
+                                    "[Facebook Spam Block] Meta error 368: policy/spam block. Pausing until {}.",
+                                    until
+                                );
+                                let _ = facebook::send_debounced_fb_admin_alert(
+                                    db_ref,
+                                    session_ref,
+                                    secrets_ref,
+                                    "spam_block",
+                                    &format!(
+                                        "🚨 AIUB Notice Facebook: Meta blocked post for policy/spam (error 368). Dispatch paused until {until}. Please inspect Facebook Page!"
+                                    ),
+                                )
+                                .await;
+                                failed_count += 1;
+                                break;
+                            }
+                            Ok(facebook::FacebookPostResult::Duplicate) => {
+                                console_warn!(
+                                    "[Facebook Duplicate] Error 506 duplicate post for {}; marking handled.",
+                                    item.notice.url
+                                );
+                                let m = db::mark_fb_duplicate_handled(
+                                    db_ref,
+                                    session_ref,
+                                    &item.notice.url,
+                                    &item.content_hash,
+                                )
+                                .await?;
+                                metrics.rows_read += m.rows_read;
+                                metrics.rows_written += m.rows_written;
+                                let _ = facebook::send_debounced_fb_admin_alert(
+                                    db_ref,
+                                    session_ref,
+                                    secrets_ref,
+                                    "duplicate_post",
+                                    &format!(
+                                        "⚠️ AIUB Notice Facebook: Consecutive duplicate rejected by Meta (error 506): {}",
+                                        item.notice.url
+                                    ),
+                                )
+                                .await;
+                            }
+                            Ok(facebook::FacebookPostResult::AuthError { message }) => {
+                                console_error!("[Facebook Auth Error] {}", message);
+                                let _ = db::set_app_state(
+                                    db_ref,
+                                    session_ref,
+                                    "fb_auth_paused",
+                                    &message,
+                                )
+                                .await;
+                                let _ = telegram::send_admin_alert(
+                                    secrets_ref,
+                                    &format!("🚨 AIUB Notice Facebook: Authentication paused: {message}"),
+                                )
+                                .await;
+                                failed_count += 1;
+                                break;
+                            }
+                            Ok(facebook::FacebookPostResult::TransientFailure { message }) => {
+                                console_warn!(
+                                    "[Facebook Transient] Error: {}; will retry at next cron.",
+                                    message
+                                );
+                                deferred_count += 1;
+                                break;
+                            }
+                            Ok(facebook::FacebookPostResult::UnknownError { message }) => {
+                                console_error!("[Facebook Unknown Error] {}", message);
+                                failed_count += 1;
+                                break;
+                            }
+                            Err(err) => {
+                                console_error!(
+                                    "[Facebook Worker Error] Failed to publish notice {}: {}",
+                                    item.notice.url,
+                                    err
+                                );
+                                failed_count += 1;
+                                break;
+                            }
+                        }
+                    }
+
+                    span.set_attribute("sent", sent_count as i64);
+                    span.set_attribute("deferred", deferred_count as i64);
+                    span.set_attribute("failed", failed_count as i64);
+                    if failed_count > 0 {
+                        span.set_status(SpanStatus::Error(Some(format!("{failed_count} sends failed"))));
+                    } else {
+                        span.set_status(SpanStatus::Ok);
+                    }
+                    Ok::<D1Metrics, worker::Error>(metrics)
+                })
+                .await?;
+
+            total_d1.rows_read += fb_metrics.rows_read;
+            total_d1.rows_written += fb_metrics.rows_written;
+        }
     }
 
     console_log!(
