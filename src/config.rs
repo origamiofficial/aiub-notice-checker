@@ -19,6 +19,9 @@ pub const MIN_LISTING_DATE_COVERAGE: f64 = 0.8;
 pub const MIN_LISTING_DESC_COVERAGE: f64 = 0.8;
 pub const DETAIL_FAILURE_MIN_SAMPLE: usize = 4;
 pub const DETAIL_FAILURE_RATIO: f64 = 0.8;
+pub const AIUB_OUTAGE_ALERT_THRESHOLD_MINS: i64 = 60;
+pub const AIUB_OUTAGE_DOWN_SINCE_KEY: &str = "aiub_down_since";
+pub const AIUB_OUTAGE_ALERTED_KEY: &str = "aiub_outage_alerted";
 
 pub const UNIFIED_MAX_MESSAGE_LEN: usize = 4096;
 pub const TELEGRAM_MAX_MESSAGE_LEN: usize = UNIFIED_MAX_MESSAGE_LEN;

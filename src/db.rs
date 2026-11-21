@@ -337,3 +337,27 @@ pub async fn set_app_state(
     )?;
     execute_batch(session, vec![stmt]).await
 }
+
+/// Deletes an operational flag or timestamp from the `app_state` table.
+#[allow(dead_code)]
+pub async fn delete_app_state(
+    db: &D1Database,
+    session: &D1DatabaseSession,
+    key: &str,
+) -> Result<D1Metrics> {
+    let stmt = query!(db, "DELETE FROM app_state WHERE key = ?1", key)?;
+    execute_batch(session, vec![stmt]).await
+}
+
+/// Deletes multiple keys from the `app_state` table in a single atomic batch.
+pub async fn delete_app_state_keys(
+    db: &D1Database,
+    session: &D1DatabaseSession,
+    keys: &[&str],
+) -> Result<D1Metrics> {
+    let mut stmts = Vec::with_capacity(keys.len());
+    for key in keys {
+        stmts.push(query!(db, "DELETE FROM app_state WHERE key = ?1", *key)?);
+    }
+    execute_batch(session, stmts).await
+}

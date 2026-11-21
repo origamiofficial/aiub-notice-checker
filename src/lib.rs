@@ -1,8 +1,10 @@
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use futures_util::stream::{self, StreamExt};
 use std::collections::{HashMap, HashSet};
 use worker::{
-    console_error, console_log, console_warn, event,
+    console_error, console_log, console_warn,
+    d1::{D1Database, D1DatabaseSession},
+    event,
     observability::{enter_span, enter_span_async, SpanStatus},
     signal::is_near_cpu_limit,
     Env, ScheduleContext, ScheduledEvent,
@@ -19,7 +21,8 @@ mod tests;
 pub mod version;
 
 use config::{
-    Secrets, DETAIL_FAILURE_MIN_SAMPLE, DETAIL_FAILURE_RATIO, DETAIL_RETRY_COOLDOWN_MINUTES,
+    Secrets, AIUB_OUTAGE_ALERT_THRESHOLD_MINS, AIUB_OUTAGE_ALERTED_KEY, AIUB_OUTAGE_DOWN_SINCE_KEY,
+    DETAIL_FAILURE_MIN_SAMPLE, DETAIL_FAILURE_RATIO, DETAIL_RETRY_COOLDOWN_MINUTES,
     FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS, MAX_DETAIL_FETCHES_PER_RUN, MAX_FACEBOOK_SENDS_PER_RUN,
     MAX_TELEGRAM_SENDS_PER_RUN, MIN_LISTING_DATE_COVERAGE, MIN_LISTING_DESC_COVERAGE,
 };
@@ -89,6 +92,130 @@ pub fn format_detail_failure_alert(
     }
 }
 
+pub fn format_listing_skip_message(err: &str) -> String {
+    format!("[Listing Fetch Skipped] AIUB listing page unreachable: {err}. Skipping this run.")
+}
+
+/// Formats a human-readable duration (e.g., "1 hour 15 minutes", "2 days 3 hours", "< 1 minute").
+pub fn format_duration_human(duration: Duration) -> String {
+    let total_secs = duration.num_seconds().max(0);
+    if total_secs < 60 {
+        return "< 1 minute".to_string();
+    }
+
+    let days = total_secs / 86400;
+    let hours = (total_secs % 86400) / 3600;
+    let minutes = (total_secs % 3600) / 60;
+
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{} day{}", days, if days == 1 { "" } else { "s" }));
+    }
+    if hours > 0 {
+        parts.push(format!("{} hour{}", hours, if hours == 1 { "" } else { "s" }));
+    }
+    if minutes > 0 {
+        parts.push(format!("{} minute{}", minutes, if minutes == 1 { "" } else { "s" }));
+    }
+
+    if parts.is_empty() {
+        "< 1 minute".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+pub fn format_outage_alert_message(duration_str: &str) -> String {
+    format!(
+        "⚠️ AIUB Notice Checker: AIUB website has been unreachable for {duration_str}. Notice checks are paused until the site recovers."
+    )
+}
+
+pub fn format_recovery_alert_message(duration_str: &str) -> String {
+    format!(
+        "✅ AIUB Notice Checker: AIUB website is back online after a total outage of {duration_str}. Notice checking has resumed."
+    )
+}
+
+async fn handle_upstream_outage(
+    db: &D1Database,
+    session: &D1DatabaseSession,
+    secrets: &Secrets,
+    now: DateTime<Utc>,
+) -> worker::Result<()> {
+    let down_since_str = db::get_app_state(session, AIUB_OUTAGE_DOWN_SINCE_KEY).await?;
+    let down_since = match down_since_str {
+        Some(ref s) if !s.is_empty() => match DateTime::parse_from_rfc3339(s) {
+            Ok(dt) => dt.with_timezone(&Utc),
+            Err(_) => {
+                let now_str = now.to_rfc3339();
+                let _ = db::set_app_state(db, session, AIUB_OUTAGE_DOWN_SINCE_KEY, &now_str).await;
+                now
+            }
+        },
+        _ => {
+            let now_str = now.to_rfc3339();
+            let _ = db::set_app_state(db, session, AIUB_OUTAGE_DOWN_SINCE_KEY, &now_str).await;
+            now
+        }
+    };
+
+    let elapsed = now.signed_duration_since(down_since);
+    if elapsed.num_minutes() >= AIUB_OUTAGE_ALERT_THRESHOLD_MINS {
+        let already_alerted = db::get_app_state(session, AIUB_OUTAGE_ALERTED_KEY)
+            .await?
+            .as_deref()
+            == Some("true");
+
+        if !already_alerted {
+            let duration_str = format_duration_human(elapsed);
+            let alert_msg = format_outage_alert_message(&duration_str);
+            let _ = telegram::send_admin_alert(secrets, &alert_msg).await;
+            let _ = db::set_app_state(db, session, AIUB_OUTAGE_ALERTED_KEY, "true").await;
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_upstream_recovery(
+    db: &D1Database,
+    session: &D1DatabaseSession,
+    secrets: &Secrets,
+    now: DateTime<Utc>,
+) -> worker::Result<()> {
+    let down_since_str = db::get_app_state(session, AIUB_OUTAGE_DOWN_SINCE_KEY).await?;
+    let Some(down_since_str) = down_since_str else {
+        return Ok(());
+    };
+    if down_since_str.is_empty() {
+        return Ok(());
+    }
+
+    let already_alerted = db::get_app_state(session, AIUB_OUTAGE_ALERTED_KEY)
+        .await?
+        .as_deref()
+        == Some("true");
+
+    if already_alerted {
+        if let Ok(down_since) = DateTime::parse_from_rfc3339(&down_since_str) {
+            let total_duration = now.signed_duration_since(down_since.with_timezone(&Utc));
+            let duration_str = format_duration_human(total_duration);
+            let recovery_msg = format_recovery_alert_message(&duration_str);
+            let _ = telegram::send_admin_alert(secrets, &recovery_msg).await;
+        }
+    }
+
+    let _ = db::delete_app_state_keys(
+        db,
+        session,
+        &[AIUB_OUTAGE_DOWN_SINCE_KEY, AIUB_OUTAGE_ALERTED_KEY],
+    )
+    .await;
+
+    Ok(())
+}
+
 #[event(scheduled)]
 pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     enter_span_async("scheduled_notice_check", |span| async move {
@@ -111,24 +238,39 @@ async fn run(env: &Env) -> worker::Result<()> {
     let mut total_d1 = D1Metrics::default();
 
     // 1. Fetch the latest notices on listing page 1.
-    let listing_notices: Vec<Notice> = enter_span_async("fetch_listing", |span| async move {
+    let listing_notices: Option<Vec<Notice>> = enter_span_async("fetch_listing", |span| async move {
         let listing_url = scraper::listing_page_url(1);
         span.set_attribute("url", listing_url.as_str());
         let html = match scraper::fetch_html(&listing_url).await {
             Ok(h) => h,
             Err(err) => {
-                console_error!("[Listing Fetch Failed] url={}, error={}", listing_url, err);
-                span.set_status(SpanStatus::Error(Some(err.to_string())));
-                return Err(err);
+                let err_msg = err.to_string();
+                console_warn!("{}", format_listing_skip_message(&err_msg));
+                span.set_attribute("upstream_available", "false");
+                span.set_attribute("skip_reason", err_msg.as_str());
+                span.set_status(SpanStatus::Ok);
+                return Ok::<Option<Vec<Notice>>, worker::Error>(None);
             }
         };
+        span.set_attribute("upstream_available", "true");
         let parsed = scraper::parse_listing_html(&html);
         span.set_attribute("notices_found", parsed.len() as i64);
         span.set_attribute("html_bytes", html.len() as i64);
         span.set_status(SpanStatus::Ok);
-        Ok::<Vec<Notice>, worker::Error>(parsed)
+        Ok::<Option<Vec<Notice>>, worker::Error>(Some(parsed))
     })
     .await?;
+
+    let Some(listing_notices) = listing_notices else {
+        if let Err(err) = handle_upstream_outage(&database, &session, &secrets, Utc::now()).await {
+            console_warn!("[Outage State Warning] Failed to update outage state: {err}");
+        }
+        return Ok(());
+    };
+
+    if let Err(err) = handle_upstream_recovery(&database, &session, &secrets, Utc::now()).await {
+        console_warn!("[Recovery State Warning] Failed to handle outage recovery: {err}");
+    }
 
     if listing_notices.is_empty() {
         console_warn!(

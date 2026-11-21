@@ -1068,8 +1068,11 @@ mod notice_row_tests {
 #[cfg(test)]
 mod lib_tests {
     use crate::{
-        clean_mojibake, format_detail_failure_alert, has_utf8_mojibake, titles_equivalent_clean,
+        clean_mojibake, format_detail_failure_alert, format_duration_human,
+        format_listing_skip_message, format_outage_alert_message, format_recovery_alert_message,
+        has_utf8_mojibake, titles_equivalent_clean,
     };
+    use chrono::Duration;
 
     #[test]
     fn has_utf8_mojibake_detects_latin1_sequences() {
@@ -1142,6 +1145,83 @@ mod lib_tests {
         let msg = format_detail_failure_alert(5, 0, 0, 0, 5, &diags);
         assert!(msg.contains("approached CPU limits"));
     }
+
+    #[test]
+    fn format_listing_skip_message_formats_correctly() {
+        let timeout_err = "HTTP timeout after 15000ms fetching https://www.aiub.edu/category/notices?pageNo=1&pageSize=50";
+        let msg = format_listing_skip_message(timeout_err);
+        assert_eq!(
+            msg,
+            format!("[Listing Fetch Skipped] AIUB listing page unreachable: {timeout_err}. Skipping this run.")
+        );
+
+        let status_err = "HTTP 502 when fetching https://www.aiub.edu/category/notices?pageNo=1&pageSize=50";
+        let msg_status = format_listing_skip_message(status_err);
+        assert!(msg_status.starts_with("[Listing Fetch Skipped]"));
+        assert!(msg_status.contains("HTTP 502"));
+    }
+
+    #[test]
+    fn format_duration_human_handles_various_ranges() {
+        // Less than 1 minute
+        assert_eq!(format_duration_human(Duration::seconds(0)), "< 1 minute");
+        assert_eq!(format_duration_human(Duration::seconds(45)), "< 1 minute");
+
+        // Minutes
+        assert_eq!(format_duration_human(Duration::minutes(1)), "1 minute");
+        assert_eq!(format_duration_human(Duration::minutes(2)), "2 minutes");
+        assert_eq!(format_duration_human(Duration::minutes(59)), "59 minutes");
+
+        // Exactly hours
+        assert_eq!(format_duration_human(Duration::hours(1)), "1 hour");
+        assert_eq!(format_duration_human(Duration::hours(2)), "2 hours");
+
+        // Hours and minutes
+        assert_eq!(
+            format_duration_human(Duration::hours(1) + Duration::minutes(1)),
+            "1 hour 1 minute"
+        );
+        assert_eq!(
+            format_duration_human(Duration::hours(1) + Duration::minutes(15)),
+            "1 hour 15 minutes"
+        );
+        assert_eq!(
+            format_duration_human(Duration::hours(2) + Duration::minutes(30)),
+            "2 hours 30 minutes"
+        );
+
+        // Days
+        assert_eq!(format_duration_human(Duration::days(1)), "1 day");
+        assert_eq!(
+            format_duration_human(Duration::days(1) + Duration::minutes(30)),
+            "1 day 30 minutes"
+        );
+        assert_eq!(
+            format_duration_human(Duration::days(1) + Duration::hours(2) + Duration::minutes(15)),
+            "1 day 2 hours 15 minutes"
+        );
+        assert_eq!(
+            format_duration_human(Duration::days(3) + Duration::hours(5)),
+            "3 days 5 hours"
+        );
+    }
+
+    #[test]
+    fn format_outage_alert_message_content() {
+        let msg = format_outage_alert_message("1 hour");
+        assert!(msg.contains("⚠️ AIUB Notice Checker"));
+        assert!(msg.contains("unreachable for 1 hour"));
+        assert!(msg.contains("Notice checks are paused"));
+    }
+
+    #[test]
+    fn format_recovery_alert_message_content() {
+        let msg = format_recovery_alert_message("2 hours 15 minutes");
+        assert!(msg.contains("✅ AIUB Notice Checker"));
+        assert!(msg.contains("back online"));
+        assert!(msg.contains("total outage of 2 hours 15 minutes"));
+        assert!(msg.contains("Notice checking has resumed"));
+    }
 }
 
 #[cfg(test)]
@@ -1156,6 +1236,13 @@ mod config_tests {
     #[test]
     fn base_host_matches_base_url() {
         assert!(BASE_URL.contains(BASE_HOST));
+    }
+
+    #[test]
+    fn outage_config_constants() {
+        assert_eq!(AIUB_OUTAGE_ALERT_THRESHOLD_MINS, 60);
+        assert_eq!(AIUB_OUTAGE_DOWN_SINCE_KEY, "aiub_down_since");
+        assert_eq!(AIUB_OUTAGE_ALERTED_KEY, "aiub_outage_alerted");
     }
 
     #[test]
