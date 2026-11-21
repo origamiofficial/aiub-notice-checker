@@ -21,7 +21,9 @@
 [Configuration](#-configuration) •
 [Deployment](#-deployment) •
 [Release & Benchmarks](#-release-pipeline--benchmarking) •
+[Message Format](#-message-format--sample-output) •
 [Observability](#-observability--resilience) •
+[Testing](#-testing--quality-assurance) •
 [Community](#-community--channels) •
 [Contributing](#-contributing)
 
@@ -45,8 +47,10 @@ By running as a serverless Rust Worker on Cloudflare's global edge network, the 
 ## ✨ Features
 
 - ⚡ **Zero-Overhead Edge Execution:** Compiled to `wasm32-unknown-unknown` via Rust for sub-millisecond execution times and minimal memory footprint.
-- ⏰ **Deterministic Cron Scheduling:** Cloudflare Worker cron triggers invoke the pipeline every 5 minutes (`*/5 * * * *`) with strict consistency.
+- ⏰ **Deterministic Cron Scheduling:** Cloudflare Worker cron triggers invoke the pipeline every 5 minutes (`*/5 * * * *`) to inspect the latest 50 notices on page 1 (`LIST_PAGE_SIZE = 50`).
 - 📢 **Native Dual-Channel Broadcasting:** Dispatches announcements to both **Telegram** (via Bot API) and **Facebook Pages** (via Meta Graph API v27.0) with zero external webhook or automation dependencies.
+- 📝 **Unified Cross-Platform Formatting:** Delivers 100% identical notice text, layout, and attachment lists across Telegram and Facebook, capped at 4,096 characters (`UNIFIED_MAX_MESSAGE_LEN`) while preserving all attachment and portal links.
+- 🌐 **AIUB Upstream Outage & Recovery Alerts:** Gracefully skips runs when the university website is down. If unreachable for $\ge 60$ minutes, sends a non-spammy admin alert, and automatically announces service recovery with total downtime calculated when online.
 - 🔀 **Independent Channel State:** Dedicated delivery columns (`tg_*` and `fb_*`) in Cloudflare D1 ensure rate limits, transient errors, or cooldowns on one platform never delay deliveries on the other.
 - 🛡️ **Empty-Database Cold-Start Guard:** Automatically detects fresh database initialization or D1 resets; if D1 is empty and notices are found ($\ge 10$), it silently seeds the archive without flooding Telegram subscribers or Facebook feeds.
 - 🔍 **Intelligent Content Hashing:** Uses cryptographic SHA-256 signatures across titles, descriptions, bodies, and attachment sets to detect both newly issued notices and updates to existing entries.
@@ -55,13 +59,14 @@ By running as a serverless Rust Worker on Cloudflare's global edge network, the 
   - **Priority A:** Brand-new notices discovered on page 1.
   - **Priority B:** Unfetched detail pages, mojibake repair candidates, or notices whose listing title/description changed.
   - **Priority C:** Rolling round-robin rotation (oldest `detail_checked_at` first) to continuously monitor older visible notices for retroactive updates.
-- 🖼️ **Attachment-First Delivery for Image Notices:** When notices contain only scanned flyers or PDF banners without descriptive text, the bot automatically surfaces direct image/PDF links in Telegram and Facebook rather than generic placeholders.
+- 🖼️ **Attachment-First Delivery for Image Notices:** When notices contain only scanned flyers or PDF banners without descriptive text, direct asset links are prioritized over placeholder texts across all platforms.
 - 📈 **Meta BUC Rate-Limit Intelligence:** Proactively inspects `X-Business-Use-Case-Usage` and `X-App-Usage` response headers, throttling gracefully when approaching 80% usage thresholds.
 - 🚨 **Automated Meta Error Classification:** Deterministically handles Meta Graph API codes (rate limits, spam blocks, consecutive duplicates, token expiry, and permission errors) with state-backed cooldowns and debounced admin alerts.
 - 🧹 **Word & CMS Control Character Sanitization:** Actively purges invisible Unicode artifacts (soft hyphens `\u{00AD}`, directional marks `\u{200E}`/`\u{200F}`, zero-width joiners `\u{200B}`..=`\u{200D}`, and BOMs `\u{FEFF}`) common in copy-pasted notices.
-- 🚫 **Meaningful Content Filtering:** Intelligently identifies and suppresses CMS boilerplate like `"No description available"` or `"Please click the link for details."` so attachments and clean summaries take priority.
-- 🩹 **Silent Mojibake & Encoding Self-Healing:** Seamlessly detects and repairs legacy UTF-8/Latin-1 double-encoded characters without triggering duplicate "Notice Edited" notifications.
-- 🩺 **Granular Diagnostics & Circuit Breaker:** Categorizes scraper failures into DOM layout shifts, upstream AIUB timeouts, or Worker CPU limits, sending structured diagnostic reports to administrators.
+- 🚫 **Meaningful Content Filtering:** Intelligently identifies and suppresses CMS boilerplate like `"No description available"` or `"Please click the link for details."` so attachments and clean summaries take priority (falling back to a generic prompt only when body and attachments are completely absent).
+- 🩹 **Silent Hash Sync & Mojibake Healing:** Seamlessly detects and repairs legacy UTF-8/Latin-1 double-encoded characters, backfills first-time detail fetches, and re-baselines legacy headers without triggering duplicate "Notice Edited" notifications.
+- 🩺 **Granular Diagnostics & Circuit Breaker:** Categorizes scraper failures into DOM layout shifts, upstream AIUB timeouts, or Worker CPU limits; sends structured diagnostic reports to administrators when $\ge 80\%$ of sampled pages fail validation.
+- 📐 **Selector Coverage Monitoring:** Tracks date and description selector extraction rates on listing page 1, logging proactive alerts if extraction coverage falls below 80% (`MIN_LISTING_DATE_COVERAGE` / `MIN_LISTING_DESC_COVERAGE`).
 - 🚦 **Rate-Limited Delivery Pacing:** Dispatches announcements sequentially with pacing delays (1,000ms for Telegram, 1,500ms for Facebook) to strictly comply with API limits.
 - ⏱️ **CPU Limit Awareness:** Continuously checks execution budget via `is_near_cpu_limit()` to gracefully defer pending tasks to subsequent runs before edge quotas expire.
 - 📊 **Automated Scraper Benchmarking:** Validates parser throughput and coverage against 500 live notices on every version release.
@@ -78,8 +83,9 @@ flowchart TD
 
     subgraph Worker ["🦀 Rust Cloudflare Worker (WASM)"]
         Scraper["HTML Scraper & Parser<br/>tl DOM Engine"]
+        OutageTracker["Outage & Recovery Tracker<br/>60-min Threshold"]
         Reconciler["State Reconciler &<br/>SHA-256 Differ"]
-        TgDispatcher["Telegram Pacer &<br/>Circuit Breaker"]
+        TgDispatcher["Telegram Pacer &<br/>Retry Handler"]
         FbDispatcher["Facebook Dispatcher &<br/>BUC Rate Limiter"]
     end
 
@@ -96,20 +102,23 @@ flowchart TD
     subgraph Delivery ["📢 Channels & Audiences"]
         TgChannel["Telegram Channel<br/>@aiubnotice"]
         FbPage["Facebook Page<br/>aiubnotice"]
-        Admin["Telegram Admin Chat<br/>Diagnostics & Cooldown Alerts"]
+        Admin["Telegram Admin Chat<br/>Outages, Diagnostics & Auth Alerts"]
     end
 
     Cron -->|Triggers scheduled check| Scraper
     Scraper -->|Fetches latest notices| AIUB
+    Scraper -.->|Site down or timing out| OutageTracker
+    OutageTracker <-->|Tracks downtime in app_state| D1
+    OutageTracker -.->|Outage over 60m or recovery alert| Admin
     Scraper -->|Extracts metadata & links| Reconciler
     Reconciler <-->|Reads & writes dual delivery state| D1
     Reconciler -->|Queues Telegram deliveries| TgDispatcher
     Reconciler -->|Queues Facebook deliveries| FbDispatcher
-    TgDispatcher -->|Dispatches with 1s pacing| TelegramAPI
+    TgDispatcher -->|Dispatches with 1s pacing & retries| TelegramAPI
     TelegramAPI -->|Broadcasts notice alerts| TgChannel
     FbDispatcher -->|Posts status update with 1.5s pacing| MetaGraph
     MetaGraph -->|Publishes feed posts| FbPage
-    TgDispatcher -.->|DOM drift & scraper alerts| Admin
+    Scraper -.->|DOM drift & validation alerts| Admin
     FbDispatcher -.->|Auth & cooldown alerts| Admin
 ```
 
@@ -121,10 +130,11 @@ flowchart TD
 | :--- | :--- | :--- |
 | **Language** | [Rust](https://www.rust-lang.org/) (Edition 2021) | Core application logic, type safety, and memory management |
 | **Target Runtime** | [Cloudflare Workers](https://workers.cloudflare.com/) (`wasm32`) | Serverless WebAssembly runtime executing on Cloudflare edge |
+| **Worker SDK** | [`worker`](https://crates.io/crates/worker) (v0.9.0) | Cloudflare Workers Rust SDK with D1 database binding support |
 | **Database** | [Cloudflare D1](https://developers.cloudflare.com/d1/) | Serverless edge SQLite database with session consistency |
 | **Parser** | [`tl`](https://crates.io/crates/tl) (v0.7.8) | High-performance, zero-allocation native HTML/DOM parser |
 | **HTML Sanitizer** | [`html-escape`](https://crates.io/crates/html-escape) (v0.3) | Entity decoding and invisible character stripping |
-| **Hashing** | [`sha2`](https://crates.io/crates/sha2) (v0.11) & [`hex`](https://crates.io/crates/hex) | Cryptographic SHA-256 state differencing |
+| **Hashing** | [`sha2`](https://crates.io/crates/sha2) (v0.11) & [`hex`](https://crates.io/crates/hex) (v0.4) | Cryptographic SHA-256 state differencing |
 | **APIs** | Telegram Bot API & Meta Graph API (v27.0) | Direct edge-to-channel communication over HTTPS |
 | **Build & Deploy** | [`wrangler`](https://developers.cloudflare.com/workers/wrangler/) & [`worker-build`](https://crates.io/crates/worker-build) | Cloudflare developer tooling with panic unwinding support |
 | **CI / CD** | GitHub Actions | Automated formatting, Clippy lints, unit testing, and chained deployment |
@@ -157,7 +167,7 @@ All secrets are managed via Cloudflare Workers Secrets and injected at runtime:
 | :--- | :---: | :---: | :--- |
 | `TELEGRAM_BOT_API_KEY` | Secret | **Yes** | Telegram Bot API authorization token generated by [@BotFather](https://t.me/BotFather). |
 | `TELEGRAM_CHAT_ID` | Secret | **Yes** | Target channel username (`@aiubnotice`) or numerical chat ID. |
-| `TELEGRAM_ADMIN_CHAT_ID` | Secret | *Optional* | Telegram numerical user ID to receive critical operational alerts (e.g. DOM drift, Meta auth). |
+| `TELEGRAM_ADMIN_CHAT_ID` | Secret | *Optional* | Telegram numerical user ID to receive critical operational alerts (e.g. outages, DOM drift, Meta auth). |
 | `FACEBOOK_PAGE_ID` | Secret | *Optional* | Facebook Page ID (e.g. `1234567890`) for broadcasting notices to Facebook. |
 | `FACEBOOK_PAGE_ACCESS_TOKEN` | Secret | *Optional* | Permanent Page Access Token for Graph API v27.0 `/{page-id}/feed` publishing. |
 
@@ -376,7 +386,7 @@ The repository includes an automated release workflow (`.github/workflows/releas
 
 ## 💬 Message Format & Sample Output
 
-All visible announcements use a **unified notice message format** regardless of delivery platform. While each platform constructs its own API transport request (e.g. Telegram POST `{"chat_id": ..., "text": ...}` with `disable_web_page_preview: true`, Facebook POST `{"message": ...}` to Graph API feed), the visible text read by students is guaranteed to be 100% identical and defensively capped at 4,096 characters (`UNIFIED_MAX_MESSAGE_LEN`).
+All visible announcements use a **unified notice message format** across Telegram and Facebook (`UNIFIED_MAX_MESSAGE_LEN = 4096`). While each platform constructs its own API transport payload (e.g. Telegram POST `{"chat_id": ..., "text": ...}` with `disable_web_page_preview: true`, Facebook POST `{"message": ...}` to Graph API feed), the visible message text read by students is guaranteed to be 100% identical.
 
 ### 1. Standard Notice with Attachments & Body Text
 Surfaces title, date, body, all attachment links (PDFs/images), and the notice URL:
@@ -419,7 +429,18 @@ https://www.aiub.edu/Files/Uploads/webp/notice-mba-waivers.webp
 https://www.aiub.edu/category/notices/mba-course-waiver-announcements
 ```
 
-### 4. Operational Admin Alert (DOM Drift & Diagnostics)
+### 4. Upstream Outage & Recovery Alerts
+Dispatched to the Telegram admin chat when the university site is continuously unreachable for over 60 minutes, followed by an automatic recovery notice once the portal restores:
+
+```text
+⚠️ AIUB Notice Checker: AIUB website has been unreachable for 1 hour 15 minutes. Notice checks are paused until the site recovers.
+```
+
+```text
+✅ AIUB Notice Checker: AIUB website is back online after a total outage of 1 hour 45 minutes. Notice checking has resumed.
+```
+
+### 5. Operational Admin Alert (DOM Drift & Diagnostics)
 Dispatched to the Telegram admin chat when scraper validation or Meta Graph API issues arise:
 
 ```text
@@ -442,19 +463,28 @@ Failed URLs:
 
 ## 🩺 Observability & Resilience
 
-- **Distributed Traces:** Employs Cloudflare Workers Tracing with named span instrumentation (`fetch_listing`, `load_existing_from_d1`, `select_detail_targets`, `fetch_detail_pages`, `d1_batch_upsert`, `dispatch_telegram_notifications`, `dispatch_facebook_notifications`).
-- **Circuit Breaker:** If sampled detail pages fail parsing validation at a rate $\ge 80\%$ (minimum 4 samples), the Worker aborts state modification and alerts the admin chat with full diagnostics.
+- **Distributed Traces:** Employs Cloudflare Workers Tracing with a root span (`scheduled_notice_check`) and named child span instrumentation (`fetch_listing`, `load_existing_from_d1`, `select_detail_targets`, `fetch_detail_pages`, `d1_batch_upsert`, `dispatch_telegram_notifications`, `dispatch_facebook_notifications`).
+- **Circuit Breaker & Fallback Guard:** If sampled detail pages fail validation at a rate $\ge 80\%$ (minimum 4 samples), the Worker dispatches a diagnostic alert to `TELEGRAM_ADMIN_CHAT_ID` identifying whether failures stem from DOM shifts or upstream timeouts. It preserves previously cached details in D1, places failed targets on a 30-minute cooldown, and prevents corrupt state overwrites.
+- **Empty Listing Layout Shift Guard:** If the listing page responds with HTTP 200 but 0 notices are parsed, the Worker immediately aborts execution and dispatches an urgent alert to `TELEGRAM_ADMIN_CHAT_ID`, preventing accidental clearing or corrupted state.
+- **Listing Selector Coverage Monitoring:** Continuously evaluates date and description selector coverage across discovered listing items; logs warning telemetry if either metric drops below 80% (`MIN_LISTING_DATE_COVERAGE = 0.8`, `MIN_LISTING_DESC_COVERAGE = 0.8`).
+- **AIUB Outage & Recovery Circuit:**
+  - If fetching the listing page fails due to university server downtime (HTTP 5xx, timeouts, or network errors), the run is gracefully skipped without logging fatal error spans.
+  - Outage start is recorded in `app_state` (`aiub_down_since`).
+  - If continuously unreachable for $\ge 60$ minutes (`AIUB_OUTAGE_ALERT_THRESHOLD_MINS = 60`), a single alert is sent to `TELEGRAM_ADMIN_CHAT_ID` (`aiub_outage_alerted = "true"`).
+  - When AIUB recovers, the worker calculates total downtime (`format_duration_human()`), notifies the admin chat, and atomically deletes outage keys (`delete_app_state_keys`).
 - **HTTP Fetch Guards:** Every outbound HTTP request is guarded by:
   - 15-second `AbortController` timeout (`HTTP_TIMEOUT_MS = 15_000`).
   - Response payload cap of 2 MB (`MAX_HTML_BYTES = 2 * 1024 * 1024`) to prevent edge out-of-memory errors.
   - Manual redirect validation capped at 5 hops (`MAX_REDIRECTS = 5`).
-  - Strict host enforcement ensuring requests remain bounded to `www.aiub.edu`.
+  - URL length restriction capped at 2,048 characters (`MAX_URL_LENGTH = 2048`).
+  - Strict host enforcement ensuring requests remain bounded to `www.aiub.edu` (third-party domains permitted only for direct attachment assets).
 - **Detail Retry Cooldown:** Failed detail page fetches enter a 30-minute cooldown (`DETAIL_RETRY_COOLDOWN_MINUTES = 30`) to avoid wasting cycle quotas on broken or timing-out URLs.
 - **Admin Alert Debouncing:** Facebook operational alerts sent to `TELEGRAM_ADMIN_CHAT_ID` are debounced to at most once per 6 hours per error category (`FACEBOOK_ADMIN_ALERT_DEBOUNCE_HOURS = 6`).
-- **Backpressure Protection:** In each 5-minute cycle:
+- **Backpressure Protection & Pacing:** In each 5-minute cycle:
   - Detail page fetching is capped at `MAX_DETAIL_FETCHES_PER_RUN = 5` with concurrency set to 3.
-  - Telegram broadcasts are paced at 1,000ms intervals (max 10 per run).
-  - Facebook broadcasts are paced at 1,500ms intervals (max 5 per run).
+  - Telegram broadcasts are paced at 1,000ms intervals (max 10 per run). On HTTP 429 rate limits with `retry_after <= 10s`, the Worker retries inline up to 2 times; longer backoffs defer remaining notices to the next run.
+  - Facebook broadcasts are paced at 1,500ms intervals (max 5 per run) with proactive BUC throttling and deterministic Meta error handling.
+  - Database queries and batch upserts are chunked into 50-item batches (`D1_BIND_CHUNK_SIZE = 50`) to strictly avoid SQLite parameter limit errors.
 - **Log Aggregation:** View live tail logs using Wrangler:
   ```bash
   npx wrangler tail
@@ -473,7 +503,7 @@ Follow the automated feeds directly on social platforms:
 
 ## 🧪 Testing & Quality Assurance
 
-The codebase includes an extensive test suite (`src/tests.rs`) covering parser regressions, date parsing, HTML entity sanitization, Unicode control character stripping, Meta Graph API classification, BUC rate-limit parsing, and D1 metric assertions:
+The codebase includes an extensive test suite (`src/tests.rs`) covering parser regressions, date parsing, HTML entity sanitization, Unicode control character stripping, Meta Graph API classification, BUC rate-limit parsing, outage detection & recovery, and D1 metric assertions:
 
 ```bash
 # Check formatting
@@ -482,7 +512,7 @@ cargo fmt --check
 # Run Clippy with zero-warning tolerance
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Execute unit and integration tests (109 tests)
+# Execute unit and integration tests (116 tests)
 cargo test --all-features
 
 # Verify WebAssembly compilation target
@@ -503,7 +533,7 @@ aiub-notice-checker/
 │       ├── dependency-review.yml      # PR dependency review action
 │       ├── deploy.yml                 # Chained deployment: runs after test.yml succeeds
 │       ├── release.yml                # Automated version bump, 500-notice benchmark, and GitHub Release
-│       └── test.yml                   # CI pipeline: fmt, clippy, 109 unit tests, wasm check
+│       └── test.yml                   # CI pipeline: fmt, clippy, 116 unit tests, wasm check
 ├── migrations/
 │   ├── 0001_init.sql                  # Initial schema and indexes
 │   └── 0002_facebook_and_tg_rename.sql # Facebook tracking columns, tg_ rename, and flood backfill
@@ -512,14 +542,14 @@ aiub-notice-checker/
 ├── src/
 │   ├── bin/
 │   │   └── benchmark.rs               # Standalone binary for 500-notice scraper benchmarking
-│   ├── config.rs                      # Constants, limits, tuning thresholds, and secrets
-│   ├── db.rs                          # D1 query builders, lightweight updates, dual-channel state
+│   ├── config.rs                      # Constants, limits, outage thresholds, and secrets
+│   ├── db.rs                          # D1 query builders, lightweight updates, dual-channel state, atomic deletions
 │   ├── facebook.rs                    # Meta Graph API client, BUC rate-limiting, and error classifier
-│   ├── lib.rs                         # Worker entrypoint, cron dispatcher, diagnostics & dual dispatch
+│   ├── lib.rs                         # Worker entrypoint, cron dispatcher, outage detection & dual dispatch
 │   ├── models.rs                      # Notice data models, hashing, and unified cross-platform message formatter
 │   ├── scraper.rs                     # HTML fetching, redirect handling, and tl DOM parsing
 │   ├── telegram.rs                    # Telegram Bot API client, rate-limit handler, and retries
-│   ├── tests.rs                       # Comprehensive unit and regression test suite (109 tests)
+│   ├── tests.rs                       # Comprehensive unit and regression test suite (116 tests)
 │   └── version.rs                     # Single-digit rolling semver rollover calculation logic
 ├── Cargo.toml                         # Rust crate manifest, dependencies, and release profiles
 ├── LICENSE                            # MIT License

@@ -921,12 +921,17 @@ mod model_tests {
         let fb_msg = format_facebook_message(&notice, false);
 
         // Crucial requirement: identical output across all platforms
-        assert_eq!(msg, fb_msg, "Telegram and Facebook messages must be identical");
+        assert_eq!(
+            msg, fb_msg,
+            "Telegram and Facebook messages must be identical"
+        );
 
         // Verify all parts are present in the exact unified structure
         assert!(msg.contains("Seat Plan for Final-Term Exams of Fall 2025-26"));
         assert!(msg.contains("Date: 21 Nov 2026"));
-        assert!(msg.contains("Please contact Exam Control Room if your name or course is not in the list."));
+        assert!(msg.contains(
+            "Please contact Exam Control Room if your name or course is not in the list."
+        ));
         assert!(msg.contains("https://www.aiub.edu/Files/Uploads/day-6---slot-1(6).pdf"));
         assert!(msg.contains("https://www.aiub.edu/Files/Uploads/day-6---slot-2(6).pdf"));
         assert!(msg.ends_with("https://www.aiub.edu/seat-plan-for-final-term-exams-of-fall-2025-26--only-for-llb-and-bpharm--day-6--nov-22-2026--sunday-"));
@@ -1155,7 +1160,8 @@ mod lib_tests {
             format!("[Listing Fetch Skipped] AIUB listing page unreachable: {timeout_err}. Skipping this run.")
         );
 
-        let status_err = "HTTP 502 when fetching https://www.aiub.edu/category/notices?pageNo=1&pageSize=50";
+        let status_err =
+            "HTTP 502 when fetching https://www.aiub.edu/category/notices?pageNo=1&pageSize=50";
         let msg_status = format_listing_skip_message(status_err);
         assert!(msg_status.starts_with("[Listing Fetch Skipped]"));
         assert!(msg_status.contains("HTTP 502"));

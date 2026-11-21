@@ -21,7 +21,7 @@ mod tests;
 pub mod version;
 
 use config::{
-    Secrets, AIUB_OUTAGE_ALERT_THRESHOLD_MINS, AIUB_OUTAGE_ALERTED_KEY, AIUB_OUTAGE_DOWN_SINCE_KEY,
+    Secrets, AIUB_OUTAGE_ALERTED_KEY, AIUB_OUTAGE_ALERT_THRESHOLD_MINS, AIUB_OUTAGE_DOWN_SINCE_KEY,
     DETAIL_FAILURE_MIN_SAMPLE, DETAIL_FAILURE_RATIO, DETAIL_RETRY_COOLDOWN_MINUTES,
     FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS, MAX_DETAIL_FETCHES_PER_RUN, MAX_FACEBOOK_SENDS_PER_RUN,
     MAX_TELEGRAM_SENDS_PER_RUN, MIN_LISTING_DATE_COVERAGE, MIN_LISTING_DESC_COVERAGE,
@@ -112,10 +112,18 @@ pub fn format_duration_human(duration: Duration) -> String {
         parts.push(format!("{} day{}", days, if days == 1 { "" } else { "s" }));
     }
     if hours > 0 {
-        parts.push(format!("{} hour{}", hours, if hours == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{} hour{}",
+            hours,
+            if hours == 1 { "" } else { "s" }
+        ));
     }
     if minutes > 0 {
-        parts.push(format!("{} minute{}", minutes, if minutes == 1 { "" } else { "s" }));
+        parts.push(format!(
+            "{} minute{}",
+            minutes,
+            if minutes == 1 { "" } else { "s" }
+        ));
     }
 
     if parts.is_empty() {
@@ -238,28 +246,29 @@ async fn run(env: &Env) -> worker::Result<()> {
     let mut total_d1 = D1Metrics::default();
 
     // 1. Fetch the latest notices on listing page 1.
-    let listing_notices: Option<Vec<Notice>> = enter_span_async("fetch_listing", |span| async move {
-        let listing_url = scraper::listing_page_url(1);
-        span.set_attribute("url", listing_url.as_str());
-        let html = match scraper::fetch_html(&listing_url).await {
-            Ok(h) => h,
-            Err(err) => {
-                let err_msg = err.to_string();
-                console_warn!("{}", format_listing_skip_message(&err_msg));
-                span.set_attribute("upstream_available", "false");
-                span.set_attribute("skip_reason", err_msg.as_str());
-                span.set_status(SpanStatus::Ok);
-                return Ok::<Option<Vec<Notice>>, worker::Error>(None);
-            }
-        };
-        span.set_attribute("upstream_available", "true");
-        let parsed = scraper::parse_listing_html(&html);
-        span.set_attribute("notices_found", parsed.len() as i64);
-        span.set_attribute("html_bytes", html.len() as i64);
-        span.set_status(SpanStatus::Ok);
-        Ok::<Option<Vec<Notice>>, worker::Error>(Some(parsed))
-    })
-    .await?;
+    let listing_notices: Option<Vec<Notice>> =
+        enter_span_async("fetch_listing", |span| async move {
+            let listing_url = scraper::listing_page_url(1);
+            span.set_attribute("url", listing_url.as_str());
+            let html = match scraper::fetch_html(&listing_url).await {
+                Ok(h) => h,
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    console_warn!("{}", format_listing_skip_message(&err_msg));
+                    span.set_attribute("upstream_available", "false");
+                    span.set_attribute("skip_reason", err_msg.as_str());
+                    span.set_status(SpanStatus::Ok);
+                    return Ok::<Option<Vec<Notice>>, worker::Error>(None);
+                }
+            };
+            span.set_attribute("upstream_available", "true");
+            let parsed = scraper::parse_listing_html(&html);
+            span.set_attribute("notices_found", parsed.len() as i64);
+            span.set_attribute("html_bytes", html.len() as i64);
+            span.set_status(SpanStatus::Ok);
+            Ok::<Option<Vec<Notice>>, worker::Error>(Some(parsed))
+        })
+        .await?;
 
     let Some(listing_notices) = listing_notices else {
         if let Err(err) = handle_upstream_outage(&database, &session, &secrets, Utc::now()).await {
