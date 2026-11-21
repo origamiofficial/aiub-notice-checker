@@ -1726,3 +1726,27 @@ mod facebook_tests {
         assert!(fb_edited, "Facebook must trigger for edited notice");
     }
 }
+
+#[cfg(test)]
+mod db_tests {
+    #[test]
+    fn lightweight_detail_update_sql_preserves_detail_fetched_at() {
+        let db_src = include_str!("db.rs");
+        assert!(
+            db_src.contains("detail_fetched_at = COALESCE(detail_fetched_at, ?1)"),
+            "build_lightweight_detail_update must use COALESCE(detail_fetched_at, ?1)"
+        );
+        assert!(
+            !db_src.contains("detail_fetched_at = COALESCE(?1, detail_fetched_at)"),
+            "Inverted COALESCE(?1, detail_fetched_at) must not be present"
+        );
+        assert!(
+            db_src.contains("tg_sent_at=COALESCE(tg_sent_at, ?1)"),
+            "tg_sent_at must use COALESCE(tg_sent_at, ?1)"
+        );
+        assert!(
+            db_src.contains("fb_sent_at=COALESCE(fb_sent_at, ?1)"),
+            "fb_sent_at must use COALESCE(fb_sent_at, ?1)"
+        );
+    }
+}

@@ -160,7 +160,7 @@ pub fn build_lightweight_detail_update(
         query!(
             db,
             "UPDATE notices SET last_seen_at = ?1, detail_checked_at = ?1, \
-             detail_fetched_at = COALESCE(?1, detail_fetched_at) WHERE link = ?2",
+             detail_fetched_at = COALESCE(detail_fetched_at, ?1) WHERE link = ?2",
             &now,
             link,
         )
