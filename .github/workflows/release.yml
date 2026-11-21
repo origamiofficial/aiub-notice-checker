@@ -248,27 +248,43 @@ jobs:
             worker-bundle.zip
           retention-days: 90
 
-      # ── Commit version bump & create tag ─────────────────────────
-      - name: Commit version bump
+      # ── Commit version bump & create tag (atomic push with retry) ─
+      - name: Commit version bump & create tag
         if: steps.check_changes.outputs.has_worker_changes == 'true'
         run: |
           NEW_VERSION="${{ steps.version.outputs.version }}"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add Cargo.toml Cargo.lock
+
+          PUSH_ARGS=()
           if git diff --cached --quiet; then
             echo "No version changes to commit"
           else
             git commit -m "chore(release): v${NEW_VERSION} [skip ci]"
-            git push origin main
+            PUSH_ARGS+=("main")
           fi
 
-      - name: Create Git tag
-        if: steps.check_changes.outputs.has_worker_changes == 'true'
-        run: |
-          NEW_VERSION="${{ steps.version.outputs.version }}"
-          git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}"
-          git push origin "v${NEW_VERSION}"
+          # Create annotated release tag
+          git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}" -f
+          PUSH_ARGS+=("v${NEW_VERSION}")
+
+          # Push commit and tag together with retry loop
+          MAX_RETRIES=3
+          RETRY_DELAY=5
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            echo "Attempt $attempt of $MAX_RETRIES: Pushing (${PUSH_ARGS[*]})..."
+            if git push --no-thin origin "${PUSH_ARGS[@]}"; then
+              echo "✓ Push successful"
+              break
+            fi
+            if [ "$attempt" -eq "$MAX_RETRIES" ]; then
+              echo "ERROR: Failed to push after $MAX_RETRIES attempts" >&2
+              exit 1
+            fi
+            echo "Push failed (transient remote unpack error). Retrying in ${RETRY_DELAY}s..."
+            sleep $RETRY_DELAY
+          done
 
       # ── Create GitHub Release with compiled worker & benchmark ───
       - name: Generate release notes
