@@ -215,6 +215,22 @@ pub async fn mark_tg_notification_attempt(
     execute_batch(session, vec![stmt]).await
 }
 
+/// Builds an UPDATE statement marking a notice as notified via Telegram.
+pub fn build_tg_notified_statement(
+    db: &D1Database,
+    link: &str,
+    content_hash: &str,
+    now: &str,
+) -> Result<D1PreparedStatement> {
+    query!(
+        db,
+        "UPDATE notices SET tg_sent_at=COALESCE(tg_sent_at, ?1), tg_last_notified_hash=?2 WHERE link=?3",
+        now,
+        content_hash,
+        link,
+    )
+}
+
 /// Marks a notice as notified via Telegram for the given `content_hash`.
 pub async fn mark_tg_notified(
     db: &D1Database,
@@ -223,13 +239,7 @@ pub async fn mark_tg_notified(
     content_hash: &str,
 ) -> Result<D1Metrics> {
     let now = Utc::now().to_rfc3339();
-    let stmt = query!(
-        db,
-        "UPDATE notices SET tg_sent_at=COALESCE(tg_sent_at, ?1), tg_last_notified_hash=?2 WHERE link=?3",
-        &now,
-        content_hash,
-        link,
-    )?;
+    let stmt = build_tg_notified_statement(db, link, content_hash, &now)?;
     execute_batch(session, vec![stmt]).await
 }
 
@@ -289,19 +299,29 @@ pub async fn mark_fb_duplicate_handled(
     execute_batch(session, vec![stmt]).await
 }
 
+/// Builds an UPDATE statement for Facebook silent hash sync.
+pub fn build_fb_hash_sync_statement(
+    db: &D1Database,
+    link: &str,
+    content_hash: &str,
+) -> Result<D1PreparedStatement> {
+    query!(
+        db,
+        "UPDATE notices SET fb_last_notified_hash=?1 WHERE link=?2 AND fb_sent_at IS NOT NULL",
+        content_hash,
+        link,
+    )
+}
+
 /// Silent hash sync for Facebook (keeps fb_last_notified_hash in sync without re-posting).
+#[allow(dead_code)]
 pub async fn mark_fb_hash_sync(
     db: &D1Database,
     session: &D1DatabaseSession,
     link: &str,
     content_hash: &str,
 ) -> Result<D1Metrics> {
-    let stmt = query!(
-        db,
-        "UPDATE notices SET fb_last_notified_hash=?1 WHERE link=?2 AND fb_sent_at IS NOT NULL",
-        content_hash,
-        link,
-    )?;
+    let stmt = build_fb_hash_sync_statement(db, link, content_hash)?;
     execute_batch(session, vec![stmt]).await
 }
 

@@ -178,8 +178,12 @@ async fn handle_upstream_outage(
         if !already_alerted {
             let duration_str = format_duration_human(elapsed);
             let alert_msg = format_outage_alert_message(&duration_str);
-            let _ = telegram::send_admin_alert(secrets, &alert_msg).await;
-            let _ = db::set_app_state(db, session, AIUB_OUTAGE_ALERTED_KEY, "true").await;
+            let alert_sent = telegram::send_admin_alert(secrets, &alert_msg)
+                .await
+                .unwrap_or(false);
+            if alert_sent || secrets.telegram_admin_chat_id.is_none() {
+                let _ = db::set_app_state(db, session, AIUB_OUTAGE_ALERTED_KEY, "true").await;
+            }
         }
     }
 
@@ -389,7 +393,7 @@ async fn run(env: &Env) -> worker::Result<()> {
                     || has_utf8_mojibake(&row.description)
                     || has_utf8_mojibake(&row.body_text);
                 let listing_changed = !titles_equivalent_clean(&item.title, &row.title)
-                    || clean_mojibake(&row.description) != clean_mojibake(&item.description);
+                    || !clean_mojibake_eq(&row.description, &item.description);
                 let needs_backfill =
                     row.detail_fetched_at.is_none() && row.detail_due(&retry_cutoff_iso);
 
@@ -641,8 +645,7 @@ async fn run(env: &Env) -> worker::Result<()> {
                 }
                 if let Some(row) = existing {
                     if !detail.legacy_sticky_body.is_empty()
-                        && clean_mojibake(row.body_text.trim())
-                            == clean_mojibake(detail.legacy_sticky_body.trim())
+                        && clean_mojibake_eq(row.body_text.trim(), detail.legacy_sticky_body.trim())
                     {
                         matched_legacy_sticky = true;
                     }
@@ -704,13 +707,13 @@ async fn run(env: &Env) -> worker::Result<()> {
             if tg_needs_sync || fb_needs_sync {
                 let listing_unchanged = titles_equivalent_clean(&listing_title, &row.title)
                     && titles_equivalent_clean(&item.title, &row.title)
-                    && clean_mojibake(&row.description) == clean_mojibake(&item.description);
+                    && clean_mojibake_eq(&row.description, &item.description);
 
                 let first_detail_backfill =
                     row.detail_fetched_at.is_none() && item.detail_fetched && listing_unchanged;
 
                 let metadata_or_mojibake_backfill = listing_unchanged
-                    && clean_mojibake(&row.body_text) == clean_mojibake(&item.body_text)
+                    && clean_mojibake_eq(&row.body_text, &item.body_text)
                     && row.attachments_json == item.attachments_json();
 
                 let sticky_header_rebaseline =
@@ -856,15 +859,17 @@ async fn run(env: &Env) -> worker::Result<()> {
         total_d1.rows_written += seed_metrics.rows_written;
     }
 
-    // Apply silent hash updates after the batch upsert completes.
-    for (url, hash) in silent_sync_links {
-        let m = db::mark_tg_notified(&database, &session, &url, &hash).await?;
-        total_d1.rows_read += m.rows_read;
-        total_d1.rows_written += m.rows_written;
-
-        let m_fb = db::mark_fb_hash_sync(&database, &session, &url, &hash).await?;
-        total_d1.rows_read += m_fb.rows_read;
-        total_d1.rows_written += m_fb.rows_written;
+    // Apply silent hash updates after the batch upsert completes in a single batch.
+    if !silent_sync_links.is_empty() {
+        let now = Utc::now().to_rfc3339();
+        let mut sync_stmts = Vec::with_capacity(silent_sync_links.len() * 2);
+        for (url, hash) in &silent_sync_links {
+            sync_stmts.push(db::build_tg_notified_statement(&database, url, hash, &now)?);
+            sync_stmts.push(db::build_fb_hash_sync_statement(&database, url, hash)?);
+        }
+        let sync_metrics = db::execute_batch(&session, sync_stmts).await?;
+        total_d1.rows_read += sync_metrics.rows_read;
+        total_d1.rows_written += sync_metrics.rows_written;
     }
 
     // 7. Dispatch queued Telegram notifications (oldest-first).
@@ -959,7 +964,8 @@ async fn run(env: &Env) -> worker::Result<()> {
                 enter_span_async("dispatch_facebook_notifications", |span| async move {
                     span.set_attribute("queued", fb_notifications.len() as i64);
 
-                    let (paused, pause_reason) = facebook::is_facebook_paused(session_ref).await?;
+                    let (paused, pause_reason) =
+                        facebook::is_facebook_paused(db_ref, session_ref).await?;
                     if paused {
                         console_log!(
                             "[Facebook Dispatch Skipped] {}",
@@ -1212,8 +1218,25 @@ fn clean_mojibake(s: &str) -> String {
     out
 }
 
+/// Efficiently checks if two strings are equivalent after stripping mojibake and non-alphanumeric chars,
+/// without allocating any new heap Strings when no mojibake is present.
+fn clean_mojibake_eq(a: &str, b: &str) -> bool {
+    if !has_utf8_mojibake(a) && !has_utf8_mojibake(b) {
+        let it_a = a
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .flat_map(|c| c.to_lowercase());
+        let it_b = b
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .flat_map(|c| c.to_lowercase());
+        return it_a.eq(it_b);
+    }
+    clean_mojibake(a) == clean_mojibake(b)
+}
+
 fn titles_equivalent_clean(listing_title: &str, cached_title: &str) -> bool {
-    if clean_mojibake(listing_title) == clean_mojibake(cached_title) {
+    if clean_mojibake_eq(listing_title, cached_title) {
         return true;
     }
     titles_equivalent(listing_title, cached_title)

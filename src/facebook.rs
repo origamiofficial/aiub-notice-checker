@@ -257,6 +257,14 @@ pub async fn publish_post(
                 .flatten()
                 .as_deref()
                 .and_then(parse_buc_usage_header)
+        })
+        .or_else(|| {
+            resp.headers()
+                .get("X-Page-Usage")
+                .ok()
+                .flatten()
+                .as_deref()
+                .and_then(parse_buc_usage_header)
         });
 
     if (200..300).contains(&status) {
@@ -289,6 +297,12 @@ pub async fn publish_post(
     if status >= 500 && error_code == 0 {
         return Ok(FacebookPostResult::TransientFailure {
             message: format!("Meta HTTP {status}: {raw_body}"),
+        });
+    }
+
+    if status == 401 && error_code == 0 {
+        return Ok(FacebookPostResult::AuthError {
+            message: format!("Meta HTTP 401 Unauthorized: {raw_body}"),
         });
     }
 
@@ -329,7 +343,10 @@ pub async fn publish_post(
 }
 
 /// Checks whether Facebook publishing is temporarily paused due to rate limiting or auth failure.
-pub async fn is_facebook_paused(session: &D1DatabaseSession) -> Result<(bool, Option<String>)> {
+pub async fn is_facebook_paused(
+    db: &D1Database,
+    session: &D1DatabaseSession,
+) -> Result<(bool, Option<String>)> {
     if let Some(reason) = db::get_app_state(session, "fb_auth_paused").await? {
         return Ok((true, Some(format!("Authentication paused: {reason}"))));
     }
@@ -341,6 +358,8 @@ pub async fn is_facebook_paused(session: &D1DatabaseSession) -> Result<(bool, Op
                 true,
                 Some(format!("Rate limit cooldown active until {cooldown_until}")),
             ));
+        } else {
+            let _ = db::delete_app_state(db, session, "fb_cooldown_until").await;
         }
     }
 
@@ -372,9 +391,13 @@ pub async fn send_debounced_fb_admin_alert(
         }
     }
 
-    let _ = telegram::send_admin_alert(secrets, message).await;
-    let now_str = now.to_rfc3339();
-    let _ = db::set_app_state(db, session, &alert_key, &now_str).await;
-    let _ = db::set_app_state(db, session, "fb_last_alert_at", &now_str).await;
+    let alert_sent = telegram::send_admin_alert(secrets, message)
+        .await
+        .unwrap_or(false);
+    if alert_sent || secrets.telegram_admin_chat_id.is_none() {
+        let now_str = now.to_rfc3339();
+        let _ = db::set_app_state(db, session, &alert_key, &now_str).await;
+        let _ = db::set_app_state(db, session, "fb_last_alert_at", &now_str).await;
+    }
     Ok(())
 }

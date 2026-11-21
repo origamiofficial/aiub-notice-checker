@@ -17,20 +17,21 @@ pub struct Notice {
 
 impl Notice {
     pub fn attachments_json(&self) -> String {
-        let mut sorted = self.attachments.clone();
-        sorted.sort();
+        let mut sorted: Vec<&str> = self.attachments.iter().map(|s| s.as_str()).collect();
+        sorted.sort_unstable();
         sorted.dedup();
         serde_json::to_string(&sorted).unwrap_or_else(|_| "[]".to_string())
     }
 
     pub fn content_hash(&self) -> String {
-        let mut sorted_attachments = self.attachments.clone();
-        sorted_attachments.sort();
+        let mut sorted_attachments: Vec<&str> =
+            self.attachments.iter().map(|s| s.as_str()).collect();
+        sorted_attachments.sort_unstable();
         sorted_attachments.dedup();
 
         #[derive(Serialize)]
         struct HashPayload<'a> {
-            attachments: &'a [String],
+            attachments: &'a [&'a str],
             body_text: &'a str,
             description: &'a str,
             link: &'a str,
@@ -109,6 +110,9 @@ pub fn truncate_text(text: &str, limit: usize) -> String {
     let trimmed = text.trim();
     if trimmed.chars().count() <= limit {
         return trimmed.to_string();
+    }
+    if limit <= 3 {
+        return trimmed.chars().take(limit).collect();
     }
     let keep = limit.saturating_sub(3);
     let prefix: String = trimmed.chars().take(keep).collect();
@@ -204,12 +208,17 @@ pub fn format_notice_message(notice: &Notice, edited: bool) -> String {
     let suffix = format!("\n\n{footer}");
     let suffix_chars = suffix.chars().count();
     let header_chars = header.chars().count();
-    let fixed_overhead = header_chars + suffix_chars + 4; // "\n\n" + "\n\n"
+    let fixed_overhead = header_chars + suffix_chars + 2; // "\n\n" between header and body
 
     let available_body_chars = UNIFIED_MAX_MESSAGE_LEN.saturating_sub(fixed_overhead);
     let truncated = if let Some(body) = text_content {
-        let truncated_body = truncate_text(body, available_body_chars.max(10));
-        format!("{header}\n\n{truncated_body}{suffix}")
+        if available_body_chars >= 10 {
+            let truncated_body = truncate_text(body, available_body_chars);
+            format!("{header}\n\n{truncated_body}{suffix}")
+        } else {
+            // Not enough room for body, preserve header and attachments/links
+            format!("{header}{suffix}")
+        }
     } else {
         truncate_text(&full_content, UNIFIED_MAX_MESSAGE_LEN)
     };

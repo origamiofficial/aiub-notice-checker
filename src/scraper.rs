@@ -395,10 +395,7 @@ fn extract_spaced_inline_text(tag: &HTMLTag, parser: &Parser) -> String {
 fn extract_legacy_multiline_text(tag: &HTMLTag, parser: &Parser) -> String {
     let raw_html = tag.inner_html(parser);
     let mut spaced = String::with_capacity(raw_html.len());
-
-    let lower = raw_html.to_ascii_lowercase();
     let bytes = raw_html.as_bytes();
-    let lower_bytes = lower.as_bytes();
     let mut i = 0;
     let mut text_start = 0;
 
@@ -408,10 +405,10 @@ fn extract_legacy_multiline_text(tag: &HTMLTag, parser: &Parser) -> String {
                 if text_start < i {
                     spaced.push_str(&raw_html[text_start..i]);
                 }
-                let tag_slice = &lower_bytes[i..=i + close_rel];
-                if is_ignored_tag_open(tag_slice) {
+                let tag_slice = &bytes[i..=i + close_rel];
+                if let Some(closing_tag) = matching_ignored_closing_tag(tag_slice) {
                     if let Some(end_rel) =
-                        find_closing_ignored_tag(&lower_bytes[i + close_rel + 1..])
+                        find_closing_tag_case_insensitive(&bytes[i + close_rel + 1..], closing_tag)
                     {
                         i = i + close_rel + 1 + end_rel;
                         text_start = i;
@@ -454,9 +451,7 @@ fn extract_legacy_multiline_text(tag: &HTMLTag, parser: &Parser) -> String {
 /// valid UTF-8 `&str` slices (`&raw_html[text_start..i]`), never casting individual bytes to `char`.
 fn strip_tags_with_spaces(raw_html: &str, skip_ignored_blocks: bool) -> String {
     let mut out = String::with_capacity(raw_html.len());
-    let lower = raw_html.to_ascii_lowercase();
     let bytes = raw_html.as_bytes();
-    let lower_bytes = lower.as_bytes();
     let mut i = 0;
     let mut text_start = 0;
 
@@ -466,14 +461,17 @@ fn strip_tags_with_spaces(raw_html: &str, skip_ignored_blocks: bool) -> String {
                 if text_start < i {
                     out.push_str(&raw_html[text_start..i]);
                 }
-                let tag_slice = &lower_bytes[i..=i + close_rel];
-                if skip_ignored_blocks && is_ignored_tag_open(tag_slice) {
-                    if let Some(end_rel) =
-                        find_closing_ignored_tag(&lower_bytes[i + close_rel + 1..])
-                    {
-                        i = i + close_rel + 1 + end_rel;
-                        text_start = i;
-                        continue;
+                let tag_slice = &bytes[i..=i + close_rel];
+                if skip_ignored_blocks {
+                    if let Some(closing_tag) = matching_ignored_closing_tag(tag_slice) {
+                        if let Some(end_rel) = find_closing_tag_case_insensitive(
+                            &bytes[i + close_rel + 1..],
+                            closing_tag,
+                        ) {
+                            i = i + close_rel + 1 + end_rel;
+                            text_start = i;
+                            continue;
+                        }
                     }
                 }
                 out.push(' ');
@@ -666,11 +664,19 @@ fn parse_date_to_iso(raw: &str) -> Option<String> {
     let tokens: Vec<&str> = cleaned.split_whitespace().collect();
     if tokens.len() >= 3 {
         for window in tokens.windows(3) {
-            if let (Ok(day), Some(month), Ok(year)) = (
-                window[0].parse::<u32>(),
-                month_number(window[1]),
-                window[2].parse::<i32>(),
-            ) {
+            let day_opt1 = strip_ordinal(window[0]).parse::<u32>();
+            let month_opt1 = month_number(window[1]);
+            let year_opt1 = window[2].parse::<i32>();
+            if let (Ok(day), Some(month), Ok(year)) = (day_opt1, month_opt1, year_opt1) {
+                if let Some(d) = NaiveDate::from_ymd_opt(year, month, day) {
+                    return Some(d.format("%Y-%m-%d").to_string());
+                }
+            }
+
+            let month_opt2 = month_number(window[0]);
+            let day_opt2 = strip_ordinal(window[1]).parse::<u32>();
+            let year_opt2 = window[2].parse::<i32>();
+            if let (Some(month), Ok(day), Ok(year)) = (month_opt2, day_opt2, year_opt2) {
                 if let Some(d) = NaiveDate::from_ymd_opt(year, month, day) {
                     return Some(d.format("%Y-%m-%d").to_string());
                 }
@@ -678,13 +684,27 @@ fn parse_date_to_iso(raw: &str) -> Option<String> {
         }
     }
 
-    for fmt in ["%Y-%m-%d", "%d %b %Y", "%d %B %Y", "%d-%m-%Y", "%d/%m/%Y"] {
+    for fmt in [
+        "%Y-%m-%d", "%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y", "%d-%m-%Y", "%d/%m/%Y",
+        "%d-%b-%Y", "%d-%B-%Y",
+    ] {
         if let Ok(d) = NaiveDate::parse_from_str(&cleaned, fmt) {
             return Some(d.format("%Y-%m-%d").to_string());
         }
     }
 
     None
+}
+
+fn strip_ordinal(s: &str) -> &str {
+    for suffix in ["st", "nd", "rd", "th", "ST", "ND", "RD", "TH"] {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            if !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit()) {
+                return stripped;
+            }
+        }
+    }
+    s
 }
 
 fn month_number(s: &str) -> Option<u32> {
@@ -806,44 +826,68 @@ pub(crate) fn clean_whitespace(input: &str) -> String {
     out
 }
 
-fn is_ignored_tag_open(tag_slice: &[u8]) -> bool {
-    tag_slice.starts_with(b"<script")
-        || tag_slice.starts_with(b"<style")
-        || tag_slice.starts_with(b"<noscript")
-        || tag_slice.starts_with(b"<template")
+fn matching_ignored_closing_tag(open_tag_slice: &[u8]) -> Option<&'static [u8]> {
+    let stripped = open_tag_slice.strip_prefix(b"<")?;
+    let name_end = stripped
+        .iter()
+        .position(|&b| b == b'>' || b == b'/' || b.is_ascii_whitespace())
+        .unwrap_or(stripped.len());
+    let name = &stripped[..name_end];
+
+    if name.eq_ignore_ascii_case(b"script") {
+        Some(b"</script>")
+    } else if name.eq_ignore_ascii_case(b"style") {
+        Some(b"</style>")
+    } else if name.eq_ignore_ascii_case(b"noscript") {
+        Some(b"</noscript>")
+    } else if name.eq_ignore_ascii_case(b"template") {
+        Some(b"</template>")
+    } else {
+        None
+    }
 }
 
-fn find_closing_ignored_tag(haystack: &[u8]) -> Option<usize> {
-    for target in [
-        b"</script>".as_slice(),
-        b"</style>".as_slice(),
-        b"</noscript>".as_slice(),
-        b"</template>".as_slice(),
-    ] {
-        if let Some(pos) = haystack.windows(target.len()).position(|w| w == target) {
-            return Some(pos + target.len());
-        }
+fn find_closing_tag_case_insensitive(haystack: &[u8], closing_tag: &[u8]) -> Option<usize> {
+    if haystack.len() < closing_tag.len() {
+        return None;
     }
-    None
+    haystack
+        .windows(closing_tag.len())
+        .position(|w| {
+            w.iter()
+                .zip(closing_tag.iter())
+                .all(|(&a, &b)| a.to_ascii_lowercase() == b)
+        })
+        .map(|pos| pos + closing_tag.len())
 }
 
 fn is_block_tag(tag_slice: &[u8]) -> bool {
-    for prefix in [
-        b"<p".as_slice(),
-        b"</p>".as_slice(),
-        b"<br".as_slice(),
-        b"<div".as_slice(),
-        b"</div>".as_slice(),
-        b"<li".as_slice(),
-        b"</li>".as_slice(),
-        b"<tr".as_slice(),
-        b"</tr>".as_slice(),
-        b"<h1".as_slice(),
-        b"<h2".as_slice(),
-        b"<h3".as_slice(),
-        b"<h4".as_slice(),
+    let stripped = if let Some(s) = tag_slice.strip_prefix(b"</") {
+        s
+    } else if let Some(s) = tag_slice.strip_prefix(b"<") {
+        s
+    } else {
+        return false;
+    };
+
+    let name_end = stripped
+        .iter()
+        .position(|&b| b == b'>' || b == b'/' || b.is_ascii_whitespace())
+        .unwrap_or(stripped.len());
+    let name = &stripped[..name_end];
+
+    for block_name in [
+        b"p".as_slice(),
+        b"br".as_slice(),
+        b"div".as_slice(),
+        b"li".as_slice(),
+        b"tr".as_slice(),
+        b"h1".as_slice(),
+        b"h2".as_slice(),
+        b"h3".as_slice(),
+        b"h4".as_slice(),
     ] {
-        if tag_slice.starts_with(prefix) {
+        if name.eq_ignore_ascii_case(block_name) {
             return true;
         }
     }

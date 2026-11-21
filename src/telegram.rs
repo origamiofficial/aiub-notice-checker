@@ -13,10 +13,16 @@ use crate::config::{
 use crate::models::{format_notice_message, Notice};
 
 #[derive(Serialize)]
+struct LinkPreviewOptions {
+    is_disabled: bool,
+}
+
+#[derive(Serialize)]
 struct SendMessagePayload<'a> {
     chat_id: &'a str,
     text: &'a str,
     disable_web_page_preview: bool,
+    link_preview_options: LinkPreviewOptions,
 }
 
 #[derive(Deserialize)]
@@ -59,6 +65,7 @@ async fn send_raw_message(bot_api_key: &str, chat_id: &str, text: &str) -> Resul
         chat_id,
         text,
         disable_web_page_preview: true,
+        link_preview_options: LinkPreviewOptions { is_disabled: true },
     };
 
     let body_json = serde_json::to_string(&payload)
@@ -82,7 +89,12 @@ async fn send_raw_message(bot_api_key: &str, chat_id: &str, text: &str) -> Resul
         let timeout_fut = Delay::from(Duration::from_millis(HTTP_TIMEOUT_MS));
 
         let mut resp = match select(pin!(send_fut), pin!(timeout_fut)).await {
-            Either::Left((res, _)) => res?,
+            Either::Left((res, _)) => match res {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(Error::RustError(redact_token(&e.to_string(), bot_api_key)));
+                }
+            },
             Either::Right(((), _)) => {
                 controller.abort();
                 return Err(Error::RustError(format!(
@@ -128,11 +140,18 @@ async fn send_raw_message(bot_api_key: &str, chat_id: &str, text: &str) -> Resul
             .and_then(|r| r.description)
             .unwrap_or(raw_body);
 
-        return Err(Error::RustError(format!(
-            "Telegram API HTTP {}: {}",
-            status, desc
-        )));
+        let err_msg = format!("Telegram API HTTP {}: {}", status, desc);
+        return Err(Error::RustError(redact_token(&err_msg, bot_api_key)));
     }
 
     Ok(false)
+}
+
+fn redact_token(msg: &str, bot_api_key: &str) -> String {
+    let key = bot_api_key.trim();
+    if key.is_empty() {
+        msg.to_string()
+    } else {
+        msg.replace(key, "[REDACTED]")
+    }
 }

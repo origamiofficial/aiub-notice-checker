@@ -244,6 +244,15 @@ mod scraper_tests {
 
         let notices = parse_listing_html(&html("25 December 2026"));
         assert_eq!(notices[0].published_date, Some("2026-12-25".to_string()));
+
+        let notices = parse_listing_html(&html("November 15, 2026"));
+        assert_eq!(notices[0].published_date, Some("2026-11-15".to_string()));
+
+        let notices = parse_listing_html(&html("15th November 2026"));
+        assert_eq!(notices[0].published_date, Some("2026-11-15".to_string()));
+
+        let notices = parse_listing_html(&html("15-Nov-2026"));
+        assert_eq!(notices[0].published_date, Some("2026-11-15".to_string()));
     }
 
     #[test]
@@ -350,6 +359,30 @@ mod scraper_tests {
         assert!(
             detail.body_text.contains("Visible text"),
             "visible text should remain"
+        );
+    }
+
+    #[test]
+    fn parse_detail_style_before_script_does_not_swallow_middle_text() {
+        let html = r#"
+        <html><body>
+        <div class="notice-page">
+            <div class="question-column">
+                <style>.hidden { display: none; }</style>
+                <p>Crucial middle text that must survive</p>
+                <script>var x = "invisible script content";</script>
+            </div>
+        </div>
+        </body></html>
+        "#;
+        let detail =
+            parse_detail_html(html, "https://www.aiub.edu/notice/test").expect("should parse");
+        assert!(
+            detail
+                .body_text
+                .contains("Crucial middle text that must survive"),
+            "middle text was swallowed between style and script tags! Got: {:?}",
+            detail.body_text
         );
     }
 
@@ -702,6 +735,16 @@ mod model_tests {
     #[test]
     fn truncate_text_trims_whitespace() {
         assert_eq!(truncate_text("  hello  ", 100), "hello");
+    }
+
+    #[test]
+    fn truncate_text_handles_small_limits_without_exceeding() {
+        assert_eq!(truncate_text("Hello", 0), "");
+        assert_eq!(truncate_text("Hello", 1), "H");
+        assert_eq!(truncate_text("Hello", 2), "He");
+        assert_eq!(truncate_text("Hello", 3), "Hel");
+        assert_eq!(truncate_text("Hello", 4), "H...");
+        assert!(truncate_text("Hello", 2).chars().count() <= 2);
     }
 
     #[test]
