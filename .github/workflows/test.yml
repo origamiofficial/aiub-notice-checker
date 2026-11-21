@@ -9,6 +9,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "wrangler.toml"
+      - ".github/workflows/**"
+      - "scripts/**"
   pull_request:
     branches: [main]
     paths:
@@ -17,6 +19,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "wrangler.toml"
+      - ".github/workflows/**"
+      - "scripts/**"
   workflow_dispatch:
 
 permissions:

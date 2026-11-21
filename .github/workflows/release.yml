@@ -5,6 +5,9 @@ on:
     workflows: ["Tests"]
     types: [completed]
     branches: [main]
+  push:
+    tags:
+      - "v[0-9]*"
   workflow_dispatch:
     inputs:
       force:
@@ -12,6 +15,11 @@ on:
         required: false
         default: false
         type: boolean
+      tag:
+        description: "Specific tag/version to release (e.g. v6.2.0)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -25,6 +33,7 @@ jobs:
     name: Version Bump, Benchmark & Release
     if: >-
       github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event != 'pull_request')
     runs-on: ubuntu-latest
@@ -46,17 +55,51 @@ jobs:
       # ── Smart check: only proceed if Worker files changed since last release ──
       - name: Detect Cloudflare Worker changes
         id: check_changes
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           git fetch --tags origin
           LATEST_TAG=$(git tag -l 'v[0-9]*' '[0-9]*' --sort=-v:refname | head -n 1 || true)
           echo "Latest release tag: ${LATEST_TAG:-<none>}"
 
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.force }}" == "true" ]]; then
-            echo "Forced release triggered via workflow_dispatch."
+          # Case 1: Triggered directly by tag push
+          if [[ "${{ github.event_name }}" == "push" && "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
+            TAG_NAME="${GITHUB_REF_NAME}"
+            echo "Triggered directly by tag push: $TAG_NAME"
             echo "has_worker_changes=true" >> "$GITHUB_OUTPUT"
+            echo "existing_tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          # Case 2: Manual tag release requested via workflow_dispatch
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.tag }}" ]]; then
+            INPUT_TAG="${{ github.event.inputs.tag }}"
+            echo "Manual tag release requested: $INPUT_TAG"
+            echo "has_worker_changes=true" >> "$GITHUB_OUTPUT"
+            echo "existing_tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Case 3: Tag exists on origin but has NO published GitHub release (orphaned tag recovery)
+          if [[ -n "$LATEST_TAG" ]]; then
+            if ! gh release view "$LATEST_TAG" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
+              echo "Tag $LATEST_TAG exists on origin but has NO published GitHub release."
+              echo "Recovering orphaned tag and completing release for $LATEST_TAG."
+              echo "has_worker_changes=true" >> "$GITHUB_OUTPUT"
+              echo "existing_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          # Case 4: Forced release via workflow_dispatch
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.force }}" == "true" ]]; then
+            echo "Forced release triggered via workflow_dispatch."
+            echo "has_worker_changes=true" >> "$GITHUB_OUTPUT"
+            echo "existing_tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Case 5: Standard check - diff against latest released tag
           if [[ -n "$LATEST_TAG" ]]; then
             if git diff --quiet "$LATEST_TAG" HEAD -- src/ migrations/ Cargo.toml Cargo.lock wrangler.toml; then
               echo "No Cloudflare Worker files (src/, migrations/, Cargo.toml, Cargo.lock, wrangler.toml) changed since $LATEST_TAG."
@@ -68,6 +111,7 @@ jobs:
 
           echo "Cloudflare Worker changes detected since previous release."
           echo "has_worker_changes=true" >> "$GITHUB_OUTPUT"
+          echo "existing_tag=" >> "$GITHUB_OUTPUT"
 
       # ── Setup toolchains ─────────────────────────────────────────
       - name: Setup Rust stable toolchain
@@ -115,8 +159,23 @@ jobs:
         if: steps.check_changes.outputs.has_worker_changes == 'true'
         id: version
         run: |
-          chmod +x scripts/version-bump.sh
-          scripts/version-bump.sh --apply
+          EXISTING_TAG="${{ steps.check_changes.outputs.existing_tag }}"
+          if [[ -n "$EXISTING_TAG" ]]; then
+            VERSION="${EXISTING_TAG#v}"
+            echo "Releasing existing tag: $EXISTING_TAG (version $VERSION)"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "is_existing_tag=true" >> "$GITHUB_OUTPUT"
+
+            # Determine previous tag for release notes changelog
+            PREV_TAG=$(git tag -l 'v[0-9]*' '[0-9]*' --sort=-v:refname | grep -v "^${EXISTING_TAG}$" | head -n 1 || true)
+            echo "previous_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+            echo "previous_version=${PREV_TAG#v}" >> "$GITHUB_OUTPUT"
+            echo "within_24h=false" >> "$GITHUB_OUTPUT"
+          else
+            chmod +x scripts/version-bump.sh
+            scripts/version-bump.sh --apply
+            echo "is_existing_tag=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Verify no stale version strings
         if: steps.check_changes.outputs.has_worker_changes == 'true'
@@ -250,7 +309,7 @@ jobs:
 
       # ── Commit version bump & create tag (atomic push with retry) ─
       - name: Commit version bump & create tag
-        if: steps.check_changes.outputs.has_worker_changes == 'true'
+        if: steps.check_changes.outputs.has_worker_changes == 'true' && steps.version.outputs.is_existing_tag != 'true'
         run: |
           NEW_VERSION="${{ steps.version.outputs.version }}"
           git config user.name 'github-actions[bot]'
