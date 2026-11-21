@@ -2,7 +2,7 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::config::{FACEBOOK_MAX_MESSAGE_LEN, TELEGRAM_MAX_MESSAGE_LEN};
+use crate::config::UNIFIED_MAX_MESSAGE_LEN;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Notice {
@@ -136,41 +136,17 @@ pub fn is_meaningful_text(text: &str) -> bool {
         && !stripped.eq_ignore_ascii_case("please click the link for details")
 }
 
+/// Formats a notice into the canonical unified plain-text message used across all platforms.
+/// All visible messages delivered to Telegram, Facebook, or future channels are guaranteed
+/// to be identical.
+///
+/// Plain text formatting:
+/// - Zero HTML tags and zero Markdown syntax so it renders cleanly and natively across all platforms.
+/// - Clean whitespace and blank lines between paragraphs and URLs.
+/// - Preserves all attachment URLs and the main AIUB notice link at the bottom.
+/// - Defensively caps length at `UNIFIED_MAX_MESSAGE_LEN` (4,096 chars), preserving header,
+///   attachments, and the notice URL while gracefully truncating overflowing body text.
 pub fn format_notice_message(notice: &Notice, edited: bool) -> String {
-    let prefix = if edited { "[EDITED] " } else { "" };
-    let header = format!(
-        "{prefix}{}\n\nDate: {}\n\n",
-        truncate_text(&notice.title, 500),
-        display_date(notice.published_date.as_deref())
-    );
-    let suffix = format!("\n\n{}", notice.url);
-
-    let raw_body = if is_meaningful_text(&notice.body_text) {
-        notice.body_text.as_str()
-    } else if is_meaningful_text(&notice.description) {
-        notice.description.as_str()
-    } else if let Some(first_attachment) = notice.attachments.iter().find(|s| !s.trim().is_empty())
-    {
-        // Surface the first attachment (image/PDF) so students can open it directly
-        // from Telegram without visiting the AIUB website.
-        first_attachment.as_str()
-    } else {
-        "Please click the link for details."
-    };
-
-    let available = TELEGRAM_MAX_MESSAGE_LEN
-        .saturating_sub(header.chars().count())
-        .saturating_sub(suffix.chars().count());
-    let body = truncate_text(raw_body, available.clamp(4, 1600));
-    format!("{header}{body}{suffix}")
-}
-
-/// Formats a notice for Facebook's `/{page-id}/feed` `message` field.
-/// Strictly plain text: zero HTML tags, zero Markdown syntax.
-/// Omits `link` and `picture` parameters so Facebook treats this as a status update.
-/// Surrounds all URLs with clean whitespace and blank lines.
-/// Preserves attachment URLs and the main AIUB notice link untruncated at the bottom.
-pub fn format_facebook_message(notice: &Notice, edited: bool) -> String {
     let prefix = if edited { "[EDITED] " } else { "" };
     let title = truncate_text(&notice.title, 500);
     let date = display_date(notice.published_date.as_deref());
@@ -220,7 +196,7 @@ pub fn format_facebook_message(notice: &Notice, edited: bool) -> String {
         }
     };
 
-    if full_content.chars().count() <= FACEBOOK_MAX_MESSAGE_LEN {
+    if full_content.chars().count() <= UNIFIED_MAX_MESSAGE_LEN {
         return full_content;
     }
 
@@ -230,17 +206,24 @@ pub fn format_facebook_message(notice: &Notice, edited: bool) -> String {
     let header_chars = header.chars().count();
     let fixed_overhead = header_chars + suffix_chars + 4; // "\n\n" + "\n\n"
 
-    let available_body_chars = FACEBOOK_MAX_MESSAGE_LEN.saturating_sub(fixed_overhead);
+    let available_body_chars = UNIFIED_MAX_MESSAGE_LEN.saturating_sub(fixed_overhead);
     let truncated = if let Some(body) = text_content {
         let truncated_body = truncate_text(body, available_body_chars.max(10));
         format!("{header}\n\n{truncated_body}{suffix}")
     } else {
-        truncate_text(&full_content, FACEBOOK_MAX_MESSAGE_LEN)
+        truncate_text(&full_content, UNIFIED_MAX_MESSAGE_LEN)
     };
 
-    if truncated.chars().count() > FACEBOOK_MAX_MESSAGE_LEN {
-        truncate_text(&truncated, FACEBOOK_MAX_MESSAGE_LEN)
+    if truncated.chars().count() > UNIFIED_MAX_MESSAGE_LEN {
+        truncate_text(&truncated, UNIFIED_MAX_MESSAGE_LEN)
     } else {
         truncated
     }
+}
+
+/// Backwards-compatible alias for `format_notice_message`.
+/// Guarantees that Facebook and future platforms receive the exact same unified visible text.
+#[inline]
+pub fn format_facebook_message(notice: &Notice, edited: bool) -> String {
+    format_notice_message(notice, edited)
 }

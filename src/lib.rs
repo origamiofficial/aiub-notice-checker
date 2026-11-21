@@ -23,7 +23,7 @@ use config::{
     FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS, MAX_DETAIL_FETCHES_PER_RUN, MAX_FACEBOOK_SENDS_PER_RUN,
     MAX_TELEGRAM_SENDS_PER_RUN, MIN_LISTING_DATE_COVERAGE, MIN_LISTING_DESC_COVERAGE,
 };
-use models::{format_facebook_message, titles_equivalent, D1Metrics, Notice, NoticeRow};
+use models::{format_notice_message, titles_equivalent, D1Metrics, Notice, NoticeRow};
 use scraper::{DetailFetchOutcome, ParsedDetail};
 
 const DETAIL_CONCURRENCY: usize = 3;
@@ -844,7 +844,7 @@ async fn run(env: &Env) -> worker::Result<()> {
                             metrics.rows_written += m.rows_written;
                         }
 
-                        let message = format_facebook_message(&item.notice, item.is_edited);
+                        let message = format_notice_message(&item.notice, item.is_edited);
                         let post_outcome = facebook::publish_post(fb_secrets_ref, &message).await;
 
                         match post_outcome {

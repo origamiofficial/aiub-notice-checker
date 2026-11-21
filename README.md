@@ -376,22 +376,26 @@ The repository includes an automated release workflow (`.github/workflows/releas
 
 ## 💬 Message Format & Sample Output
 
-### 1. Telegram Message Format
-Telegram alerts are dispatched as clean plain text with `disable_web_page_preview: true` (avoiding fragile HTML parse errors and large link preview cards), defensively truncated to stay within Telegram limits:
+All visible announcements use a **unified notice message format** regardless of delivery platform. While each platform constructs its own API transport request (e.g. Telegram POST `{"chat_id": ..., "text": ...}` with `disable_web_page_preview: true`, Facebook POST `{"message": ...}` to Graph API feed), the visible text read by students is guaranteed to be 100% identical and defensively capped at 4,096 characters (`UNIFIED_MAX_MESSAGE_LEN`).
+
+### 1. Standard Notice with Attachments & Body Text
+Surfaces title, date, body, all attachment links (PDFs/images), and the notice URL:
 
 ```text
-Final Exam Routine Fall 2026-2027
+Seat Plan for Final-Term Exams of Fall 2025-26 [ Only for LLB and BPharm ] ,Day 6 : Nov 22, 2026 ( Sunday )
 
-Date: 15 Nov 2026
+Date: 21 Nov 2026
 
-The students of the Undergraduate and Graduate programs are hereby informed that the Final Examinations of Fall 2026-2027 will commence from...
+Please contact Exam Control Room if your name or course is not in the list. Annex 6 Exam Control Room # 6116 SLOT-1 (09:00 AM - 11:00 AM) SLOT-2 (12:00 PM - 02:00 PM)
 
-https://www.aiub.edu/category/notices/final-exam-routine-fall-2026-2027
+https://www.aiub.edu/Files/Uploads/day-6---slot-1(6).pdf
+
+https://www.aiub.edu/Files/Uploads/day-6---slot-2(6).pdf
+
+https://www.aiub.edu/category/notices/seat-plan-for-final-term-exams
 ```
 
-### 2. Facebook Page Feed Post Format
-Facebook posts use clean plain-text formatting (zero HTML/Markdown) sent strictly via POST body `{"message": ...}` with all links spaced for rich previews and untruncated footers (capped defensively at 4,500 characters):
-
+### 2. Standard Text-Only Notice
 ```text
 Final Exam Routine Fall 2026-2027
 
@@ -403,7 +407,7 @@ https://www.aiub.edu/category/notices/final-exam-routine-fall-2026-2027
 ```
 
 ### 3. Flyer / Image-Only Notice (Attachment-First)
-When notices contain only scanned flyers or PDFs without descriptive text, the direct asset link is prioritized over placeholder texts across both platforms:
+When notices contain only scanned flyers or PDFs without descriptive text, direct asset links are prioritized over placeholder texts across all platforms:
 
 ```text
 MBA Course Waiver Announcements
@@ -512,7 +516,7 @@ aiub-notice-checker/
 │   ├── db.rs                          # D1 query builders, lightweight updates, dual-channel state
 │   ├── facebook.rs                    # Meta Graph API client, BUC rate-limiting, and error classifier
 │   ├── lib.rs                         # Worker entrypoint, cron dispatcher, diagnostics & dual dispatch
-│   ├── models.rs                      # Notice data models, hashing, Telegram & Facebook message formatters
+│   ├── models.rs                      # Notice data models, hashing, and unified cross-platform message formatter
 │   ├── scraper.rs                     # HTML fetching, redirect handling, and tl DOM parsing
 │   ├── telegram.rs                    # Telegram Bot API client, rate-limit handler, and retries
 │   ├── tests.rs                       # Comprehensive unit and regression test suite (109 tests)

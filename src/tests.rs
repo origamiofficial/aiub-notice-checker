@@ -569,7 +569,8 @@ mod scraper_tests {
 #[cfg(test)]
 mod model_tests {
     use crate::models::{
-        display_date, format_notice_message, titles_equivalent, truncate_text, Notice,
+        display_date, format_facebook_message, format_notice_message, titles_equivalent,
+        truncate_text, Notice,
     };
 
     // ── Content hashing ──────────────────────────────────────────────
@@ -899,6 +900,88 @@ mod model_tests {
             "message should respect Telegram max length, got {} chars",
             msg.chars().count()
         );
+    }
+
+    #[test]
+    fn format_notice_message_surfaces_attachments_alongside_meaningful_body() {
+        let notice = Notice {
+            title: "Seat Plan for Final-Term Exams of Fall 2025-26 [ Only for LLB and BPharm ] ,Day 6 : Nov 22, 2026 ( Sunday )".to_string(),
+            description: "Seat plan details".to_string(),
+            url: "https://www.aiub.edu/seat-plan-for-final-term-exams-of-fall-2025-26--only-for-llb-and-bpharm--day-6--nov-22-2026--sunday-".to_string(),
+            published_date: Some("2026-11-21".to_string()),
+            body_text: "Please contact Exam Control Room if your name or course is not in the list. Annex 6 Exam Control Room # 6116 SLOT-1 (09:00 AM - 11:00 AM) SLOT-2 (12:00 PM - 02:00 PM)".to_string(),
+            attachments: vec![
+                "https://www.aiub.edu/Files/Uploads/day-6---slot-1(6).pdf".to_string(),
+                "https://www.aiub.edu/Files/Uploads/day-6---slot-2(6).pdf".to_string(),
+            ],
+            detail_fetched: true,
+        };
+
+        let msg = format_notice_message(&notice, false);
+        let fb_msg = format_facebook_message(&notice, false);
+
+        // Crucial requirement: identical output across all platforms
+        assert_eq!(msg, fb_msg, "Telegram and Facebook messages must be identical");
+
+        // Verify all parts are present in the exact unified structure
+        assert!(msg.contains("Seat Plan for Final-Term Exams of Fall 2025-26"));
+        assert!(msg.contains("Date: 21 Nov 2026"));
+        assert!(msg.contains("Please contact Exam Control Room if your name or course is not in the list."));
+        assert!(msg.contains("https://www.aiub.edu/Files/Uploads/day-6---slot-1(6).pdf"));
+        assert!(msg.contains("https://www.aiub.edu/Files/Uploads/day-6---slot-2(6).pdf"));
+        assert!(msg.ends_with("https://www.aiub.edu/seat-plan-for-final-term-exams-of-fall-2025-26--only-for-llb-and-bpharm--day-6--nov-22-2026--sunday-"));
+    }
+
+    #[test]
+    fn format_notice_message_cross_platform_exact_equality() {
+        let cases = vec![
+            Notice {
+                title: "Standard Text Only".to_string(),
+                description: "Desc".to_string(),
+                url: "https://www.aiub.edu/notice/text-only".to_string(),
+                published_date: Some("2026-11-21".to_string()),
+                body_text: "Plain announcement without attachments.".to_string(),
+                attachments: vec![],
+                detail_fetched: true,
+            },
+            Notice {
+                title: "Flyer Banner Only".to_string(),
+                description: "".to_string(),
+                url: "https://www.aiub.edu/notice/flyer".to_string(),
+                published_date: Some("2026-11-20".to_string()),
+                body_text: "".to_string(),
+                attachments: vec![
+                    "https://www.aiub.edu/Files/Uploads/flyer.webp".to_string(),
+                    "https://www.aiub.edu/Files/Uploads/info.pdf".to_string(),
+                ],
+                detail_fetched: true,
+            },
+            Notice {
+                title: "Empty Notice".to_string(),
+                description: "".to_string(),
+                url: "https://www.aiub.edu/notice/empty".to_string(),
+                published_date: None,
+                body_text: "".to_string(),
+                attachments: vec![],
+                detail_fetched: false,
+            },
+        ];
+
+        for notice in &cases {
+            for edited in [false, true] {
+                let tg_output = format_notice_message(notice, edited);
+                let fb_output = format_facebook_message(notice, edited);
+                assert_eq!(
+                    tg_output, fb_output,
+                    "Format mismatch between platforms for title='{}', edited={}",
+                    notice.title, edited
+                );
+                assert!(
+                    tg_output.chars().count() <= crate::config::UNIFIED_MAX_MESSAGE_LEN,
+                    "Message exceeds unified limit of 4096"
+                );
+            }
+        }
     }
 }
 
