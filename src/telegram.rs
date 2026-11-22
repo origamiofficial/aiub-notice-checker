@@ -105,7 +105,22 @@ async fn send_raw_message(bot_api_key: &str, chat_id: &str, text: &str) -> Resul
         };
 
         let status = resp.status_code();
-        let raw_body = resp.text().await.unwrap_or_default();
+        // M9: the 15s timeout must cover the body read too, not just
+        // `send()` — a stalled body stream previously hung the send past
+        // the timeout. On timeout, fail the attempt (the caller retries
+        // on the next run) instead of blocking the worker.
+        let text_fut = resp.text();
+        let timeout_fut = Delay::from(Duration::from_millis(HTTP_TIMEOUT_MS));
+        let raw_body = match select(pin!(text_fut), pin!(timeout_fut)).await {
+            Either::Left((res, _)) => res.unwrap_or_default(),
+            Either::Right(((), _)) => {
+                controller.abort();
+                return Err(Error::RustError(format!(
+                    "Telegram API timeout after {}ms reading response body",
+                    HTTP_TIMEOUT_MS
+                )));
+            }
+        };
 
         if (200..300).contains(&status) {
             Delay::from(Duration::from_millis(TELEGRAM_PACE_MS)).await;

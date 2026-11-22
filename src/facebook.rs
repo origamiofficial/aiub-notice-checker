@@ -258,7 +258,23 @@ pub async fn publish_post(
     };
 
     let status = resp.status_code();
-    let raw_body = resp.text().await.unwrap_or_default();
+    // M9: the 15s timeout must cover the body read too, not just
+    // `send()` — a stalled body stream previously hung the send past
+    // the timeout. On timeout, treat it as transient (retry next run).
+    let text_fut = resp.text();
+    let timeout_fut = Delay::from(StdDuration::from_millis(HTTP_TIMEOUT_MS));
+    let raw_body = match select(pin!(text_fut), pin!(timeout_fut)).await {
+        Either::Left((res, _)) => res.unwrap_or_default(),
+        Either::Right(((), _)) => {
+            controller.abort();
+            return Ok(FacebookPostResult::TransientFailure {
+                message: format!(
+                    "Facebook API timeout after {}ms reading response body",
+                    HTTP_TIMEOUT_MS
+                ),
+            });
+        }
+    };
     // L3: never let a token (exact, URL-encoded, truncated, or EAA-shaped)
     // leak into a stored/logged/alerted error message.
     let redacted_body = telegram::redact_token(&raw_body, &fb_secrets.page_access_token);
@@ -417,6 +433,20 @@ pub(crate) fn classify_publish_error(
     }
 }
 
+/// M2: pure timestamp comparison for stored `app_state` values.
+/// Returns `Some(true)` when the stored RFC3339 timestamp is after
+/// `threshold`, `Some(false)` when it is at or before it, and `None`
+/// when the stored value is corrupt (unparsable) — the caller deletes
+/// the key and treats it as expired. String comparison must never be
+/// used here: a corrupt value sorts after any RFC3339 string and could
+/// suppress posting/alerts forever.
+pub(crate) fn stored_time_is_after(stored: &str, threshold: chrono::DateTime<Utc>) -> Option<bool> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(stored)
+        .ok()?
+        .with_timezone(&Utc);
+    Some(parsed > threshold)
+}
+
 /// Checks whether Facebook publishing is temporarily paused due to rate limiting or auth failure.
 ///
 /// H2: an auth pause expires after `FACEBOOK_AUTH_PAUSE_TTL_HOURS` (24h).
@@ -454,14 +484,29 @@ pub async fn is_facebook_paused(
     }
 
     if let Some(cooldown_until) = db::get_app_state(session, FACEBOOK_COOLDOWN_UNTIL_KEY).await? {
-        let now = Utc::now().to_rfc3339();
-        if cooldown_until > now {
-            return Ok((
-                true,
-                Some(format!("Rate limit cooldown active until {cooldown_until}")),
-            ));
-        } else {
-            let _ = db::delete_app_state(db, session, FACEBOOK_COOLDOWN_UNTIL_KEY).await;
+        // M2: compare parsed timestamps, not strings. A corrupt stored
+        // value previously compared lexicographically against `now` and
+        // could suppress Facebook posting forever ("garbage" > any
+        // RFC3339 string). On parse failure the key is deleted and the
+        // cooldown treated as expired; a real rate limit re-sets it.
+        match stored_time_is_after(&cooldown_until, Utc::now()) {
+            Some(true) => {
+                return Ok((
+                    true,
+                    Some(format!("Rate limit cooldown active until {cooldown_until}")),
+                ));
+            }
+            Some(false) => {
+                let _ = db::delete_app_state(db, session, FACEBOOK_COOLDOWN_UNTIL_KEY).await;
+            }
+            None => {
+                console_log!(
+                    "Stored {} value is not valid RFC3339 (value: {:?}); clearing it and treating the cooldown as expired.",
+                    FACEBOOK_COOLDOWN_UNTIL_KEY,
+                    cooldown_until
+                );
+                let _ = db::delete_app_state(db, session, FACEBOOK_COOLDOWN_UNTIL_KEY).await;
+            }
         }
     }
 
@@ -481,15 +526,29 @@ pub async fn send_debounced_fb_admin_alert(
     let now = Utc::now();
 
     if let Some(last_alert_str) = db::get_app_state(session, &alert_key).await? {
-        let debounce_limit =
-            (now - Duration::hours(FACEBOOK_ADMIN_ALERT_DEBOUNCE_HOURS)).to_rfc3339();
-        if last_alert_str > debounce_limit {
-            console_log!(
-                "Suppressing duplicate FB admin alert (category: {}, last sent at {})",
-                category,
-                last_alert_str
-            );
-            return Ok(());
+        // M2: same corrupt-timestamp rule as the cooldown check above —
+        // parse the stored value; a corrupt value is deleted and treated
+        // as expired instead of suppressing alerts forever via a string
+        // comparison against the debounce limit.
+        let debounce_limit = now - Duration::hours(FACEBOOK_ADMIN_ALERT_DEBOUNCE_HOURS);
+        match stored_time_is_after(&last_alert_str, debounce_limit) {
+            Some(true) => {
+                console_log!(
+                    "Suppressing duplicate FB admin alert (category: {}, last sent at {})",
+                    category,
+                    last_alert_str
+                );
+                return Ok(());
+            }
+            Some(false) => {}
+            None => {
+                console_log!(
+                    "Stored {} value is not valid RFC3339 (value: {:?}); clearing it and treating the alert debounce as expired.",
+                    alert_key,
+                    last_alert_str
+                );
+                let _ = db::delete_app_state(db, session, &alert_key).await;
+            }
         }
     }
 

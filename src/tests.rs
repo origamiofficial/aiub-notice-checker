@@ -151,10 +151,12 @@ mod scraper_tests {
 
     #[test]
     fn parse_listing_fallback_to_card_class() {
+        // M16: a `.card` only counts as a notice card when it carries an
+        // `a.info-link` / `a.notification-link`.
         let html = r#"
         <html><body>
         <div class="card">
-            <a href="/notice/card-notice">Link</a>
+            <a class="info-link" href="/notice/card-notice">Link</a>
             <h2 class="title">Card Notice</h2>
             <p class="desc">Card description</p>
         </div>
@@ -163,6 +165,31 @@ mod scraper_tests {
         let notices = parse_listing_html(html);
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].title, "Card Notice");
+    }
+
+    #[test]
+    fn parse_listing_card_without_info_link_is_ignored() {
+        // M16: a `.card` with only a generic link (promo tile, event
+        // card, sidebar widget) must not be misparsed as a notice.
+        let html = r#"
+        <html><body>
+        <div class="card">
+            <a href="/notice/card-notice">Link</a>
+            <h2 class="title">Card Notice</h2>
+            <p class="desc">Card description</p>
+        </div>
+        <div class="card">
+            <a href="https://example.com/promo">Promo</a>
+            <h2 class="title">Promo Card</h2>
+            <p class="desc">Not a notice</p>
+        </div>
+        </body></html>
+        "#;
+        let notices = parse_listing_html(html);
+        assert!(
+            notices.is_empty(),
+            "cards without an info-link must not be parsed as notices"
+        );
     }
 
     #[test]
@@ -727,6 +754,28 @@ mod model_tests {
             "Important Notice About Exam...",
             "Important Notice About Examination Schedule"
         ));
+    }
+
+    #[test]
+    fn titles_equivalent_ellipsis_prefix_mismatch() {
+        // M1: "..." no longer means "equivalent to anything" — the
+        // cached title must start with the visible prefix. A real edit
+        // to a long title must not be masked as unchanged.
+        assert!(!titles_equivalent(
+            "Important Notice About Exam...",
+            "Important Notice About Sports Day Events"
+        ));
+    }
+
+    #[test]
+    fn titles_equivalent_ellipsis_not_at_end() {
+        // "..." in the middle is not a truncation marker.
+        assert!(!titles_equivalent("Title... A", "Title B"));
+    }
+
+    #[test]
+    fn titles_equivalent_ellipsis_empty_prefix() {
+        assert!(!titles_equivalent("...", "Something Else"));
     }
 
     #[test]
@@ -1335,6 +1384,274 @@ mod lib_tests {
     }
 }
 
+// M15: tests for the pure decision functions extracted from run() —
+// detail-target selection (Priority A/B/C, incl. the M7 cooldown gate),
+// per-platform notification eligibility, and silent-sync eligibility
+// (incl. the M6 listing-title-only rule).
+#[cfg(test)]
+mod run_decision_tests {
+    use crate::models::{Notice, NoticeRow};
+    use crate::{platform_notification, select_detail_targets, silent_sync_flags};
+    use std::collections::HashMap;
+
+    fn notice(url: &str, title: &str) -> Notice {
+        Notice {
+            title: title.to_string(),
+            description: "Desc".to_string(),
+            url: url.to_string(),
+            published_date: None,
+            body_text: String::new(),
+            attachments: vec![],
+            detail_fetched: false,
+        }
+    }
+
+    fn row(link: &str, title: &str) -> NoticeRow {
+        NoticeRow {
+            title: title.to_string(),
+            description: "Desc".to_string(),
+            link: link.to_string(),
+            published_date: None,
+            body_text: String::new(),
+            attachments_json: "[]".to_string(),
+            content_hash: "hash1".to_string(),
+            tg_sent_at: None,
+            tg_last_notified_hash: None,
+            detail_checked_at: None,
+            detail_fetched_at: None,
+            fb_sent_at: None,
+            fb_last_notified_hash: None,
+        }
+    }
+
+    fn fetched_notice(url: &str, title: &str) -> Notice {
+        let mut n = notice(url, title);
+        n.detail_fetched = true;
+        n
+    }
+
+    // ── Priority A: brand-new notices ────────────────────────────────
+
+    #[test]
+    fn select_detail_targets_picks_new_notices_first() {
+        let listing = vec![
+            notice("https://www.aiub.edu/notice/1", "New One"),
+            notice("https://www.aiub.edu/notice/2", "New Two"),
+        ];
+        let existing = HashMap::new();
+        let sel = select_detail_targets(&listing, &existing, "2026-11-21T12:00:00Z");
+        assert_eq!(sel.new_count, 2);
+        assert_eq!(sel.backfill_count, 0);
+        assert_eq!(sel.rotation_count, 0);
+        assert_eq!(
+            sel.targets,
+            vec![
+                "https://www.aiub.edu/notice/1".to_string(),
+                "https://www.aiub.edu/notice/2".to_string(),
+            ]
+        );
+    }
+
+    // ── Priority B + M7: mojibake backfill gated on the retry cooldown ─
+
+    #[test]
+    fn select_detail_targets_mojibake_backfill_respects_cooldown() {
+        // Row already fetched, but its stored title has mojibake and it
+        // was checked 15 minutes ago — inside the 30-minute cooldown, so
+        // it must NOT be re-fetched on this run (M7).
+        let listing = vec![notice("https://www.aiub.edu/notice/1", "Clean Title")];
+        let mut existing = HashMap::new();
+        let mut r = row(
+            "https://www.aiub.edu/notice/1",
+            "2026\u{00e2}\u{0080}\u{0093}27 Title",
+        );
+        r.detail_fetched_at = Some("2026-11-21T11:00:00Z".to_string());
+        r.detail_checked_at = Some("2026-11-21T12:15:00Z".to_string());
+        existing.insert(r.link.clone(), r);
+
+        let sel = select_detail_targets(&listing, &existing, "2026-11-21T12:00:00Z");
+        assert_eq!(
+            sel.backfill_count, 0,
+            "mojibake backfill inside the cooldown must not be selected via Priority B (M7)"
+        );
+
+        // Same row, but last checked before the cutoff — now it is due.
+        let mut r2 = row(
+            "https://www.aiub.edu/notice/1",
+            "2026\u{00e2}\u{0080}\u{0093}27 Title",
+        );
+        r2.detail_fetched_at = Some("2026-11-21T11:00:00Z".to_string());
+        r2.detail_checked_at = Some("2026-11-21T11:30:00Z".to_string());
+        let mut existing2 = HashMap::new();
+        existing2.insert(r2.link.clone(), r2);
+        let sel2 = select_detail_targets(&listing, &existing2, "2026-11-21T12:00:00Z");
+        assert_eq!(sel2.backfill_count, 1);
+        assert_eq!(sel2.targets.len(), 1);
+    }
+
+    #[test]
+    fn select_detail_targets_listing_change_respects_cooldown() {
+        // Listing title genuinely changed, but the row was checked 15
+        // minutes ago — the change waits for the cooldown (M7).
+        let listing = vec![notice(
+            "https://www.aiub.edu/notice/1",
+            "Updated Title Here",
+        )];
+        let mut existing = HashMap::new();
+        let mut r = row("https://www.aiub.edu/notice/1", "Original Title");
+        r.detail_fetched_at = Some("2026-11-21T11:00:00Z".to_string());
+        r.detail_checked_at = Some("2026-11-21T12:15:00Z".to_string());
+        existing.insert(r.link.clone(), r);
+
+        let sel = select_detail_targets(&listing, &existing, "2026-11-21T12:00:00Z");
+        assert_eq!(
+            sel.backfill_count, 0,
+            "listing-change backfill inside the cooldown must not be selected via Priority B (M7)"
+        );
+    }
+
+    // ── Priority C: rolling edit check, oldest first ─────────────────
+
+    #[test]
+    fn select_detail_targets_rotation_picks_oldest_checked_first() {
+        let listing = vec![
+            notice("https://www.aiub.edu/notice/1", "One"),
+            notice("https://www.aiub.edu/notice/2", "Two"),
+        ];
+        let mut existing = HashMap::new();
+        for (link, title, checked) in [
+            (
+                "https://www.aiub.edu/notice/1",
+                "One",
+                "2026-11-21T10:00:00Z",
+            ),
+            (
+                "https://www.aiub.edu/notice/2",
+                "Two",
+                "2026-11-21T09:00:00Z",
+            ),
+        ] {
+            let mut r = row(link, title);
+            r.detail_fetched_at = Some("2026-11-21T08:00:00Z".to_string());
+            r.detail_checked_at = Some(checked.to_string());
+            existing.insert(r.link.clone(), r);
+        }
+        let sel = select_detail_targets(&listing, &existing, "2026-11-21T12:00:00Z");
+        assert_eq!(sel.rotation_count, 2);
+        assert_eq!(
+            sel.targets,
+            vec![
+                "https://www.aiub.edu/notice/2".to_string(),
+                "https://www.aiub.edu/notice/1".to_string(),
+            ],
+            "oldest detail_checked_at first"
+        );
+    }
+
+    // ── Notification eligibility ─────────────────────────────────────
+
+    #[test]
+    fn platform_notification_never_sent_queues_new() {
+        assert_eq!(
+            platform_notification(None, None, true, true, false, "hash2"),
+            Some(false)
+        );
+        // Not attempted and never checked: nothing to queue.
+        assert_eq!(
+            platform_notification(None, None, false, false, false, "hash2"),
+            None
+        );
+        // Attempted but detail failed still queues (matches run()).
+        assert_eq!(
+            platform_notification(None, None, false, true, false, "hash2"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn platform_notification_sent_only_queues_real_edits() {
+        let sent_at = Some("2026-11-21T10:00:00Z");
+        assert_eq!(
+            platform_notification(sent_at, Some("hash1"), true, true, true, "hash2"),
+            Some(true),
+            "hash changed after a detail attempt is an edit"
+        );
+        assert_eq!(
+            platform_notification(sent_at, Some("hash1"), true, true, true, "hash1"),
+            None,
+            "unchanged hash is not an edit"
+        );
+        assert_eq!(
+            platform_notification(sent_at, Some("hash1"), true, false, true, "hash2"),
+            None,
+            "no detail attempt, no edit check"
+        );
+    }
+
+    // ── Silent sync (M6) ─────────────────────────────────────────────
+
+    #[test]
+    fn silent_sync_flags_full_detail_title_still_syncs() {
+        // M6: the listing title is truncated ("..."), the detail fetch
+        // returned the full title. The old check required the full
+        // detail title to be equivalent to the cached title too, which
+        // defeated the sync and produced a false [EDITED]. The listing
+        // title alone decides now.
+        let r = {
+            let mut r = row(
+                "https://www.aiub.edu/notice/1",
+                "Important Notice About Examination Schedule",
+            );
+            r.tg_sent_at = Some("2026-11-21T10:00:00Z".to_string());
+            r.tg_last_notified_hash = Some("hash1".to_string());
+            r
+        };
+        let item = fetched_notice(
+            "https://www.aiub.edu/notice/1",
+            "Important Notice About Examination Schedule",
+        );
+        let (tg, fb) =
+            silent_sync_flags(&r, "Important Notice About Exam...", &item, "hash2", false);
+        assert!(
+            tg,
+            "first-detail backfill with a truncated listing title must sync (M6)"
+        );
+        assert!(!fb, "Facebook never sent, so it has nothing to sync");
+    }
+
+    #[test]
+    fn silent_sync_flags_never_sent_platform_does_not_sync() {
+        // H1 (preserved): a platform that never sent must never be
+        // silently synced — only already-sent platforms sync their hash.
+        let r = {
+            let mut r = row("https://www.aiub.edu/notice/1", "Some Title");
+            r.fb_sent_at = Some("2026-11-21T10:00:00Z".to_string());
+            r.fb_last_notified_hash = Some("hash1".to_string());
+            r
+        };
+        let item = fetched_notice("https://www.aiub.edu/notice/1", "Some Title");
+        let (tg, fb) = silent_sync_flags(&r, "Some Title", &item, "hash2", false);
+        assert!(!tg, "Telegram never sent");
+        assert!(fb, "Facebook sent and hash differs");
+    }
+
+    #[test]
+    fn silent_sync_flags_genuine_listing_change_does_not_sync() {
+        let r = {
+            let mut r = row("https://www.aiub.edu/notice/1", "Old Title");
+            r.tg_sent_at = Some("2026-11-21T10:00:00Z".to_string());
+            r.tg_last_notified_hash = Some("hash1".to_string());
+            r
+        };
+        let item = fetched_notice("https://www.aiub.edu/notice/1", "Brand New Title");
+        let (tg, fb) = silent_sync_flags(&r, "Brand New Title", &item, "hash2", false);
+        assert!(
+            !tg && !fb,
+            "a genuine listing change is an edit, not a silent sync"
+        );
+    }
+}
+
 #[cfg(test)]
 mod config_tests {
     use crate::config::*;
@@ -1475,8 +1792,30 @@ mod version_tests {
 #[cfg(test)]
 mod facebook_tests {
     use crate::config::FACEBOOK_MAX_MESSAGE_LEN;
-    use crate::facebook::{classify_meta_error, parse_buc_usage_header, MetaErrorAction};
+    use crate::facebook::{
+        classify_meta_error, parse_buc_usage_header, stored_time_is_after, MetaErrorAction,
+    };
     use crate::models::{format_facebook_message, Notice};
+
+    #[test]
+    fn stored_time_is_after_handles_future_past_and_corrupt() {
+        // M2: a corrupt stored timestamp must be distinguishable from an
+        // active one — under the old string comparison, "zzzz" sorted
+        // after every RFC3339 string and suppressed posting forever.
+        use chrono::{Duration, Utc};
+        let now = Utc::now();
+        assert_eq!(
+            stored_time_is_after(&(now + Duration::hours(1)).to_rfc3339(), now),
+            Some(true)
+        );
+        assert_eq!(
+            stored_time_is_after(&(now - Duration::hours(1)).to_rfc3339(), now),
+            Some(false)
+        );
+        assert_eq!(stored_time_is_after("not-a-timestamp", now), None);
+        assert_eq!(stored_time_is_after("zzzz", now), None);
+        assert_eq!(stored_time_is_after("", now), None);
+    }
 
     #[test]
     fn format_facebook_message_standard_text_notice() {
@@ -1928,6 +2267,18 @@ mod facebook_tests {
 
 #[cfg(test)]
 mod db_tests {
+    #[test]
+    fn d1_metrics_default_has_zero_failed_statements() {
+        // M8: execute_batch reports per-statement failures through
+        // D1Metrics.failed_statements so callers can tell a partial
+        // batch from a clean one.
+        use crate::models::D1Metrics;
+        let m = D1Metrics::default();
+        assert_eq!(m.failed_statements, 0);
+        assert_eq!(m.rows_read, 0);
+        assert_eq!(m.rows_written, 0);
+    }
+
     // L2: behavioural test — the SQL from build_lightweight_detail_update()
     // (via lightweight_detail_update_sql()) is executed against a real
     // in-memory SQLite database (D1 is SQLite-backed), instead of merely

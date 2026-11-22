@@ -91,6 +91,11 @@ impl NoticeRow {
 pub struct D1Metrics {
     pub rows_read: usize,
     pub rows_written: usize,
+    /// M8: statements that failed even after the per-statement fallback
+    /// in `execute_batch`. Callers must check this — a batch that returns
+    /// Ok with `failed_statements > 0` only partially applied, and
+    /// dispatch must not proceed as if every upsert landed.
+    pub failed_statements: usize,
 }
 
 pub fn titles_equivalent(listing_title: &str, cached_title: &str) -> bool {
@@ -103,7 +108,19 @@ pub fn titles_equivalent(listing_title: &str, cached_title: &str) -> bool {
     if normalize(listing_title) == normalize(cached_title) {
         return true;
     }
-    listing_title.contains("...")
+    // M1: a truncated listing title ("Long title...") is only equivalent
+    // when the cached title actually starts with the visible prefix. The
+    // old code returned true for ANY title containing "...", so a real
+    // edit to a long title was silently masked as "unchanged".
+    let trimmed = listing_title.trim_end();
+    let Some(prefix) = trimmed.strip_suffix("...") else {
+        return false;
+    };
+    let prefix_norm = normalize(prefix);
+    if prefix_norm.is_empty() {
+        return false;
+    }
+    normalize(cached_title).starts_with(&prefix_norm)
 }
 
 /// Length of a string in UTF-16 code units — the unit Telegram (and

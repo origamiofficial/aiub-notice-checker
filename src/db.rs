@@ -52,6 +52,20 @@ pub async fn get_notices_by_links(
     Ok((map, metrics))
 }
 
+/// M3: true emptiness check for the cold-start seed guard. Counts every
+/// row in `notices`, not just the ones matching the current page-1 links —
+/// a DB that still holds older rows is not empty even when none of them
+/// appear on page 1 anymore.
+pub async fn count_notices(session: &D1DatabaseSession) -> Result<i64> {
+    #[derive(Deserialize)]
+    struct CountRow {
+        n: i64,
+    }
+    let stmt = session.prepare("SELECT COUNT(*) AS n FROM notices");
+    let row: Option<CountRow> = stmt.first(None).await?;
+    Ok(row.map(|r| r.n).unwrap_or(0))
+}
+
 /// Builds a parameterized upsert statement using `worker::query!` (`&D1Database`).
 pub fn build_upsert_statement(
     db: &D1Database,
@@ -302,6 +316,10 @@ pub async fn execute_batch(
                     );
                     return Err(batch_err);
                 }
+                // M8: surface the per-statement failures to the caller
+                // instead of swallowing them. A batch that returns Ok with
+                // failed_statements > 0 only partially applied.
+                metrics.failed_statements += failed;
                 worker::console_warn!(
                     "[D1 Batch Fallback] Chunk {} recovered: {}/{} statements applied individually ({} failed).",
                     chunk_idx,
