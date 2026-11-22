@@ -19,6 +19,10 @@ pub const MIN_LISTING_DATE_COVERAGE: f64 = 0.8;
 pub const MIN_LISTING_DESC_COVERAGE: f64 = 0.8;
 pub const DETAIL_FAILURE_MIN_SAMPLE: usize = 4;
 pub const DETAIL_FAILURE_RATIO: f64 = 0.8;
+// Debounce for the detail-failure admin alert (M5): without one, a
+// sustained AIUB outage alerted on every 5-minute run.
+pub const DETAIL_FAILURE_LAST_ALERT_KEY: &str = "detail_failure_last_alert_at";
+pub const DETAIL_FAILURE_ALERT_DEBOUNCE_HOURS: i64 = 6;
 pub const AIUB_OUTAGE_ALERT_THRESHOLD_MINS: i64 = 60;
 pub const AIUB_OUTAGE_DOWN_SINCE_KEY: &str = "aiub_down_since";
 pub const AIUB_OUTAGE_ALERTED_KEY: &str = "aiub_outage_alerted";

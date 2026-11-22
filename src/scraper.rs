@@ -120,7 +120,34 @@ pub async fn fetch_html(target_url: &str) -> Result<String> {
             )));
         }
 
-        let text = resp.text().await?;
+        // M9: check Content-Length before buffering the body — a lying
+        // or huge response must be rejected without downloading it first.
+        if let Ok(Some(len_str)) = resp.headers().get("Content-Length") {
+            if let Ok(len) = len_str.parse::<usize>() {
+                if len > MAX_HTML_BYTES {
+                    return Err(Error::RustError(format!(
+                        "HTML response too large (Content-Length {} bytes) for {}",
+                        len, current_url
+                    )));
+                }
+            }
+        }
+
+        // M9: the 15s timeout must cover the body read too, not just
+        // `send()`. A stalled body stream previously hung the run past
+        // the timeout (and the 2 MB cap only fired after full buffering).
+        let text_fut = resp.text();
+        let timeout_fut = Delay::from(Duration::from_millis(HTTP_TIMEOUT_MS));
+        let text = match select(pin!(text_fut), pin!(timeout_fut)).await {
+            Either::Left((res, _)) => res?,
+            Either::Right(((), _)) => {
+                controller.abort();
+                return Err(Error::RustError(format!(
+                    "HTTP timeout after {}ms reading body of {}",
+                    HTTP_TIMEOUT_MS, current_url
+                )));
+            }
+        };
         if text.len() > MAX_HTML_BYTES {
             return Err(Error::RustError(format!(
                 "HTML response too large ({} bytes) for {}",
@@ -149,8 +176,29 @@ pub fn parse_listing_html(html: &str) -> Vec<Notice> {
     if item_handles.is_empty() {
         item_handles = find_listing_li_handles(&dom, parser);
     }
+    // M16: the `.card` fallback is scoped to real notice cards only. A
+    // bare `.card` previously matched any card on the page (promo tiles,
+    // event cards, sidebar widgets) and the generic `a[href]` fallback
+    // below then harvested whatever link it contained, misparsing
+    // unrelated cards as notices. A card only counts when it carries an
+    // `a.info-link` / `a.notification-link` — the selectors real AIUB
+    // notice cards use.
+    let mut from_card_fallback = false;
     if item_handles.is_empty() {
-        item_handles = query_handles(&dom, ".card");
+        item_handles = query_handles(&dom, ".card")
+            .into_iter()
+            .filter(|handle| {
+                let Some(node) = handle.get(parser) else {
+                    return false;
+                };
+                let Some(tag) = node.as_tag() else {
+                    return false;
+                };
+                find_first_attr_in_tag(tag, parser, "a.info-link", "href").is_some()
+                    || find_first_attr_in_tag(tag, parser, "a.notification-link", "href").is_some()
+            })
+            .collect();
+        from_card_fallback = true;
     }
 
     let mut notices = Vec::with_capacity(item_handles.len());
@@ -163,10 +211,19 @@ pub fn parse_listing_html(html: &str) -> Vec<Notice> {
             continue;
         };
 
-        let raw_href = find_first_attr_in_tag(tag, parser, "a.info-link", "href")
-            .or_else(|| find_first_attr_in_tag(tag, parser, "a.notification-link", "href"))
-            .or_else(|| find_first_attr_in_tag(tag, parser, "a", "href"))
-            .unwrap_or_default();
+        // M16: inside a `.card` fallback item, never fall back to a
+        // generic `a[href]` — that is exactly how unrelated links
+        // inside a card were harvested as notice URLs.
+        let raw_href = if from_card_fallback {
+            find_first_attr_in_tag(tag, parser, "a.info-link", "href")
+                .or_else(|| find_first_attr_in_tag(tag, parser, "a.notification-link", "href"))
+                .unwrap_or_default()
+        } else {
+            find_first_attr_in_tag(tag, parser, "a.info-link", "href")
+                .or_else(|| find_first_attr_in_tag(tag, parser, "a.notification-link", "href"))
+                .or_else(|| find_first_attr_in_tag(tag, parser, "a", "href"))
+                .unwrap_or_default()
+        };
 
         let url = normalize_notice_url(&raw_href);
         if url.is_empty() || !is_valid_aiub_notice_url(&url) {

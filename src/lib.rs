@@ -22,10 +22,11 @@ pub mod version;
 
 use config::{
     Secrets, AIUB_OUTAGE_ALERTED_KEY, AIUB_OUTAGE_ALERT_THRESHOLD_MINS, AIUB_OUTAGE_DOWN_SINCE_KEY,
-    DETAIL_FAILURE_MIN_SAMPLE, DETAIL_FAILURE_RATIO, DETAIL_RETRY_COOLDOWN_MINUTES,
-    EMPTY_LISTING_ALERT_DEBOUNCE_HOURS, EMPTY_LISTING_ALERT_KEY, FACEBOOK_AUTH_PAUSED_KEY,
-    FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS, MAX_DETAIL_FETCHES_PER_RUN, MAX_FACEBOOK_SENDS_PER_RUN,
-    MAX_TELEGRAM_SENDS_PER_RUN, MIN_LISTING_DATE_COVERAGE, MIN_LISTING_DESC_COVERAGE,
+    DETAIL_FAILURE_ALERT_DEBOUNCE_HOURS, DETAIL_FAILURE_LAST_ALERT_KEY, DETAIL_FAILURE_MIN_SAMPLE,
+    DETAIL_FAILURE_RATIO, DETAIL_RETRY_COOLDOWN_MINUTES, EMPTY_LISTING_ALERT_DEBOUNCE_HOURS,
+    EMPTY_LISTING_ALERT_KEY, FACEBOOK_AUTH_PAUSED_KEY, FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS,
+    MAX_DETAIL_FETCHES_PER_RUN, MAX_FACEBOOK_SENDS_PER_RUN, MAX_TELEGRAM_SENDS_PER_RUN,
+    MIN_LISTING_DATE_COVERAGE, MIN_LISTING_DESC_COVERAGE,
 };
 use models::{format_notice_message, titles_equivalent, D1Metrics, Notice, NoticeRow};
 use scraper::{DetailFetchOutcome, ParsedDetail};
@@ -501,86 +502,19 @@ async fn run(env: &Env) -> worker::Result<()> {
     total_d1.rows_read += read_metrics.rows_read;
     total_d1.rows_written += read_metrics.rows_written;
 
-    // 3. Select up to MAX_DETAIL_FETCHES_PER_RUN (5) detail pages strictly from the visible notices:
-    //    Priority A: Brand-new notices not in D1 yet.
-    //    Priority B: Existing notices where detail_fetched_at IS NULL (respecting retry cooldown),
-    //                rows containing Latin-1 mojibake (`â`) that need healing, OR notices whose
-    //                listing title/description changed on page 1.
-    //    Priority C: Existing notices ordered by oldest detail_checked_at (rolling edit check).
+    // 3. Select up to MAX_DETAIL_FETCHES_PER_RUN (5) detail pages strictly from the visible notices.
+    //    See select_detail_targets() (M15) for the Priority A/B/C rules.
     let retry_cutoff_iso =
         (Utc::now() - Duration::minutes(DETAIL_RETRY_COOLDOWN_MINUTES)).to_rfc3339();
 
     let detail_targets = enter_span("select_detail_targets", |span| {
-        let mut selected: Vec<String> = Vec::with_capacity(MAX_DETAIL_FETCHES_PER_RUN);
-        let mut selected_set: HashSet<String> = HashSet::with_capacity(MAX_DETAIL_FETCHES_PER_RUN);
-
-        // Priority A: Brand-new notices
-        let mut new_count = 0i64;
-        for item in &unique_listing {
-            if selected.len() >= MAX_DETAIL_FETCHES_PER_RUN {
-                break;
-            }
-            if !existing_map.contains_key(&item.url) && selected_set.insert(item.url.clone()) {
-                selected.push(item.url.clone());
-                new_count += 1;
-            }
-        }
-
-        // Priority B: Unfetched detail pages, mojibake repair, OR listing changes
-        let mut backfill_count = 0i64;
-        for item in &unique_listing {
-            if selected.len() >= MAX_DETAIL_FETCHES_PER_RUN {
-                break;
-            }
-            if let Some(row) = existing_map.get(&item.url) {
-                let row_has_mojibake = has_utf8_mojibake(&row.title)
-                    || has_utf8_mojibake(&row.description)
-                    || has_utf8_mojibake(&row.body_text);
-                let listing_changed = !titles_equivalent_clean(&item.title, &row.title)
-                    || !clean_mojibake_eq(&row.description, &item.description);
-                let needs_backfill =
-                    row.detail_fetched_at.is_none() && row.detail_due(&retry_cutoff_iso);
-
-                if (needs_backfill || row_has_mojibake || listing_changed)
-                    && selected_set.insert(item.url.clone())
-                {
-                    selected.push(item.url.clone());
-                    backfill_count += 1;
-                }
-            }
-        }
-
-        // Priority C: Rolling edit check across visible notices (oldest detail_checked_at first)
-        let mut rotation_count = 0i64;
-        if selected.len() < MAX_DETAIL_FETCHES_PER_RUN {
-            let mut candidates: Vec<&NoticeRow> = existing_map
-                .values()
-                .filter(|r| r.detail_fetched_at.is_some() && !selected_set.contains(&r.link))
-                .collect();
-
-            candidates.sort_by(|a, b| {
-                let a_ts = a.detail_checked_at.as_deref().unwrap_or("");
-                let b_ts = b.detail_checked_at.as_deref().unwrap_or("");
-                a_ts.cmp(b_ts)
-            });
-
-            for row in candidates {
-                if selected.len() >= MAX_DETAIL_FETCHES_PER_RUN {
-                    break;
-                }
-                if selected_set.insert(row.link.clone()) {
-                    selected.push(row.link.clone());
-                    rotation_count += 1;
-                }
-            }
-        }
-
-        span.set_attribute("new_targets", new_count);
-        span.set_attribute("backfill_targets", backfill_count);
-        span.set_attribute("rotation_targets", rotation_count);
-        span.set_attribute("total_targets", selected.len() as i64);
+        let selection = select_detail_targets(&unique_listing, &existing_map, &retry_cutoff_iso);
+        span.set_attribute("new_targets", selection.new_count as i64);
+        span.set_attribute("backfill_targets", selection.backfill_count as i64);
+        span.set_attribute("rotation_targets", selection.rotation_count as i64);
+        span.set_attribute("total_targets", selection.targets.len() as i64);
         span.set_status(SpanStatus::Ok);
-        selected
+        selection.targets
     });
 
     // 4. Fetch the selected detail pages with bounded concurrency and CPU budget awareness.
@@ -723,7 +657,15 @@ async fn run(env: &Env) -> worker::Result<()> {
             &failure_diagnostics,
         );
 
-        let _ = telegram::send_admin_alert(&secrets, &alert_message).await;
+        // M5: debounced — a sustained AIUB outage previously alerted on
+        // every 5-minute run.
+        if let Err(err) =
+            send_debounced_detail_failure_alert(&database, &session, &secrets, &alert_message).await
+        {
+            console_warn!(
+                "[Detail Failure Alert Warning] Failed to handle detail-failure alert: {err}"
+            );
+        }
     }
 
     let mut detail_map: HashMap<String, Option<ParsedDetail>> =
@@ -752,7 +694,21 @@ async fn run(env: &Env) -> worker::Result<()> {
     // Cold-start guard: if D1 is completely empty and we scraped a full page of notices,
     // this is a fresh database seed — write all rows silently and populate tracking columns
     // so neither Telegram nor Facebook are flooded.
-    let is_empty_db_seed = existing_map.is_empty() && unique_listing.len() >= 10;
+    // M3: emptiness is measured with COUNT(*) over the whole table, not
+    // inferred from page-1 matches — a DB holding only older rows is not
+    // empty. On a COUNT failure, fall back to the page-1 heuristic
+    // rather than failing the run.
+    let db_is_empty = match db::count_notices(&session).await {
+        Ok(n) => n == 0,
+        Err(err) => {
+            console_warn!(
+                "[Cold-Start Check Failed] COUNT(*) failed ({}); falling back to page-1 emptiness heuristic.",
+                err
+            );
+            existing_map.is_empty()
+        }
+    };
+    let is_empty_db_seed = db_is_empty && unique_listing.len() >= 10;
     if is_empty_db_seed {
         console_log!(
             "Empty-database cold-start detected ({} notices). Seeding silently without Telegram or Facebook notifications.",
@@ -838,51 +794,15 @@ async fn run(env: &Env) -> worker::Result<()> {
             }
         };
 
-        // Silent hash sync for non-edit backfills:
-        // 1. First-time detail fetch (`row.detail_fetched_at.is_none()`) when listing fields didn't change.
-        // 2. Date-only, full-title, or UTF-8 mojibake healing when content is equivalent.
-        // 3. Re-baselining rows from version `e1a14563` whose stored `body_text` was the sticky header.
-        let mut silent_hash_sync = false;
-        // H1: per-platform sync flags. A platform only needs its hash
-        // synced when it has already sent this notice (sent_at is set) and
-        // its stored hash differs. In particular a platform that has never
-        // sent must never be marked sent by a silent sync — the old code
-        // pushed both platforms' sync statements unconditionally, and the
-        // Telegram statement set tg_sent_at, silently losing the first
-        // Telegram send for a notice Facebook had already posted.
-        let mut silent_sync_tg = false;
-        let mut silent_sync_fb = false;
-        if let Some(row) = existing {
-            let tg_needs_sync = row.tg_sent_at.is_some()
-                && row.tg_last_notified_hash.as_deref() != Some(new_hash.as_str());
-            let fb_needs_sync = row.fb_sent_at.is_some()
-                && row.fb_last_notified_hash.as_deref() != Some(new_hash.as_str());
-
-            if tg_needs_sync || fb_needs_sync {
-                let listing_unchanged = titles_equivalent_clean(&listing_title, &row.title)
-                    && titles_equivalent_clean(&item.title, &row.title)
-                    && clean_mojibake_eq(&row.description, &item.description);
-
-                let first_detail_backfill =
-                    row.detail_fetched_at.is_none() && item.detail_fetched && listing_unchanged;
-
-                let metadata_or_mojibake_backfill = listing_unchanged
-                    && clean_mojibake_eq(&row.body_text, &item.body_text)
-                    && row.attachments_json == item.attachments_json();
-
-                let sticky_header_rebaseline =
-                    matched_legacy_sticky && item.detail_fetched && listing_unchanged;
-
-                if first_detail_backfill
-                    || metadata_or_mojibake_backfill
-                    || sticky_header_rebaseline
-                {
-                    silent_hash_sync = true;
-                    silent_sync_tg = tg_needs_sync;
-                    silent_sync_fb = fb_needs_sync;
-                }
+        // Silent hash sync for non-edit backfills — see silent_sync_flags()
+        // (M15) for the eligibility rules.
+        let (silent_sync_tg, silent_sync_fb) = match existing {
+            Some(row) => {
+                silent_sync_flags(row, &listing_title, &item, &new_hash, matched_legacy_sticky)
             }
-        }
+            None => (false, false),
+        };
+        let silent_hash_sync = silent_sync_tg || silent_sync_fb;
 
         if needs_db_write {
             if use_lightweight_update {
@@ -923,41 +843,37 @@ async fn run(env: &Env) -> worker::Result<()> {
                 }
             }
             Some(row) => {
-                // Telegram notification eligibility
-                if row.tg_sent_at.is_none() {
-                    if item.detail_fetched || detail_attempted || row.detail_checked_at.is_some() {
-                        tg_notifications.push(PendingNotification {
-                            notice: item.clone(),
-                            content_hash: new_hash.clone(),
-                            is_edited: false,
-                        });
-                    }
-                } else if detail_attempted
-                    && row.tg_last_notified_hash.as_deref() != Some(new_hash.as_str())
-                {
+                // Notification eligibility (M15): the Telegram and
+                // Facebook rules are identical given each platform's own
+                // sent_at / last-notified-hash, so one pure function
+                // serves both phases.
+                if let Some(is_edited) = platform_notification(
+                    row.tg_sent_at.as_deref(),
+                    row.tg_last_notified_hash.as_deref(),
+                    item.detail_fetched,
+                    detail_attempted,
+                    row.detail_checked_at.is_some(),
+                    &new_hash,
+                ) {
                     tg_notifications.push(PendingNotification {
                         notice: item.clone(),
                         content_hash: new_hash.clone(),
-                        is_edited: true,
+                        is_edited,
                     });
                 }
 
-                // Facebook notification eligibility (fully independent tracking)
-                if row.fb_sent_at.is_none() {
-                    if item.detail_fetched || detail_attempted || row.detail_checked_at.is_some() {
-                        fb_notifications.push(PendingNotification {
-                            notice: item,
-                            content_hash: new_hash,
-                            is_edited: false,
-                        });
-                    }
-                } else if detail_attempted
-                    && row.fb_last_notified_hash.as_deref() != Some(new_hash.as_str())
-                {
+                if let Some(is_edited) = platform_notification(
+                    row.fb_sent_at.as_deref(),
+                    row.fb_last_notified_hash.as_deref(),
+                    item.detail_fetched,
+                    detail_attempted,
+                    row.detail_checked_at.is_some(),
+                    &new_hash,
+                ) {
                     fb_notifications.push(PendingNotification {
                         notice: item,
                         content_hash: new_hash,
-                        is_edited: true,
+                        is_edited,
                     });
                 }
             }
@@ -967,6 +883,10 @@ async fn run(env: &Env) -> worker::Result<()> {
     let silent_backfills = silent_sync_links.len();
 
     // 6. Execute D1 batch upserts on the session.
+    // M8: if any upsert failed, D1 state is uncertain — dispatch is
+    // deferred to the next run instead of notifying for rows that may
+    // not have been written.
+    let mut upsert_failed = false;
     if !statements.is_empty() {
         let stmt_count = statements.len();
         let batch_metrics = enter_span_async("d1_batch_upsert", |span| async move {
@@ -975,6 +895,7 @@ async fn run(env: &Env) -> worker::Result<()> {
                 Ok(m) => {
                     span.set_attribute("rows_read", m.rows_read as i64);
                     span.set_attribute("rows_written", m.rows_written as i64);
+                    span.set_attribute("failed_statements", m.failed_statements as i64);
                     span.set_status(SpanStatus::Ok);
                     Ok::<D1Metrics, worker::Error>(m)
                 }
@@ -991,8 +912,18 @@ async fn run(env: &Env) -> worker::Result<()> {
         })
         .await?;
 
+        if batch_metrics.failed_statements > 0 {
+            upsert_failed = true;
+            console_error!(
+                "[D1 Batch Partial Failure] {}/{} upsert statements failed; deferring Telegram/Facebook dispatch to the next run.",
+                batch_metrics.failed_statements,
+                stmt_count
+            );
+        }
+
         total_d1.rows_read += batch_metrics.rows_read;
         total_d1.rows_written += batch_metrics.rows_written;
+        total_d1.failed_statements += batch_metrics.failed_statements;
     }
 
     // Cold-start seed: populate tracking fields for both platforms so subsequent runs
@@ -1030,13 +961,25 @@ async fn run(env: &Env) -> worker::Result<()> {
                 sync_stmts.push(db::build_fb_hash_sync_statement(&database, url, hash)?);
             }
         }
+        let sync_stmt_count = sync_stmts.len();
         let sync_metrics = db::execute_batch(&session, sync_stmts).await?;
+        if sync_metrics.failed_statements > 0 {
+            // M8: a failed silent sync is not fatal — the next run
+            // re-evaluates — but it must be visible, not swallowed.
+            console_warn!(
+                "[Silent Sync Partial Failure] {}/{} hash-sync statements failed; affected notices will be re-evaluated on the next run.",
+                sync_metrics.failed_statements,
+                sync_stmt_count
+            );
+        }
         total_d1.rows_read += sync_metrics.rows_read;
         total_d1.rows_written += sync_metrics.rows_written;
+        total_d1.failed_statements += sync_metrics.failed_statements;
     }
 
     // 7. Dispatch queued Telegram notifications (oldest-first).
-    if !tg_notifications.is_empty() {
+    // M8: skipped entirely when the upsert batch partially failed.
+    if !upsert_failed && !tg_notifications.is_empty() {
         tg_notifications.reverse();
         let db_ref = &database;
         let secrets_ref = &secrets;
@@ -1069,16 +1012,34 @@ async fn run(env: &Env) -> worker::Result<()> {
                         .await
                     {
                         Ok(true) => {
-                            let m = db::mark_tg_notified(
+                            // M4: a failed mark must not abort the rest of
+                            // dispatch (or the Facebook phase below). The
+                            // send already happened; log the mark failure
+                            // and continue — the notice may re-send on the
+                            // next run, which is safer than dropping the
+                            // remaining queue.
+                            match db::mark_tg_notified(
                                 db_ref,
                                 session_ref,
                                 &item.notice.url,
                                 &item.content_hash,
                             )
-                            .await?;
-                            metrics.rows_read += m.rows_read;
-                            metrics.rows_written += m.rows_written;
-                            sent_count += 1;
+                            .await
+                            {
+                                Ok(m) => {
+                                    metrics.rows_read += m.rows_read;
+                                    metrics.rows_written += m.rows_written;
+                                    sent_count += 1;
+                                }
+                                Err(err) => {
+                                    console_error!(
+                                        "[Telegram Mark Failed] Send succeeded for {} but marking it notified failed: {}; it may re-send on the next run.",
+                                        item.notice.url,
+                                        err
+                                    );
+                                    failed_count += 1;
+                                }
+                            }
                         }
                         Ok(false) => {
                             console_warn!(
@@ -1113,17 +1074,20 @@ async fn run(env: &Env) -> worker::Result<()> {
 
         total_d1.rows_read += notify_metrics.rows_read;
         total_d1.rows_written += notify_metrics.rows_written;
+        total_d1.failed_statements += notify_metrics.failed_statements;
     }
 
     // 8. Dispatch queued Facebook notifications (oldest-first, independent phase).
-    if let Some(fb_secrets) = &secrets.facebook {
-        if !fb_notifications.is_empty() {
-            fb_notifications.reverse();
-            let db_ref = &database;
-            let secrets_ref = &secrets;
-            let fb_secrets_ref = fb_secrets;
+    // M8: skipped entirely when the upsert batch partially failed.
+    if !upsert_failed {
+        if let Some(fb_secrets) = &secrets.facebook {
+            if !fb_notifications.is_empty() {
+                fb_notifications.reverse();
+                let db_ref = &database;
+                let secrets_ref = &secrets;
+                let fb_secrets_ref = fb_secrets;
 
-            let fb_metrics =
+                let fb_metrics =
                 enter_span_async("dispatch_facebook_notifications", |span| async move {
                     span.set_attribute("queued", fb_notifications.len() as i64);
 
@@ -1169,17 +1133,33 @@ async fn run(env: &Env) -> worker::Result<()> {
 
                         match post_outcome {
                             Ok(facebook::FacebookPostResult::Success { post_id, usage }) => {
-                                let m = db::mark_fb_notified(
+                                // M4: same log-and-continue rule as the
+                                // Telegram mark — a failed mark must not
+                                // abort the remaining dispatch.
+                                match db::mark_fb_notified(
                                     db_ref,
                                     session_ref,
                                     &item.notice.url,
                                     &item.content_hash,
                                     &post_id,
                                 )
-                                .await?;
-                                metrics.rows_read += m.rows_read;
-                                metrics.rows_written += m.rows_written;
-                                sent_count += 1;
+                                .await
+                                {
+                                    Ok(m) => {
+                                        metrics.rows_read += m.rows_read;
+                                        metrics.rows_written += m.rows_written;
+                                        sent_count += 1;
+                                    }
+                                    Err(err) => {
+                                        console_error!(
+                                            "[Facebook Mark Failed] Post {} published for {} but marking it notified failed: {}; it may re-send (and hit a 506 duplicate) on the next run.",
+                                            post_id,
+                                            item.notice.url,
+                                            err
+                                        );
+                                        failed_count += 1;
+                                    }
+                                }
 
                                 if let Some(u) = usage {
                                     if u.is_approaching_limit() {
@@ -1260,15 +1240,29 @@ async fn run(env: &Env) -> worker::Result<()> {
                                     "[Facebook Duplicate] Error 506 duplicate post for {}; marking handled.",
                                     item.notice.url
                                 );
-                                let m = db::mark_fb_duplicate_handled(
+                                // M4: log-and-continue — a failed mark
+                                // must not abort the remaining dispatch.
+                                match db::mark_fb_duplicate_handled(
                                     db_ref,
                                     session_ref,
                                     &item.notice.url,
                                     &item.content_hash,
                                 )
-                                .await?;
-                                metrics.rows_read += m.rows_read;
-                                metrics.rows_written += m.rows_written;
+                                .await
+                                {
+                                    Ok(m) => {
+                                        metrics.rows_read += m.rows_read;
+                                        metrics.rows_written += m.rows_written;
+                                    }
+                                    Err(err) => {
+                                        console_error!(
+                                            "[Facebook Duplicate Mark Failed] Could not mark 506 duplicate handled for {}: {}; it will be retried on the next run.",
+                                            item.notice.url,
+                                            err
+                                        );
+                                        failed_count += 1;
+                                    }
+                                }
                                 let _ = facebook::send_debounced_fb_admin_alert(
                                     db_ref,
                                     session_ref,
@@ -1313,6 +1307,26 @@ async fn run(env: &Env) -> worker::Result<()> {
                             }
                             Ok(facebook::FacebookPostResult::UnknownError { message }) => {
                                 console_error!("[Facebook Unknown Error] {}", message);
+                                // M10: an unclassified Meta error previously
+                                // got no admin alert, no pause and no
+                                // cooldown — it failed silently every run
+                                // until someone noticed the logs. Route it
+                                // through the existing debounced FB admin
+                                // alert (6h, category "unknown_error") so
+                                // it is seen once without spamming. No
+                                // cooldown/pause is set: the error is
+                                // unclassified, so pausing could suppress
+                                // good posts for a transient Meta glitch.
+                                let _ = facebook::send_debounced_fb_admin_alert(
+                                    db_ref,
+                                    session_ref,
+                                    secrets_ref,
+                                    "unknown_error",
+                                    &format!(
+                                        "⚠️ AIUB Notice Facebook: Unclassified Meta error, dispatch paused for this run (no cooldown set): {message}"
+                                    ),
+                                )
+                                .await;
                                 failed_count += 1;
                                 break;
                             }
@@ -1340,15 +1354,18 @@ async fn run(env: &Env) -> worker::Result<()> {
                 })
                 .await?;
 
-            total_d1.rows_read += fb_metrics.rows_read;
-            total_d1.rows_written += fb_metrics.rows_written;
+                total_d1.rows_read += fb_metrics.rows_read;
+                total_d1.rows_written += fb_metrics.rows_written;
+                total_d1.failed_statements += fb_metrics.failed_statements;
+            }
         }
     }
 
     console_log!(
-        "[Run Summary] rows_read={}, rows_written={}, silent_backfills={}, detail_succeeded={}, detail_http_errors={}, detail_parse_errors={}",
+        "[Run Summary] rows_read={}, rows_written={}, failed_statements={}, silent_backfills={}, detail_succeeded={}, detail_http_errors={}, detail_parse_errors={}",
         total_d1.rows_read,
         total_d1.rows_written,
+        total_d1.failed_statements,
         silent_backfills,
         detail_succeeded_count,
         detail_http_error_count,
@@ -1356,6 +1373,230 @@ async fn run(env: &Env) -> worker::Result<()> {
     );
 
     Ok(())
+}
+
+/// M5: sends the detail-failure admin alert at most once per
+/// `DETAIL_FAILURE_ALERT_DEBOUNCE_HOURS`, reusing `is_debounce_expired`.
+/// The timestamp is only recorded when the alert was actually delivered
+/// (or no admin chat is configured).
+async fn send_debounced_detail_failure_alert(
+    db: &D1Database,
+    session: &D1DatabaseSession,
+    secrets: &Secrets,
+    message: &str,
+) -> worker::Result<()> {
+    let now = Utc::now();
+    if let Some(last_alert_str) = db::get_app_state(session, DETAIL_FAILURE_LAST_ALERT_KEY).await? {
+        if !is_debounce_expired(
+            Some(&last_alert_str),
+            now,
+            DETAIL_FAILURE_ALERT_DEBOUNCE_HOURS,
+        ) {
+            console_log!(
+                "Suppressing duplicate detail-failure alert (last sent at {})",
+                last_alert_str
+            );
+            return Ok(());
+        }
+    }
+
+    let alert_sent = match telegram::send_admin_alert(secrets, message).await {
+        Ok(true) => true,
+        Ok(false) => secrets.telegram_admin_chat_id.is_none(),
+        Err(err) => {
+            console_warn!(
+                "[Detail Failure Alert Failed] Failed to send detail-failure alert: {err}; will retry on the next run."
+            );
+            false
+        }
+    };
+
+    if alert_sent {
+        let now_str = now.to_rfc3339();
+        db::set_app_state(db, session, DETAIL_FAILURE_LAST_ALERT_KEY, &now_str).await?;
+    }
+    Ok(())
+}
+
+/// M15: result of the pure detail-target selection.
+pub(crate) struct DetailTargetSelection {
+    pub targets: Vec<String>,
+    pub new_count: usize,
+    pub backfill_count: usize,
+    pub rotation_count: usize,
+}
+
+/// M15: pure detail-target selection (Priority A/B/C), extracted from
+/// `run()` so the orchestration decisions are unit-testable instead of
+/// only reachable through a live D1 + AIUB run.
+///
+/// - Priority A: brand-new notices not in D1 yet.
+/// - Priority B: existing notices where `detail_fetched_at` is NULL
+///   (respecting the retry cooldown), rows containing Latin-1 mojibake
+///   that need healing, OR notices whose listing title/description
+///   changed on page 1.
+/// - Priority C: existing notices ordered by oldest `detail_checked_at`
+///   (rolling edit check).
+pub(crate) fn select_detail_targets(
+    unique_listing: &[Notice],
+    existing_map: &HashMap<String, NoticeRow>,
+    retry_cutoff_iso: &str,
+) -> DetailTargetSelection {
+    let mut selected: Vec<String> = Vec::with_capacity(MAX_DETAIL_FETCHES_PER_RUN);
+    let mut selected_set: HashSet<String> = HashSet::with_capacity(MAX_DETAIL_FETCHES_PER_RUN);
+
+    // Priority A: Brand-new notices
+    let mut new_count = 0usize;
+    for item in unique_listing {
+        if selected.len() >= MAX_DETAIL_FETCHES_PER_RUN {
+            break;
+        }
+        if !existing_map.contains_key(&item.url) && selected_set.insert(item.url.clone()) {
+            selected.push(item.url.clone());
+            new_count += 1;
+        }
+    }
+
+    // Priority B: Unfetched detail pages, mojibake repair, OR listing changes
+    let mut backfill_count = 0usize;
+    for item in unique_listing {
+        if selected.len() >= MAX_DETAIL_FETCHES_PER_RUN {
+            break;
+        }
+        if let Some(row) = existing_map.get(&item.url) {
+            let row_has_mojibake = has_utf8_mojibake(&row.title)
+                || has_utf8_mojibake(&row.description)
+                || has_utf8_mojibake(&row.body_text);
+            let listing_changed = !titles_equivalent_clean(&item.title, &row.title)
+                || !clean_mojibake_eq(&row.description, &item.description);
+            let needs_backfill =
+                row.detail_fetched_at.is_none() && row.detail_due(retry_cutoff_iso);
+            // M7: mojibake / listing-change backfill is gated on the
+            // detail retry cooldown too. Previously it bypassed the
+            // 30-minute cooldown entirely, so a persistently mojibake or
+            // changed row was re-fetched on every 5-minute run.
+            let detail_due = row.detail_due(retry_cutoff_iso);
+
+            if (needs_backfill || ((row_has_mojibake || listing_changed) && detail_due))
+                && selected_set.insert(item.url.clone())
+            {
+                selected.push(item.url.clone());
+                backfill_count += 1;
+            }
+        }
+    }
+
+    // Priority C: Rolling edit check across visible notices (oldest detail_checked_at first)
+    let mut rotation_count = 0usize;
+    if selected.len() < MAX_DETAIL_FETCHES_PER_RUN {
+        let mut candidates: Vec<&NoticeRow> = existing_map
+            .values()
+            .filter(|r| r.detail_fetched_at.is_some() && !selected_set.contains(&r.link))
+            .collect();
+
+        candidates.sort_by(|a, b| {
+            let a_ts = a.detail_checked_at.as_deref().unwrap_or("");
+            let b_ts = b.detail_checked_at.as_deref().unwrap_or("");
+            a_ts.cmp(b_ts)
+        });
+
+        for row in candidates {
+            if selected.len() >= MAX_DETAIL_FETCHES_PER_RUN {
+                break;
+            }
+            if selected_set.insert(row.link.clone()) {
+                selected.push(row.link.clone());
+                rotation_count += 1;
+            }
+        }
+    }
+
+    DetailTargetSelection {
+        targets: selected,
+        new_count,
+        backfill_count,
+        rotation_count,
+    }
+}
+
+/// M15: per-platform notification eligibility, shared by the Telegram and
+/// Facebook dispatch phases (their logic was duplicated inline in
+/// `run()`). Returns `Some(is_edited)` when the notice should be queued,
+/// `None` otherwise.
+pub(crate) fn platform_notification(
+    sent_at: Option<&str>,
+    last_notified_hash: Option<&str>,
+    detail_fetched: bool,
+    detail_attempted: bool,
+    detail_checked: bool,
+    new_hash: &str,
+) -> Option<bool> {
+    match sent_at {
+        None => {
+            if detail_fetched || detail_attempted || detail_checked {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Some(_) => {
+            if detail_attempted && last_notified_hash != Some(new_hash) {
+                Some(true)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// M15: silent-sync eligibility for one existing row, extracted from
+/// `run()`. Returns `(tg_needs_sync, fb_needs_sync)` — each true only
+/// when that platform has already sent this notice (`sent_at` is set)
+/// and its stored hash differs, and the change is a non-edit backfill:
+/// first-time detail fetch, metadata/mojibake healing, or legacy sticky
+/// header re-baseline.
+///
+/// H1 (preserved): a platform that has never sent must never be marked
+/// sent by a silent sync — only its hash is synced, and only when it
+/// has already sent.
+pub(crate) fn silent_sync_flags(
+    row: &NoticeRow,
+    listing_title: &str,
+    item: &Notice,
+    new_hash: &str,
+    matched_legacy_sticky: bool,
+) -> (bool, bool) {
+    let tg_needs_sync =
+        row.tg_sent_at.is_some() && row.tg_last_notified_hash.as_deref() != Some(new_hash);
+    let fb_needs_sync =
+        row.fb_sent_at.is_some() && row.fb_last_notified_hash.as_deref() != Some(new_hash);
+
+    if !tg_needs_sync && !fb_needs_sync {
+        return (false, false);
+    }
+
+    // M6: compare the listing title only. The old check also required
+    // `item.title` — which by this point may be the full detail title —
+    // to be equivalent to the cached title, so a truncated/long title
+    // defeated the sync and produced a false `[EDITED]` notification.
+    let listing_unchanged = titles_equivalent_clean(listing_title, &row.title)
+        && clean_mojibake_eq(&row.description, &item.description);
+
+    let first_detail_backfill =
+        row.detail_fetched_at.is_none() && item.detail_fetched && listing_unchanged;
+
+    let metadata_or_mojibake_backfill = listing_unchanged
+        && clean_mojibake_eq(&row.body_text, &item.body_text)
+        && row.attachments_json == item.attachments_json();
+
+    let sticky_header_rebaseline =
+        matched_legacy_sticky && item.detail_fetched && listing_unchanged;
+
+    if first_detail_backfill || metadata_or_mojibake_backfill || sticky_header_rebaseline {
+        (tg_needs_sync, fb_needs_sync)
+    } else {
+        (false, false)
+    }
 }
 
 /// Detects whether a string contains Latin-1 mojibake (`\u{00e2}\u{0080}` or `\u{00e2}\u{0086}`)
