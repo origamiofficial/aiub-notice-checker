@@ -24,3 +24,14 @@ package-lock.json
 # Artifacts & temp files
 scrape-benchmark.json
 *.html
+
+# Secrets — never commit these. H4: .dev.vars holds live Telegram/Facebook
+# tokens (see README "Configure Local Secrets"); one `git add -A` without
+# this entry would publish them to this public repo. If a secrets file is
+# ever committed by mistake, rotate the tokens immediately (BotFather for
+# Telegram, Meta Access Token Debugger / app dashboard for Facebook) and
+# purge the file from git history.
+.dev.vars
+.env
+.env*
+*.vars

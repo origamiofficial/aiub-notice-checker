@@ -1762,6 +1762,61 @@ mod facebook_tests {
         );
     }
 
+    // H3: a bare HTTP 429 is a rate limit even with no parseable Meta
+    // error payload — it must set a cooldown (via the RateLimited arm in
+    // lib.rs) instead of falling through to Unknown with no cooldown.
+    #[test]
+    fn classify_publish_error_bare_429_is_rate_limited() {
+        use crate::config::FACEBOOK_RATE_LIMIT_COOLDOWN_FALLBACK_MINS;
+        use crate::facebook::{classify_publish_error, BucUsage, FacebookPostResult};
+
+        // No BUC usage: fall back to the 60-minute cooldown.
+        let result =
+            classify_publish_error(429, 0, None, "Too Many Requests", "rate limited", None);
+        assert!(
+            matches!(
+                result,
+                FacebookPostResult::RateLimited {
+                    cooldown_minutes
+                } if cooldown_minutes == FACEBOOK_RATE_LIMIT_COOLDOWN_FALLBACK_MINS
+            ),
+            "bare 429 with no BUC usage must be RateLimited with the fallback, got {result:?}"
+        );
+
+        // BUC usage with an estimated regain time: use that instead.
+        let usage = BucUsage {
+            call_count: 95,
+            total_cputime: 10,
+            total_time: 10,
+            estimated_time_to_regain_access: 15,
+        };
+        let result = classify_publish_error(
+            429,
+            0,
+            None,
+            "Too Many Requests",
+            "rate limited",
+            Some(&usage),
+        );
+        assert!(
+            matches!(
+                result,
+                FacebookPostResult::RateLimited {
+                    cooldown_minutes: 15
+                }
+            ),
+            "bare 429 with BUC regain time must use it, got {result:?}"
+        );
+
+        // A 429 carrying a parsed rate-limit code is rate-limited too.
+        let result =
+            classify_publish_error(429, 4, None, "Application request limit reached", "", None);
+        assert!(
+            matches!(result, FacebookPostResult::RateLimited { .. }),
+            "429 with Meta code 4 must be RateLimited, got {result:?}"
+        );
+    }
+
     // ── Facebook secrets & graceful feature gating ───────────────────
 
     #[test]
@@ -1970,6 +2025,179 @@ mod db_tests {
                 "last_seen_at must be updated for {link}"
             );
         }
+    }
+
+    // H1: silent hash sync must never mark a never-sent notice as sent.
+    // Row 1: Facebook sent, Telegram never sent — the Telegram sync SQL
+    // must leave tg_sent_at NULL and tg_last_notified_hash untouched, while
+    // the Facebook sync SQL updates fb_last_notified_hash.
+    // Row 2: Telegram sent — the Telegram sync SQL must update the hash
+    // and preserve the existing tg_sent_at timestamp.
+    #[test]
+    fn tg_hash_sync_never_marks_unsent_as_sent() {
+        use rusqlite::{params, Connection};
+
+        let conn = Connection::open_in_memory().expect("in-memory SQLite");
+        conn.execute_batch(
+            "CREATE TABLE notices (
+                link TEXT PRIMARY KEY,
+                tg_sent_at TEXT,
+                tg_last_notified_hash TEXT,
+                fb_sent_at TEXT,
+                fb_last_notified_hash TEXT
+            )",
+        )
+        .expect("create notices table");
+        conn.execute(
+            "INSERT INTO notices VALUES (?1, NULL, NULL, ?2, ?3)",
+            params![
+                "https://www.aiub.edu/notice/1",
+                "2026-11-21T10:00:00Z",
+                "old_hash"
+            ],
+        )
+        .expect("insert row 1");
+        conn.execute(
+            "INSERT INTO notices VALUES (?1, ?2, ?3, NULL, NULL)",
+            params![
+                "https://www.aiub.edu/notice/2",
+                "2026-11-21T10:00:00Z",
+                "old_hash"
+            ],
+        )
+        .expect("insert row 2");
+
+        let read = |link: &str| -> (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) {
+            conn.query_row(
+                "SELECT tg_sent_at, tg_last_notified_hash, fb_sent_at, fb_last_notified_hash \
+                 FROM notices WHERE link = ?1",
+                params![link],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("read row")
+        };
+
+        conn.execute(
+            crate::db::tg_hash_sync_sql(),
+            params!["new_hash", "https://www.aiub.edu/notice/1"],
+        )
+        .expect("tg sync row 1");
+        conn.execute(
+            crate::db::fb_hash_sync_sql(),
+            params!["new_hash", "https://www.aiub.edu/notice/1"],
+        )
+        .expect("fb sync row 1");
+        conn.execute(
+            crate::db::tg_hash_sync_sql(),
+            params!["new_hash", "https://www.aiub.edu/notice/2"],
+        )
+        .expect("tg sync row 2");
+
+        let (tg_sent, tg_hash, fb_sent, fb_hash) = read("https://www.aiub.edu/notice/1");
+        assert_eq!(tg_sent, None, "row 1: TG sync must not set tg_sent_at");
+        assert_eq!(tg_hash, None, "row 1: TG sync must not set tg hash");
+        assert_eq!(
+            fb_sent.as_deref(),
+            Some("2026-11-21T10:00:00Z"),
+            "row 1: fb_sent_at must be preserved"
+        );
+        assert_eq!(
+            fb_hash.as_deref(),
+            Some("new_hash"),
+            "row 1: FB sync must update the hash"
+        );
+
+        let (tg_sent, tg_hash, _, _) = read("https://www.aiub.edu/notice/2");
+        assert_eq!(
+            tg_sent.as_deref(),
+            Some("2026-11-21T10:00:00Z"),
+            "row 2: tg_sent_at must be preserved"
+        );
+        assert_eq!(
+            tg_hash.as_deref(),
+            Some("new_hash"),
+            "row 2: TG sync must update the hash for a sent notice"
+        );
+    }
+
+    // H2: a 506 duplicate means Meta already has this content, so the
+    // row must count as sent afterwards — otherwise lib.rs re-queues it
+    // as new (fb_sent_at.is_none()) and loops on 506 forever.
+    #[test]
+    fn fb_duplicate_handled_marks_notice_as_sent() {
+        use rusqlite::{params, Connection};
+
+        let conn = Connection::open_in_memory().expect("in-memory SQLite");
+        conn.execute_batch(
+            "CREATE TABLE notices (
+                link TEXT PRIMARY KEY,
+                fb_sent_at TEXT,
+                fb_last_notified_hash TEXT,
+                fb_notification_attempted_at TEXT
+            )",
+        )
+        .expect("create notices table");
+        // Row 1: never sent, duplicate reported — must become sent.
+        conn.execute(
+            "INSERT INTO notices VALUES (?1, NULL, NULL, NULL)",
+            params!["https://www.aiub.edu/notice/1"],
+        )
+        .expect("insert row 1");
+        // Row 2: already sent at an earlier time — that timestamp must
+        // be preserved, not overwritten.
+        conn.execute(
+            "INSERT INTO notices VALUES (?1, ?2, ?3, NULL)",
+            params![
+                "https://www.aiub.edu/notice/2",
+                "2026-11-20T09:00:00Z",
+                "old_hash"
+            ],
+        )
+        .expect("insert row 2");
+
+        let now = "2026-11-21T12:00:00Z";
+        conn.execute(
+            crate::db::fb_duplicate_handled_sql(),
+            params![now, "hash_v1", now, "https://www.aiub.edu/notice/1"],
+        )
+        .expect("duplicate-handled row 1");
+        conn.execute(
+            crate::db::fb_duplicate_handled_sql(),
+            params![now, "hash_v2", now, "https://www.aiub.edu/notice/2"],
+        )
+        .expect("duplicate-handled row 2");
+
+        let read = |link: &str| -> (Option<String>, Option<String>) {
+            conn.query_row(
+                "SELECT fb_sent_at, fb_last_notified_hash FROM notices WHERE link = ?1",
+                params![link],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read row")
+        };
+        let (sent_at, hash) = read("https://www.aiub.edu/notice/1");
+        assert_eq!(
+            sent_at.as_deref(),
+            Some(now),
+            "row 1: duplicate-handled must set fb_sent_at"
+        );
+        assert_eq!(hash.as_deref(), Some("hash_v1"));
+        assert!(
+            sent_at.is_some(),
+            "row 1: fb_sent_at.is_some() must hold, so it is not re-queued as new"
+        );
+        let (sent_at, hash) = read("https://www.aiub.edu/notice/2");
+        assert_eq!(
+            sent_at.as_deref(),
+            Some("2026-11-20T09:00:00Z"),
+            "row 2: existing fb_sent_at must be preserved"
+        );
+        assert_eq!(hash.as_deref(), Some("hash_v2"));
     }
 }
 
