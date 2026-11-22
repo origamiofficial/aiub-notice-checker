@@ -67,15 +67,18 @@ pub async fn count_notices(session: &D1DatabaseSession) -> Result<i64> {
 }
 
 /// Builds a parameterized upsert statement using `worker::query!` (`&D1Database`).
+/// O5: `attachments_json` is computed once by the caller (`run()`),
+/// not re-serialized here — it was previously computed once per call
+/// site (upsert + silent-sync check) for the same notice.
 pub fn build_upsert_statement(
     db: &D1Database,
     notice: &Notice,
     content_hash: &str,
+    attachments_json: &str,
     detail_attempted: bool,
 ) -> Result<D1PreparedStatement> {
     let now = Utc::now().to_rfc3339();
     let pub_date = notice.published_date.as_deref().unwrap_or("");
-    let attachments_json = notice.attachments_json();
 
     if detail_attempted && notice.detail_fetched {
         query!(
@@ -250,11 +253,12 @@ pub fn build_lightweight_detail_update(
 /// therefore never leave a notice half-synced *within* that chunk.
 ///
 /// Failure granularity (M4): if a whole chunk fails (e.g. one bad statement
-/// poisons the batch), fall back to executing that chunk's statements one
-/// at a time, log each per-statement failure, and continue with the
-/// remaining chunks instead of aborting the whole run / dispatch. Only if
-/// every statement in a chunk also fails individually is the error
-/// propagated, so a single bad row cannot silently discard the rest.
+/// poisons the batch), fall back to bisection (O8) — retry halves until
+/// single bad statements are isolated — log each per-statement failure,
+/// and continue with the remaining chunks instead of aborting the whole
+/// run / dispatch. Only if every statement in a chunk also fails
+/// individually is the error propagated, so a single bad row cannot
+/// silently discard the rest.
 pub async fn execute_batch(
     session: &D1DatabaseSession,
     statements: Vec<D1PreparedStatement>,
@@ -276,35 +280,16 @@ pub async fn execute_batch(
             }
             Err(batch_err) => {
                 worker::console_warn!(
-                    "[D1 Batch Fallback] Chunk {} ({} statements) failed as a batch: {}; retrying statements individually.",
+                    "[D1 Batch Fallback] Chunk {} ({} statements) failed as a batch: {}; retrying by bisection.",
                     chunk_idx,
                     chunk.len(),
                     batch_err
                 );
-                let mut succeeded = 0usize;
-                let mut failed = 0usize;
-                for (stmt_idx, stmt) in chunk.iter().enumerate() {
-                    match session.batch(vec![stmt.clone()]).await {
-                        Ok(results) => {
-                            succeeded += 1;
-                            for res in results {
-                                if let Ok(Some(meta)) = res.meta() {
-                                    metrics.rows_read += meta.rows_read.unwrap_or(0);
-                                    metrics.rows_written += meta.rows_written.unwrap_or(0);
-                                }
-                            }
-                        }
-                        Err(stmt_err) => {
-                            failed += 1;
-                            worker::console_warn!(
-                                "[D1 Batch Fallback] Chunk {} statement {} failed individually: {}",
-                                chunk_idx,
-                                stmt_idx,
-                                stmt_err
-                            );
-                        }
-                    }
-                }
+                let (fallback_metrics, succeeded) =
+                    execute_statements_bisect(session, chunk, chunk_idx, 0).await;
+                metrics.rows_read += fallback_metrics.rows_read;
+                metrics.rows_written += fallback_metrics.rows_written;
+                metrics.failed_statements += fallback_metrics.failed_statements;
                 if succeeded == 0 {
                     // Every statement in this chunk failed even on its own:
                     // there is nothing salvageable, so propagate the error
@@ -319,13 +304,12 @@ pub async fn execute_batch(
                 // M8: surface the per-statement failures to the caller
                 // instead of swallowing them. A batch that returns Ok with
                 // failed_statements > 0 only partially applied.
-                metrics.failed_statements += failed;
                 worker::console_warn!(
-                    "[D1 Batch Fallback] Chunk {} recovered: {}/{} statements applied individually ({} failed).",
+                    "[D1 Batch Fallback] Chunk {} recovered: {}/{} statements applied ({} failed).",
                     chunk_idx,
                     succeeded,
                     chunk.len(),
-                    failed
+                    fallback_metrics.failed_statements
                 );
             }
         }
@@ -334,22 +318,96 @@ pub async fn execute_batch(
     Ok(metrics)
 }
 
+/// O8: fallback for a chunk that failed as a batch. Returns
+/// `(metrics, succeeded_count)`. The old code retried the chunk's
+/// statements one at a time — up to 50 serial round-trips for a full
+/// chunk. Bisection retries halves instead: a half that succeeds
+/// applies in one call, a half that fails splits again, until single
+/// bad statements are isolated. One bad statement in a 50-statement
+/// chunk costs ~12 round-trips instead of 50.
+///
+/// `offset` is the index of `stmts[0]` within the chunk, for logging.
+async fn execute_statements_bisect(
+    session: &D1DatabaseSession,
+    stmts: &[D1PreparedStatement],
+    chunk_idx: usize,
+    offset: usize,
+) -> (D1Metrics, usize) {
+    if stmts.is_empty() {
+        return (D1Metrics::default(), 0);
+    }
+    // Note: `session.batch()` takes an owned Vec, so the slice is
+    // cloned here. The clone is a set of cheap JS-handle refcount
+    // bumps (not a deep copy), and the borrowed slice stays available
+    // for the fallback — that is why execute_batch keeps the chunk
+    // borrowed instead of draining owned statements into batch().
+    match session.batch(stmts.to_vec()).await {
+        Ok(results) => {
+            let mut metrics = D1Metrics::default();
+            for res in results {
+                if let Ok(Some(meta)) = res.meta() {
+                    metrics.rows_read += meta.rows_read.unwrap_or(0);
+                    metrics.rows_written += meta.rows_written.unwrap_or(0);
+                }
+            }
+            (metrics, stmts.len())
+        }
+        Err(err) => {
+            if stmts.len() == 1 {
+                worker::console_warn!(
+                    "[D1 Batch Fallback] Chunk {} statement {} failed individually: {}",
+                    chunk_idx,
+                    offset,
+                    err
+                );
+                (
+                    D1Metrics {
+                        failed_statements: 1,
+                        ..Default::default()
+                    },
+                    0,
+                )
+            } else {
+                let mid = stmts.len() / 2;
+                let (mut m1, s1) = Box::pin(execute_statements_bisect(
+                    session,
+                    &stmts[..mid],
+                    chunk_idx,
+                    offset,
+                ))
+                .await;
+                let (m2, s2) = Box::pin(execute_statements_bisect(
+                    session,
+                    &stmts[mid..],
+                    chunk_idx,
+                    offset + mid,
+                ))
+                .await;
+                m1.rows_read += m2.rows_read;
+                m1.rows_written += m2.rows_written;
+                m1.failed_statements += m2.failed_statements;
+                (m1, s1 + s2)
+            }
+        }
+    }
+}
+
 // ── Telegram delivery tracking ───────────────────────────────────────
 
-/// Records the timestamp of a Telegram send attempt.
-pub async fn mark_tg_notification_attempt(
+/// O1: builds an attempt-mark statement without executing it, so
+/// dispatch can accumulate marks and flush one batch per platform
+/// instead of one round-trip per send.
+pub fn build_tg_attempt_statement(
     db: &D1Database,
-    session: &D1DatabaseSession,
     link: &str,
-) -> Result<D1Metrics> {
-    let now = Utc::now().to_rfc3339();
-    let stmt = query!(
+    now: &str,
+) -> Result<D1PreparedStatement> {
+    query!(
         db,
         "UPDATE notices SET tg_notification_attempted_at=?1 WHERE link=?2",
-        &now,
+        now,
         link,
-    )?;
-    execute_batch(session, vec![stmt]).await
+    )
 }
 
 /// Builds an UPDATE statement marking a notice as notified via Telegram.
@@ -400,79 +458,60 @@ pub async fn mark_tg_hash_sync(
     execute_batch(session, vec![stmt]).await
 }
 
-/// Marks a notice as notified via Telegram for the given `content_hash`.
-pub async fn mark_tg_notified(
-    db: &D1Database,
-    session: &D1DatabaseSession,
-    link: &str,
-    content_hash: &str,
-) -> Result<D1Metrics> {
-    let now = Utc::now().to_rfc3339();
-    let stmt = build_tg_notified_statement(db, link, content_hash, &now)?;
-    execute_batch(session, vec![stmt]).await
-}
-
 // ── Facebook delivery tracking ───────────────────────────────────────
 
-/// Records the timestamp of a Facebook send attempt.
-pub async fn mark_fb_notification_attempt(
+/// O1: builds an attempt-mark statement without executing it (see
+/// `build_tg_attempt_statement`).
+pub fn build_fb_attempt_statement(
     db: &D1Database,
-    session: &D1DatabaseSession,
     link: &str,
-) -> Result<D1Metrics> {
-    let now = Utc::now().to_rfc3339();
-    let stmt = query!(
+    now: &str,
+) -> Result<D1PreparedStatement> {
+    query!(
         db,
         "UPDATE notices SET fb_notification_attempted_at=?1 WHERE link=?2",
-        &now,
+        now,
         link,
-    )?;
-    execute_batch(session, vec![stmt]).await
+    )
 }
 
-/// Marks a notice as successfully posted to Facebook.
-pub async fn mark_fb_notified(
+/// O1: builds a Facebook notified-mark statement without executing it.
+/// The SQL is identical to the inline statement `mark_fb_notified`
+/// used to build.
+pub fn build_fb_notified_statement(
     db: &D1Database,
-    session: &D1DatabaseSession,
     link: &str,
     content_hash: &str,
     post_id: &str,
-) -> Result<D1Metrics> {
-    let now = Utc::now().to_rfc3339();
-    let stmt = query!(
+    now: &str,
+) -> Result<D1PreparedStatement> {
+    query!(
         db,
         "UPDATE notices SET fb_sent_at=COALESCE(fb_sent_at, ?1), fb_last_notified_hash=?2, fb_post_id=?3 WHERE link=?4",
-        &now,
+        now,
         content_hash,
         post_id,
         link,
-    )?;
-    execute_batch(session, vec![stmt]).await
+    )
 }
 
-/// Marks a Facebook duplicate (error 506) as handled to stop retry loops.
-///
-/// H2: also sets `fb_sent_at = COALESCE(fb_sent_at, now)`. Meta has
-/// already seen this content on the Page (that is what a 506 means), so
-/// the notice counts as sent for queueing purposes. The old version only
-/// updated the hash, so `fb_sent_at` stayed NULL and the next run
-/// re-queued the notice as new, got 506 again, and looped forever.
-pub async fn mark_fb_duplicate_handled(
+/// O1: builds a Facebook duplicate-handled statement without executing
+/// it. The SQL is identical to `fb_duplicate_handled_sql()` — keep the
+/// two in sync (see the note above that function).
+pub fn build_fb_duplicate_handled_statement(
     db: &D1Database,
-    session: &D1DatabaseSession,
     link: &str,
     content_hash: &str,
-) -> Result<D1Metrics> {
-    let now = Utc::now().to_rfc3339();
-    let stmt = query!(
+    now: &str,
+) -> Result<D1PreparedStatement> {
+    query!(
         db,
         "UPDATE notices SET fb_sent_at=COALESCE(fb_sent_at, ?1), fb_last_notified_hash=?2, fb_notification_attempted_at=?3 WHERE link=?4",
-        &now,
+        now,
         content_hash,
-        &now,
+        now,
         link,
-    )?;
-    execute_batch(session, vec![stmt]).await
+    )
 }
 
 /// Builds an UPDATE statement for Facebook silent hash sync.
@@ -517,7 +556,46 @@ pub async fn get_app_state(session: &D1DatabaseSession, key: &str) -> Result<Opt
     Ok(row.map(|r| r.value))
 }
 
-/// Persists an operational flag or timestamp in the `app_state` table.
+/// O7: reads several operational keys in one round-trip instead of one
+/// `get_app_state` call per key. The outage/recovery handlers and
+/// `is_facebook_paused()` each made 2 sequential reads on every run
+/// that hit those paths; one `IN (...)` query replaces them.
+pub async fn get_app_states(
+    session: &D1DatabaseSession,
+    keys: &[&str],
+) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    if keys.is_empty() {
+        return Ok(map);
+    }
+    #[derive(Deserialize)]
+    struct KeyValueRow {
+        key: String,
+        value: String,
+    }
+    let d1_types: Vec<D1Type> = keys.iter().map(|k| D1Type::Text(k)).collect();
+    let args: Vec<D1PreparedArgument> = d1_types.iter().map(D1PreparedArgument::new).collect();
+    let stmt = session
+        .prepare(app_states_in_sql(keys.len()))
+        .bind_refs(&args)?;
+    let result = stmt.all().await?;
+    let rows: Vec<KeyValueRow> = result.results()?;
+    for row in rows {
+        map.insert(row.key, row.value);
+    }
+    Ok(map)
+}
+
+/// SQL for [`get_app_states`], extracted so its semantics can be
+/// tested behaviourally against a real SQLite database in tests (same
+/// pattern as `lightweight_detail_update_sql()`).
+pub fn app_states_in_sql(count: usize) -> String {
+    let placeholders: Vec<String> = (1..=count).map(|i| format!("?{i}")).collect();
+    format!(
+        "SELECT key, value FROM app_state WHERE key IN ({})",
+        placeholders.join(", ")
+    )
+}
 pub async fn set_app_state(
     db: &D1Database,
     session: &D1DatabaseSession,

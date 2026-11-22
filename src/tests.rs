@@ -1610,8 +1610,14 @@ mod run_decision_tests {
             "https://www.aiub.edu/notice/1",
             "Important Notice About Examination Schedule",
         );
-        let (tg, fb) =
-            silent_sync_flags(&r, "Important Notice About Exam...", &item, "hash2", false);
+        let (tg, fb) = silent_sync_flags(
+            &r,
+            "Important Notice About Exam...",
+            &item,
+            "hash2",
+            &item.attachments_json(),
+            false,
+        );
         assert!(
             tg,
             "first-detail backfill with a truncated listing title must sync (M6)"
@@ -1630,7 +1636,14 @@ mod run_decision_tests {
             r
         };
         let item = fetched_notice("https://www.aiub.edu/notice/1", "Some Title");
-        let (tg, fb) = silent_sync_flags(&r, "Some Title", &item, "hash2", false);
+        let (tg, fb) = silent_sync_flags(
+            &r,
+            "Some Title",
+            &item,
+            "hash2",
+            &item.attachments_json(),
+            false,
+        );
         assert!(!tg, "Telegram never sent");
         assert!(fb, "Facebook sent and hash differs");
     }
@@ -1644,7 +1657,14 @@ mod run_decision_tests {
             r
         };
         let item = fetched_notice("https://www.aiub.edu/notice/1", "Brand New Title");
-        let (tg, fb) = silent_sync_flags(&r, "Brand New Title", &item, "hash2", false);
+        let (tg, fb) = silent_sync_flags(
+            &r,
+            "Brand New Title",
+            &item,
+            "hash2",
+            &item.attachments_json(),
+            false,
+        );
         assert!(
             !tg && !fb,
             "a genuine listing change is an edit, not a silent sync"
@@ -2549,6 +2569,59 @@ mod db_tests {
             "row 2: existing fb_sent_at must be preserved"
         );
         assert_eq!(hash.as_deref(), Some("hash_v2"));
+    }
+
+    // O7: behavioural test — the SQL from get_app_states()
+    // (via app_states_in_sql()) is executed against a real in-memory
+    // SQLite database: one IN (...) query must return exactly the
+    // requested keys, and no others.
+    #[test]
+    fn app_states_in_sql_returns_only_requested_keys() {
+        use rusqlite::{params, Connection};
+
+        let conn = Connection::open_in_memory().expect("in-memory SQLite");
+        conn.execute_batch("CREATE TABLE app_state (key TEXT PRIMARY KEY, value TEXT)")
+            .expect("create app_state table");
+        for (key, value) in [
+            ("fb_auth_paused", "paused:401"),
+            ("fb_cooldown_until", "2026-11-23T10:00:00Z"),
+            ("unrelated_key", "keep me out"),
+        ] {
+            conn.execute(
+                "INSERT INTO app_state (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            )
+            .expect("insert app_state row");
+        }
+
+        let sql = crate::db::app_states_in_sql(2);
+        let mut stmt = conn.prepare(&sql).expect("prepare IN query");
+        let rows: Vec<(String, String)> = stmt
+            .query_map(params!["fb_auth_paused", "fb_cooldown_until"], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("query app_state")
+            .collect::<Result<_, _>>()
+            .expect("collect rows");
+        assert_eq!(rows.len(), 2, "exactly the two requested keys");
+        assert!(rows
+            .iter()
+            .any(|(k, v)| k == "fb_auth_paused" && v == "paused:401"));
+        assert!(rows
+            .iter()
+            .any(|(k, v)| k == "fb_cooldown_until" && v == "2026-11-23T10:00:00Z"));
+    }
+
+    #[test]
+    fn app_states_in_sql_placeholders_match_count() {
+        assert_eq!(
+            crate::db::app_states_in_sql(1),
+            "SELECT key, value FROM app_state WHERE key IN (?1)"
+        );
+        assert_eq!(
+            crate::db::app_states_in_sql(3),
+            "SELECT key, value FROM app_state WHERE key IN (?1, ?2, ?3)"
+        );
     }
 }
 

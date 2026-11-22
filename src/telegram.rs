@@ -10,7 +10,6 @@ use worker::{
 use crate::config::{
     Secrets, HTTP_TIMEOUT_MS, TELEGRAM_MAX_RETRIES, TELEGRAM_MAX_RETRY_WAIT_SECS, TELEGRAM_PACE_MS,
 };
-use crate::models::{format_notice_message, Notice};
 
 #[derive(Serialize)]
 struct LinkPreviewOptions {
@@ -41,12 +40,14 @@ struct TelegramResponseParams {
 
 /// Sends a formatted notice alert to the main Telegram chat.
 /// Returns `Ok(true)` if delivered, or `Ok(false)` if rate-limited beyond `TELEGRAM_MAX_RETRY_WAIT_SECS`.
-pub async fn send_notice_alert(secrets: &Secrets, notice: &Notice, edited: bool) -> Result<bool> {
-    let text = format_notice_message(notice, edited);
+///
+/// O5: takes the pre-formatted message — `run()` formats each notice
+/// once at queue time, and the Facebook phase uses the same string.
+pub async fn send_notice_alert(secrets: &Secrets, message: &str) -> Result<bool> {
     send_raw_message(
         &secrets.telegram_bot_api_key,
         &secrets.telegram_chat_id,
-        &text,
+        message,
     )
     .await
 }
@@ -78,7 +79,10 @@ async fn send_raw_message(bot_api_key: &str, chat_id: &str, text: &str) -> Resul
         let mut init = RequestInit::new();
         init.with_method(Method::Post)
             .with_headers(headers)
-            .with_body(Some(body_json.clone().into()));
+            // O10: no `body_json.clone()` per retry — the body is built
+            // once above, and `&str -> JsValue` creates the JS string
+            // directly from the borrowed slice.
+            .with_body(Some(body_json.as_str().into()));
 
         let req = Request::new_with_init(&url, &init)?;
         let controller = AbortController::default();
