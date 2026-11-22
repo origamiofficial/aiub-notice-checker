@@ -10,9 +10,10 @@ use worker::{
 };
 
 use crate::config::{
-    FacebookSecrets, Secrets, FACEBOOK_ADMIN_ALERT_DEBOUNCE_HOURS,
-    FACEBOOK_BUC_USAGE_THRESHOLD_PCT, FACEBOOK_GRAPH_API_VERSION, FACEBOOK_PACE_MS,
-    FACEBOOK_RATE_LIMIT_COOLDOWN_FALLBACK_MINS, HTTP_TIMEOUT_MS,
+    FacebookSecrets, Secrets, FACEBOOK_ADMIN_ALERT_DEBOUNCE_HOURS, FACEBOOK_AUTH_PAUSED_KEY,
+    FACEBOOK_AUTH_PAUSE_TTL_HOURS, FACEBOOK_BUC_USAGE_THRESHOLD_PCT, FACEBOOK_COOLDOWN_UNTIL_KEY,
+    FACEBOOK_GRAPH_API_VERSION, FACEBOOK_PACE_MS, FACEBOOK_RATE_LIMIT_COOLDOWN_FALLBACK_MINS,
+    HTTP_TIMEOUT_MS,
 };
 use crate::db;
 use crate::telegram;
@@ -150,6 +151,23 @@ pub fn classify_meta_error(code: i64, subcode: Option<i64>) -> MetaErrorAction {
     }
 }
 
+/// Serialises an auth-pause value for `app_state.fb_auth_paused` as
+/// `<RFC3339 timestamp>|<message>`, so the pause can expire (H2).
+pub fn format_auth_pause_value(message: &str) -> String {
+    format!("{}|{}", Utc::now().to_rfc3339(), message)
+}
+
+/// Parses a value produced by [`format_auth_pause_value`].
+/// Returns `(paused_at, message)`, or `None` for a legacy value that was
+/// stored before timestamps were added (a bare message with no `|`).
+pub fn parse_auth_pause_value(value: &str) -> Option<(chrono::DateTime<Utc>, String)> {
+    let (ts, message) = value.split_once('|')?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()?
+        .with_timezone(&Utc);
+    Some((parsed, message.to_string()))
+}
+
 /// Result of attempting to publish a post to Facebook.
 #[derive(Debug)]
 pub enum FacebookPostResult {
@@ -241,6 +259,9 @@ pub async fn publish_post(
 
     let status = resp.status_code();
     let raw_body = resp.text().await.unwrap_or_default();
+    // L3: never let a token (exact, URL-encoded, truncated, or EAA-shaped)
+    // leak into a stored/logged/alerted error message.
+    let redacted_body = telegram::redact_token(&raw_body, &fb_secrets.page_access_token);
 
     // Parse BUC rate-limit usage header on EVERY response (success or failure)
     let buc_usage = resp
@@ -292,66 +313,129 @@ pub async fn publish_post(
         .as_ref()
         .and_then(|e| e.message.as_deref())
         .unwrap_or("Unknown Meta API error");
+    let error_msg = telegram::redact_token(error_msg, &fb_secrets.page_access_token);
 
+    Ok(classify_publish_error(
+        status,
+        error_code,
+        error_subcode,
+        &error_msg,
+        &redacted_body,
+        buc_usage.as_ref(),
+    ))
+}
+
+/// Pure classification of a failed Graph API publish response (H2/L4).
+/// Kept separate from `publish_post` (which does network I/O) so the
+/// bare-401 / bare-403 rules are unit-testable.
+pub(crate) fn classify_publish_error(
+    status: u16,
+    error_code: i64,
+    error_subcode: Option<i64>,
+    error_msg: &str,
+    redacted_body: &str,
+    buc_usage: Option<&BucUsage>,
+) -> FacebookPostResult {
     // Server-side transient 5xx without explicit Meta error code
     if status >= 500 && error_code == 0 {
-        return Ok(FacebookPostResult::TransientFailure {
-            message: format!("Meta HTTP {status}: {raw_body}"),
-        });
+        return FacebookPostResult::TransientFailure {
+            message: format!("Meta HTTP {status}: {redacted_body}"),
+        };
     }
 
+    // H2: a bare 401 with no parseable Meta error payload is NOT proof of an
+    // auth failure — it can be a Meta edge glitch, a proxy/CDN 401, or an
+    // HTML error page. Treat it as transient (defer to the next cron) so it
+    // can never permanently pause Facebook posting. A genuine auth failure
+    // carries a parseable Meta error (code 190/102) and is classified below.
     if status == 401 && error_code == 0 {
-        return Ok(FacebookPostResult::AuthError {
-            message: format!("Meta HTTP 401 Unauthorized: {raw_body}"),
-        });
+        return FacebookPostResult::TransientFailure {
+            message: format!("Meta HTTP 401 Unauthorized (unparsable body): {redacted_body}"),
+        };
+    }
+
+    // L4: a bare 403 with no parseable Meta error payload is, by contrast,
+    // a permission denial — treat it as an auth/permission error (with the
+    // H2 expiry, so it cannot pause posting forever), matching the handling
+    // of a parsed permission error (code 10 / 200..=299) below.
+    if status == 403 && error_code == 0 {
+        return FacebookPostResult::AuthError {
+            message: format!("Meta HTTP 403 Forbidden (unparsable body): {redacted_body}"),
+        };
     }
 
     let action = classify_meta_error(error_code, error_subcode);
     match action {
         MetaErrorAction::RateLimitCooldown { .. } => {
             let cooldown = buc_usage
-                .as_ref()
                 .map(|u| u.estimated_time_to_regain_access)
                 .filter(|&m| m > 0)
                 .unwrap_or(FACEBOOK_RATE_LIMIT_COOLDOWN_FALLBACK_MINS);
 
-            Ok(FacebookPostResult::RateLimited {
+            FacebookPostResult::RateLimited {
                 cooldown_minutes: cooldown,
-            })
+            }
         }
-        MetaErrorAction::SpamBlock => Ok(FacebookPostResult::SpamBlocked),
-        MetaErrorAction::DuplicatePost => Ok(FacebookPostResult::Duplicate),
-        MetaErrorAction::AuthFailure { code, subcode } => Ok(FacebookPostResult::AuthError {
+        MetaErrorAction::SpamBlock => FacebookPostResult::SpamBlocked,
+        MetaErrorAction::DuplicatePost => FacebookPostResult::Duplicate,
+        MetaErrorAction::AuthFailure { code, subcode } => FacebookPostResult::AuthError {
             message: format!(
                 "Facebook auth failure (code: {code}, subcode: {:?}): {error_msg}",
                 subcode
             ),
-        }),
-        MetaErrorAction::PermissionError { code } => Ok(FacebookPostResult::AuthError {
+        },
+        MetaErrorAction::PermissionError { code } => FacebookPostResult::AuthError {
             message: format!("Facebook permission error (code: {code}): {error_msg}"),
-        }),
-        MetaErrorAction::TransientError => Ok(FacebookPostResult::TransientFailure {
+        },
+        MetaErrorAction::TransientError => FacebookPostResult::TransientFailure {
             message: format!("Meta transient error {error_code}: {error_msg}"),
-        }),
-        MetaErrorAction::Unknown { code } => Ok(FacebookPostResult::UnknownError {
+        },
+        MetaErrorAction::Unknown { code } => FacebookPostResult::UnknownError {
             message: format!(
                 "Meta error {code} (subcode: {:?}): {error_msg}",
                 error_subcode
             ),
-        }),
+        },
     }
 }
 
 /// Checks whether Facebook publishing is temporarily paused due to rate limiting or auth failure.
+///
+/// H2: an auth pause expires after `FACEBOOK_AUTH_PAUSE_TTL_HOURS` (24h).
+/// An expired pause — or a legacy pause value stored before timestamps
+/// were added, which has no reliable start time — is deleted and treated
+/// as not paused. A genuine auth failure will re-pause on the next failed
+/// post attempt, so expiring a stale pause cannot mask a real problem.
 pub async fn is_facebook_paused(
     db: &D1Database,
     session: &D1DatabaseSession,
 ) -> Result<(bool, Option<String>)> {
-    if let Some(reason) = db::get_app_state(session, "fb_auth_paused").await? {
-        return Ok((true, Some(format!("Authentication paused: {reason}"))));
+    if let Some(reason) = db::get_app_state(session, FACEBOOK_AUTH_PAUSED_KEY).await? {
+        match parse_auth_pause_value(&reason) {
+            Some((paused_at, message)) => {
+                let age = Utc::now().signed_duration_since(paused_at);
+                if age.num_hours() >= FACEBOOK_AUTH_PAUSE_TTL_HOURS {
+                    console_log!(
+                        "Facebook auth pause expired (paused at {}, {}h old); clearing it.",
+                        paused_at.to_rfc3339(),
+                        age.num_hours()
+                    );
+                    let _ = db::delete_app_state(db, session, FACEBOOK_AUTH_PAUSED_KEY).await;
+                } else {
+                    return Ok((true, Some(format!("Authentication paused: {message}"))));
+                }
+            }
+            None => {
+                // Legacy value with no timestamp: its age is unknowable, so
+                // it must not be allowed to pause posting forever. Clear it;
+                // a real auth failure will re-pause on the next attempt.
+                console_log!("Facebook auth pause has no timestamp (legacy value); clearing it.");
+                let _ = db::delete_app_state(db, session, FACEBOOK_AUTH_PAUSED_KEY).await;
+            }
+        }
     }
 
-    if let Some(cooldown_until) = db::get_app_state(session, "fb_cooldown_until").await? {
+    if let Some(cooldown_until) = db::get_app_state(session, FACEBOOK_COOLDOWN_UNTIL_KEY).await? {
         let now = Utc::now().to_rfc3339();
         if cooldown_until > now {
             return Ok((
@@ -359,7 +443,7 @@ pub async fn is_facebook_paused(
                 Some(format!("Rate limit cooldown active until {cooldown_until}")),
             ));
         } else {
-            let _ = db::delete_app_state(db, session, "fb_cooldown_until").await;
+            let _ = db::delete_app_state(db, session, FACEBOOK_COOLDOWN_UNTIL_KEY).await;
         }
     }
 

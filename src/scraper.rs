@@ -861,7 +861,7 @@ fn find_closing_tag_case_insensitive(haystack: &[u8], closing_tag: &[u8]) -> Opt
         .map(|pos| pos + closing_tag.len())
 }
 
-fn is_block_tag(tag_slice: &[u8]) -> bool {
+pub(crate) fn is_block_tag(tag_slice: &[u8]) -> bool {
     let stripped = if let Some(s) = tag_slice.strip_prefix(b"</") {
         s
     } else if let Some(s) = tag_slice.strip_prefix(b"<") {
@@ -882,10 +882,15 @@ fn is_block_tag(tag_slice: &[u8]) -> bool {
         b"div".as_slice(),
         b"li".as_slice(),
         b"tr".as_slice(),
+        // L1: <pre> was matched by the old prefix matcher and <h5>/<h6>
+        // were missing; all three are block-level for line-break purposes.
+        b"pre".as_slice(),
         b"h1".as_slice(),
         b"h2".as_slice(),
         b"h3".as_slice(),
         b"h4".as_slice(),
+        b"h5".as_slice(),
+        b"h6".as_slice(),
     ] {
         if name.eq_ignore_ascii_case(block_name) {
             return true;

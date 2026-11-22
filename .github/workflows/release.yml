@@ -65,6 +65,17 @@ jobs:
           # Case 1: Triggered directly by tag push
           if [[ "${{ github.event_name }}" == "push" && "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
             TAG_NAME="${GITHUB_REF_NAME}"
+            # H1: the tag push itself triggers this run, and the release
+            # workflow also pushes the tag — so a second run is queued for
+            # every release. If the GitHub Release already exists, this
+            # run is the duplicate: exit successfully without rebuilding
+            # or failing on `gh release create`.
+            if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
+              echo "GitHub Release $TAG_NAME already exists; this tag-push run is a duplicate. Skipping."
+              echo "has_worker_changes=false" >> "$GITHUB_OUTPUT"
+              echo "existing_tag=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             echo "Triggered directly by tag push: $TAG_NAME"
             echo "has_worker_changes=true" >> "$GITHUB_OUTPUT"
             echo "existing_tag=$TAG_NAME" >> "$GITHUB_OUTPUT"
@@ -74,6 +85,14 @@ jobs:
           # Case 2: Manual tag release requested via workflow_dispatch
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ github.event.inputs.tag }}" ]]; then
             INPUT_TAG="${{ github.event.inputs.tag }}"
+            # H1: same duplicate guard as Case 1 — never re-create a
+            # release that already exists for this tag.
+            if gh release view "$INPUT_TAG" --repo "$GITHUB_REPOSITORY" &>/dev/null; then
+              echo "GitHub Release $INPUT_TAG already exists; skipping duplicate manual release."
+              echo "has_worker_changes=false" >> "$GITHUB_OUTPUT"
+              echo "existing_tag=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             echo "Manual tag release requested: $INPUT_TAG"
             echo "has_worker_changes=true" >> "$GITHUB_OUTPUT"
             echo "existing_tag=$INPUT_TAG" >> "$GITHUB_OUTPUT"
@@ -112,6 +131,22 @@ jobs:
           echo "Cloudflare Worker changes detected since previous release."
           echo "has_worker_changes=true" >> "$GITHUB_OUTPUT"
           echo "existing_tag=" >> "$GITHUB_OUTPUT"
+
+      # ── H1: build from the tag, not from main HEAD ────────────────
+      # For an existing-tag / orphaned-tag recovery run, the release assets
+      # must be built from the tagged commit itself. The checkout step
+      # above always checks out `main`, so without this the published
+      # release would silently contain whatever main HEAD happened to be
+      # (as happened for v6.2.0). New-tag runs skip this step and build
+      # from main as before.
+      - name: Checkout release tag (existing-tag path)
+        if: steps.check_changes.outputs.has_worker_changes == 'true' && steps.check_changes.outputs.existing_tag != ''
+        run: |
+          TAG="${{ steps.check_changes.outputs.existing_tag }}"
+          echo "Checking out existing tag $TAG (detached) so build/benchmark match the tag, not main HEAD."
+          git checkout --detach "$TAG"
+          echo "Checked out commit: $(git rev-parse HEAD)"
+          echo "Tag at HEAD: $(git describe --tags --exact-match HEAD || echo '<none>')"
 
       # ── Setup toolchains ─────────────────────────────────────────
       - name: Setup Rust stable toolchain
@@ -324,11 +359,31 @@ jobs:
             PUSH_ARGS+=("main")
           fi
 
-          # Create annotated release tag
-          git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}" -f
-          PUSH_ARGS+=("v${NEW_VERSION}")
+          # Create annotated release tag.
+          # M3: never force-move a tag. If the tag already exists, only
+          # proceed when it points at exactly this commit (idempotent
+          # re-run); if it points elsewhere, fail rather than silently
+          # retagging a published release.
+          if git rev-parse -q --verify "refs/tags/v${NEW_VERSION}" >/dev/null; then
+            if [[ "$(git rev-parse "v${NEW_VERSION}^{commit}")" == "$(git rev-parse HEAD)" ]]; then
+              echo "Tag v${NEW_VERSION} already exists at this commit; reusing it (not pushing the tag again)."
+            else
+              echo "ERROR: Tag v${NEW_VERSION} already exists pointing at a different commit ($(git rev-parse "v${NEW_VERSION}")). Refusing to move a published tag." >&2
+              exit 1
+            fi
+          else
+            git tag -a "v${NEW_VERSION}" -m "Release v${NEW_VERSION}"
+            PUSH_ARGS+=("v${NEW_VERSION}")
+          fi
 
-          # Push commit and tag together with retry loop
+          # Push commit and tag together with retry loop.
+          # (M3 follow-on: if there is nothing to push — no version commit
+          # and the tag already existed at this commit — skip the push
+          # entirely instead of running a bare `git push origin`.)
+          if [[ ${#PUSH_ARGS[@]} -eq 0 ]]; then
+            echo "Nothing to push (no version commit; tag already exists at this commit)."
+            exit 0
+          fi
           MAX_RETRIES=3
           RETRY_DELAY=5
           for attempt in $(seq 1 $MAX_RETRIES); do
@@ -362,9 +417,17 @@ jobs:
             BUMP_TYPE="hotfix (patch)"
           fi
 
-          # Extract commit changelog between previous tag and HEAD^ (excluding the release commit)
+          # Extract commit changelog.
+          # H1: for an existing-tag release, the range is PREV_TAG..TAG —
+          # never ..HEAD^, which would list commits that are not in the
+          # tagged release (as happened for v6.2.0). For a new tag, HEAD^
+          # excludes the just-created release commit.
           CHANGES=""
-          if [[ -n "$PREV_TAG" ]] && git rev-parse --verify "refs/tags/$PREV_TAG" &>/dev/null; then
+          IS_EXISTING="${{ steps.version.outputs.is_existing_tag }}"
+          EXISTING_TAG="${{ steps.check_changes.outputs.existing_tag }}"
+          if [[ "$IS_EXISTING" == "true" && -n "$EXISTING_TAG" && -n "$PREV_TAG" ]] && git rev-parse --verify "refs/tags/$PREV_TAG" &>/dev/null; then
+            CHANGES=$(git log "${PREV_TAG}..${EXISTING_TAG}" --pretty=format:"- %h %s" --no-merges 2>/dev/null || true)
+          elif [[ -n "$PREV_TAG" ]] && git rev-parse --verify "refs/tags/$PREV_TAG" &>/dev/null; then
             CHANGES=$(git log "${PREV_TAG}..HEAD^" --pretty=format:"- %h %s" --no-merges 2>/dev/null || true)
           elif [[ -n "$PREV_VERSION" ]] && git rev-parse --verify "refs/tags/v$PREV_VERSION" &>/dev/null; then
             CHANGES=$(git log "v${PREV_VERSION}..HEAD^" --pretty=format:"- %h %s" --no-merges 2>/dev/null || true)
