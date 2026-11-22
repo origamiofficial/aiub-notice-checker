@@ -50,8 +50,8 @@ By running as a serverless Rust Worker on Cloudflare's global edge network, the 
 - ⚡ **Zero-Overhead Edge Execution:** Compiled to `wasm32-unknown-unknown` via Rust for sub-millisecond execution times and minimal memory footprint.
 - ⏰ **Deterministic Cron Scheduling:** Cloudflare Worker cron triggers invoke the pipeline every 5 minutes (`*/5 * * * *`) to inspect the latest 50 notices on page 1 (`LIST_PAGE_SIZE = 50`).
 - 📢 **Native Dual-Channel Broadcasting:** Dispatches announcements to both **Telegram** (via Bot API) and **Facebook Pages** (via Meta Graph API v27.0) with zero external webhook or automation dependencies.
-- 📝 **Unified Cross-Platform Formatting:** Delivers 100% identical notice text, layout, and attachment lists across Telegram and Facebook, capped at 4,096 characters (`UNIFIED_MAX_MESSAGE_LEN`) while preserving all attachment and portal links.
-- 🌐 **AIUB Upstream Outage & Recovery Alerts:** Gracefully skips runs when the university website is down. If unreachable for $\ge 60$ minutes, sends a non-spammy admin alert, and automatically announces service recovery with total downtime calculated when online.
+- 📝 **Unified Cross-Platform Formatting:** Delivers 100% identical notice text, layout, and attachment lists across Telegram and Facebook, capped at 4,096 UTF-16 code units (`UNIFIED_MAX_MESSAGE_LEN` — the unit Telegram counts, so an emoji counts as 2) while preserving all attachment and portal links; the notice URL is never truncated, even for image-only notices with very long attachment lists.
+- 🌐 **AIUB Upstream Outage & Recovery Alerts:** Gracefully skips runs when the university website is down. If unreachable for $\ge 60$ minutes, sends a non-spammy admin alert, and automatically announces service recovery with total downtime calculated when the listing comes back with notices parsed. A recovery alert is only sent when the listing actually parses notices, and if Telegram delivery fails the outage state is kept so the alert is retried on the next run instead of being lost.
 - 🔀 **Independent Channel State:** Dedicated delivery columns (`tg_*` and `fb_*`) in Cloudflare D1 ensure rate limits, transient errors, or cooldowns on one platform never delay deliveries on the other.
 - 🛡️ **Empty-Database Cold-Start Guard:** Automatically detects fresh database initialization or D1 resets; if D1 is empty and notices are found ($\ge 10$), it silently seeds the archive without flooding Telegram subscribers or Facebook feeds.
 - 🔍 **Intelligent Content Hashing:** Uses cryptographic SHA-256 signatures across titles, descriptions, bodies, and attachment sets to detect both newly issued notices and updates to existing entries.
@@ -62,11 +62,11 @@ By running as a serverless Rust Worker on Cloudflare's global edge network, the 
   - **Priority C:** Rolling round-robin rotation (oldest `detail_checked_at` first) to continuously monitor older visible notices for retroactive updates.
 - 🖼️ **Attachment-First Delivery for Image Notices:** When notices contain only scanned flyers or PDF banners without descriptive text, direct asset links are prioritized over placeholder texts across all platforms.
 - 📈 **Meta BUC & Page Usage Intelligence:** Inspects `X-Business-Use-Case-Usage`, `X-App-Usage`, and `X-Page-Usage` response headers on every call, throttling gracefully when approaching 80% usage thresholds with automatic cleanup of expired cooldown state.
-- 🚨 **Automated Meta Error Classification:** Deterministically handles Meta Graph API codes (rate limits, spam blocks, consecutive duplicates, token expiry, 401 unauthorized, and permission errors) with state-backed cooldowns and debounced admin alerts.
+- 🚨 **Automated Meta Error Classification:** Deterministically handles Meta Graph API codes (rate limits, spam blocks, consecutive duplicates, token expiry, and permission errors) with state-backed cooldowns and debounced admin alerts. A bare/unparsable 401 is treated as transient (never a permanent auth pause), a bare 403 as an auth error, and an auth pause (`fb_auth_paused`) expires after 24 hours (`FACEBOOK_AUTH_PAUSE_TTL_HOURS`) so a transient blip cannot permanently kill Facebook posting.
 - 🧹 **Word & CMS Control Character Sanitization:** Actively purges invisible Unicode artifacts (soft hyphens `\u{00AD}`, directional marks `\u{200E}`/`\u{200F}`, zero-width joiners `\u{200B}`..=`\u{200D}`, and BOMs `\u{FEFF}`) common in copy-pasted notices.
 - 📅 **Flexible Multi-Format Date Engine:** Intelligently parses AIUB's diverse publication date layouts, including standard ISO, month-first (`November 15, 2026`), ordinal suffixes (`15th November 2026`), and hyphenated variants (`15-Nov-2026`).
 - 🚫 **Meaningful Content Filtering:** Intelligently identifies and suppresses CMS boilerplate like `"No description available"` or `"Please click the link for details."` so attachments and clean summaries take priority (falling back to a generic prompt only when body and attachments are completely absent).
-- 🩹 **Batched Silent Hash Sync & Mojibake Healing:** Seamlessly repairs legacy UTF-8/Latin-1 double-encoded characters, backfills first-time detail fetches, and re-baselines legacy headers in a single atomic D1 batch without triggering duplicate "Notice Edited" notifications.
+- 🩹 **Batched Silent Hash Sync & Mojibake Healing:** Seamlessly repairs legacy UTF-8/Latin-1 double-encoded characters, backfills first-time detail fetches, and re-baselines legacy headers in a single atomic D1 batch without triggering duplicate "Notice Edited" notifications. Each D1 batch chunk is atomic (all-or-nothing); if a chunk fails, its statements are retried individually with per-statement failures logged, instead of aborting the whole run. Mojibake comparison is Unicode-aware, so Bengali/accented-only edits are detected.
 - 🩺 **Granular Diagnostics & Circuit Breaker:** Categorizes scraper failures into DOM layout shifts, upstream AIUB timeouts, or Worker CPU limits; sends structured diagnostic reports to administrators when $\ge 80\%$ of sampled pages fail validation.
 - 📐 **Selector Coverage Monitoring:** Tracks date and description selector extraction rates on listing page 1, logging early alerts if extraction coverage falls below 80% (`MIN_LISTING_DATE_COVERAGE` / `MIN_LISTING_DESC_COVERAGE`).
 - 🚦 **Rate-Limited Delivery Pacing & Redaction:** Dispatches announcements sequentially with pacing delays (1,000ms for Telegram, 1,500ms for Facebook), modern link preview suppression (`link_preview_options`), and strict bot token redaction in all error logs.
@@ -539,13 +539,13 @@ Failed URLs:
 
 - **Distributed Traces:** Employs Cloudflare Workers Tracing with a root span (`scheduled_notice_check`) and named child span instrumentation (`fetch_listing`, `load_existing_from_d1`, `select_detail_targets`, `fetch_detail_pages`, `d1_batch_upsert`, `dispatch_telegram_notifications`, `dispatch_facebook_notifications`).
 - **Circuit Breaker & Fallback Guard:** If sampled detail pages fail validation at a rate $\ge 80\%$ (minimum 4 samples), the Worker dispatches a diagnostic alert to `TELEGRAM_ADMIN_CHAT_ID` identifying whether failures stem from DOM shifts or upstream timeouts. It preserves previously cached details in D1, places failed targets on a 30-minute cooldown, and prevents corrupt state overwrites.
-- **Empty Listing Layout Shift Guard:** If the listing page responds with HTTP 200 but 0 notices are parsed, the Worker immediately aborts execution and dispatches an urgent alert to `TELEGRAM_ADMIN_CHAT_ID`, preventing accidental clearing or corrupted state.
+- **Empty Listing Layout Shift Guard:** If the listing page responds with HTTP 200 but 0 notices are parsed, the Worker immediately aborts execution and dispatches an urgent alert to `TELEGRAM_ADMIN_CHAT_ID`, preventing accidental clearing or corrupted state. The alert is debounced to at most once per 6 hours (`EMPTY_LISTING_ALERT_DEBOUNCE_HOURS = 6`), so a prolonged DOM break does not spam the admin chat every 5 minutes.
 - **Listing Selector Coverage Monitoring:** Continuously evaluates date and description selector coverage across discovered listing items; logs warning telemetry if either metric drops below 80% (`MIN_LISTING_DATE_COVERAGE = 0.8`, `MIN_LISTING_DESC_COVERAGE = 0.8`).
 - **AIUB Outage & Recovery Circuit:**
   - If fetching the listing page fails due to university server downtime (HTTP 5xx, timeouts, or network errors), the run is gracefully skipped without logging fatal error spans.
   - Outage start is recorded in `app_state` (`aiub_down_since`).
   - If continuously unreachable for $\ge 60$ minutes (`AIUB_OUTAGE_ALERT_THRESHOLD_MINS = 60`), a single alert is sent to `TELEGRAM_ADMIN_CHAT_ID` (`aiub_outage_alerted = "true"`).
-  - When AIUB recovers, the worker calculates total downtime (`format_duration_human()`), notifies the admin chat, and atomically deletes outage keys (`delete_app_state_keys`).
+  - When AIUB recovers (listing fetch parses at least one notice), the worker calculates total downtime (`format_duration_human()`), notifies the admin chat, and only then deletes outage keys (`delete_app_state_keys`); if the recovery alert fails to deliver, the outage keys are kept for a retry on the next run. A corrupt stored `aiub_down_since` value is never overwritten with "now" (which would restart the 60-minute clock) — the outage is treated as already started and the corrupt value is logged.
 - **HTTP Fetch Guards:** Every outbound HTTP request is guarded by:
   - 15-second `AbortController` timeout (`HTTP_TIMEOUT_MS = 15_000`).
   - Response payload cap of 2 MB (`MAX_HTML_BYTES = 2 * 1024 * 1024`) to prevent edge out-of-memory errors.
@@ -553,7 +553,7 @@ Failed URLs:
   - URL length restriction capped at 2,048 characters (`MAX_URL_LENGTH = 2048`).
   - Strict host enforcement ensuring requests remain bounded to `www.aiub.edu` (third-party domains permitted only for direct attachment assets).
 - **HTML & DOM Parser Resilience:** Tokenizes DOM structures with exact tag matching (`is_block_tag`) and decoupled `<style>`/`<script>` subtree stripping so text between embedded scripts or styles is never dropped.
-- **Token Redaction & Privacy:** Outbound API credentials (such as `TELEGRAM_BOT_API_KEY`) are actively redacted (`[REDACTED]`) from error descriptions before any exception is surfaced or logged.
+- **Token Redaction & Privacy:** Outbound API credentials (such as `TELEGRAM_BOT_API_KEY` and the Facebook Page access token) are actively redacted (`[REDACTED]`) from error descriptions before any exception is surfaced or logged — covering the exact token, its URL-encoded form, truncated fragments, and any `EAA…` Meta token pattern.
 - **Detail Retry Cooldown:** Failed detail page fetches enter a 30-minute cooldown (`DETAIL_RETRY_COOLDOWN_MINUTES = 30`) to avoid wasting cycle quotas on broken or timing-out URLs.
 - **Admin Alert Debouncing:** Facebook operational alerts sent to `TELEGRAM_ADMIN_CHAT_ID` are debounced to at most once per 6 hours per error category (`FACEBOOK_ADMIN_ALERT_DEBOUNCE_HOURS = 6`).
 - **Backpressure Protection & Pacing:** In each 5-minute cycle:
@@ -588,7 +588,7 @@ cargo fmt --check
 # Run Clippy with zero-warning tolerance
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Execute unit and integration tests (119 tests)
+# Execute unit and integration tests (136 tests)
 cargo test --all-features
 
 # Verify WebAssembly compilation target
@@ -609,7 +609,7 @@ aiub-notice-checker/
 │       ├── dependency-review.yml      # PR dependency review action
 │       ├── deploy.yml                 # Chained deployment: runs after test.yml succeeds
 │       ├── release.yml                # Automated version bump, 500-notice benchmark, and GitHub Release
-│       └── test.yml                   # CI pipeline: fmt, clippy, 119 unit tests, wasm check
+│       └── test.yml                   # CI pipeline: fmt, clippy, 136 unit tests, wasm check
 ├── migrations/
 │   ├── 0001_init.sql                  # Initial schema and indexes
 │   └── 0002_facebook_and_tg_rename.sql # Facebook tracking columns, tg_ rename, and flood backfill
@@ -625,7 +625,7 @@ aiub-notice-checker/
 │   ├── models.rs                      # Notice data models, hashing, and unified cross-platform message formatter
 │   ├── scraper.rs                     # HTML fetching, redirect handling, and tl DOM parsing
 │   ├── telegram.rs                    # Telegram Bot API client, rate-limit handler, and retries
-│   ├── tests.rs                       # Comprehensive unit and regression test suite (119 tests)
+│   ├── tests.rs                       # Comprehensive unit and regression test suite (136 tests)
 │   └── version.rs                     # Single-digit rolling semver rollover calculation logic
 ├── Cargo.toml                         # Rust crate manifest, dependencies, and release profiles
 ├── LICENSE                            # MIT License

@@ -22,6 +22,10 @@ pub const DETAIL_FAILURE_RATIO: f64 = 0.8;
 pub const AIUB_OUTAGE_ALERT_THRESHOLD_MINS: i64 = 60;
 pub const AIUB_OUTAGE_DOWN_SINCE_KEY: &str = "aiub_down_since";
 pub const AIUB_OUTAGE_ALERTED_KEY: &str = "aiub_outage_alerted";
+// Debounce for the "0 notices parsed" admin alert (M2): a DOM break must not
+// alert on every 5-minute run.
+pub const EMPTY_LISTING_ALERT_KEY: &str = "empty_listing_last_alert_at";
+pub const EMPTY_LISTING_ALERT_DEBOUNCE_HOURS: i64 = 6;
 
 pub const UNIFIED_MAX_MESSAGE_LEN: usize = 4096;
 pub const TELEGRAM_MAX_MESSAGE_LEN: usize = UNIFIED_MAX_MESSAGE_LEN;
@@ -39,6 +43,13 @@ pub const FACEBOOK_RATE_LIMIT_COOLDOWN_FALLBACK_MINS: i64 = 60;
 pub const FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS: i64 = 12;
 pub const FACEBOOK_ADMIN_ALERT_DEBOUNCE_HOURS: i64 = 6;
 pub const FACEBOOK_TRANSIENT_RETRY_WAIT_MS: u64 = 2_000;
+// Auth pause (fb_auth_paused) must never last forever (H2): a pause older
+// than this is treated as expired and cleared, so a transient auth blip
+// cannot permanently kill Facebook posting. A genuine auth failure will
+// simply re-pause on the next failed post attempt.
+pub const FACEBOOK_AUTH_PAUSE_TTL_HOURS: i64 = 24;
+pub const FACEBOOK_AUTH_PAUSED_KEY: &str = "fb_auth_paused";
+pub const FACEBOOK_COOLDOWN_UNTIL_KEY: &str = "fb_cooldown_until";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FacebookSecrets {

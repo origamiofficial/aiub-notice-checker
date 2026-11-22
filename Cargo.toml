@@ -17,6 +17,14 @@ sha2 = "0.11"
 tl = "0.7.8"
 worker = { version = "0.9.0", features = ["d1"] }
 
+[dev-dependencies]
+# Only used by the behavioural db tests in src/tests.rs (L2): the SQL from
+# build_lightweight_detail_update() is executed against a real in-memory
+# SQLite database (D1 is SQLite-backed). Dev-dependencies are not included
+# in the wasm release build. `bundled` is required because the build
+# environment has no libsqlite3 dev headers.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 [profile.release]
 opt-level = "s"
 lto = true

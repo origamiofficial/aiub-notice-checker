@@ -23,6 +23,7 @@ pub mod version;
 use config::{
     Secrets, AIUB_OUTAGE_ALERTED_KEY, AIUB_OUTAGE_ALERT_THRESHOLD_MINS, AIUB_OUTAGE_DOWN_SINCE_KEY,
     DETAIL_FAILURE_MIN_SAMPLE, DETAIL_FAILURE_RATIO, DETAIL_RETRY_COOLDOWN_MINUTES,
+    EMPTY_LISTING_ALERT_DEBOUNCE_HOURS, EMPTY_LISTING_ALERT_KEY, FACEBOOK_AUTH_PAUSED_KEY,
     FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS, MAX_DETAIL_FETCHES_PER_RUN, MAX_FACEBOOK_SENDS_PER_RUN,
     MAX_TELEGRAM_SENDS_PER_RUN, MIN_LISTING_DATE_COVERAGE, MIN_LISTING_DESC_COVERAGE,
 };
@@ -156,14 +157,26 @@ async fn handle_upstream_outage(
         Some(ref s) if !s.is_empty() => match DateTime::parse_from_rfc3339(s) {
             Ok(dt) => dt.with_timezone(&Utc),
             Err(_) => {
-                let now_str = now.to_rfc3339();
-                let _ = db::set_app_state(db, session, AIUB_OUTAGE_DOWN_SINCE_KEY, &now_str).await;
-                now
+                // L5: do NOT overwrite a corrupt stored value with `now` —
+                // that would restart the 60-minute alert clock. Preserve
+                // the stored value and treat the outage as already started
+                // (alert on schedule instead of delaying it by up to an
+                // hour). The corrupt value is logged for diagnosis.
+                console_warn!(
+                    "[Outage State Warning] Stored {} value is not valid RFC3339 (value: {:?}); treating outage as already started.",
+                    AIUB_OUTAGE_DOWN_SINCE_KEY,
+                    s
+                );
+                now - Duration::minutes(AIUB_OUTAGE_ALERT_THRESHOLD_MINS)
             }
         },
         _ => {
+            // First failed run of this outage: record the start time.
+            // L5: a failed write is propagated (not silently ignored with
+            // `let _ =`), so the caller logs it and the next run retries
+            // instead of the alert silently never firing.
             let now_str = now.to_rfc3339();
-            let _ = db::set_app_state(db, session, AIUB_OUTAGE_DOWN_SINCE_KEY, &now_str).await;
+            db::set_app_state(db, session, AIUB_OUTAGE_DOWN_SINCE_KEY, &now_str).await?;
             now
         }
     };
@@ -182,7 +195,7 @@ async fn handle_upstream_outage(
                 .await
                 .unwrap_or(false);
             if alert_sent || secrets.telegram_admin_chat_id.is_none() {
-                let _ = db::set_app_state(db, session, AIUB_OUTAGE_ALERTED_KEY, "true").await;
+                db::set_app_state(db, session, AIUB_OUTAGE_ALERTED_KEY, "true").await?;
             }
         }
     }
@@ -190,11 +203,15 @@ async fn handle_upstream_outage(
     Ok(())
 }
 
+/// M1: a recovery is only a recovery when the listing fetch actually
+/// parsed notices. A 0-notice fetch (DOM change) is not the site coming
+/// back, so it must not send a recovery alert or clear the outage state.
 async fn handle_upstream_recovery(
     db: &D1Database,
     session: &D1DatabaseSession,
     secrets: &Secrets,
     now: DateTime<Utc>,
+    listing_count: usize,
 ) -> worker::Result<()> {
     let down_since_str = db::get_app_state(session, AIUB_OUTAGE_DOWN_SINCE_KEY).await?;
     let Some(down_since_str) = down_since_str else {
@@ -209,22 +226,138 @@ async fn handle_upstream_recovery(
         .as_deref()
         == Some("true");
 
-    if already_alerted {
-        if let Ok(down_since) = DateTime::parse_from_rfc3339(&down_since_str) {
-            let total_duration = now.signed_duration_since(down_since.with_timezone(&Utc));
-            let duration_str = format_duration_human(total_duration);
-            let recovery_msg = format_recovery_alert_message(&duration_str);
-            let _ = telegram::send_admin_alert(secrets, &recovery_msg).await;
+    if !already_alerted {
+        // The outage never reached the alert threshold, so no recovery
+        // message is owed — just clear the (short) outage state.
+        db::delete_app_state_keys(
+            db,
+            session,
+            &[AIUB_OUTAGE_DOWN_SINCE_KEY, AIUB_OUTAGE_ALERTED_KEY],
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if listing_count == 0 {
+        // Not a recovery: the fetch succeeded but parsed nothing. Keep the
+        // outage state so the next genuinely successful run can recover.
+        console_warn!(
+            "[Recovery Skipped] Listing fetch parsed 0 notices; not treating this as an AIUB recovery."
+        );
+        return Ok(());
+    }
+
+    let Ok(down_since) = DateTime::parse_from_rfc3339(&down_since_str) else {
+        console_warn!(
+            "[Recovery State Warning] Stored {} value is not valid RFC3339 (value: {:?}); clearing outage state without a recovery alert.",
+            AIUB_OUTAGE_DOWN_SINCE_KEY,
+            down_since_str
+        );
+        db::delete_app_state_keys(
+            db,
+            session,
+            &[AIUB_OUTAGE_DOWN_SINCE_KEY, AIUB_OUTAGE_ALERTED_KEY],
+        )
+        .await?;
+        return Ok(());
+    };
+
+    let total_duration = now.signed_duration_since(down_since.with_timezone(&Utc));
+    let duration_str = format_duration_human(total_duration);
+    let recovery_msg = format_recovery_alert_message(&duration_str);
+
+    // M1: do NOT delete the outage keys until the recovery alert actually
+    // lands. If Telegram fails (or is rate-limited), the keys stay and the
+    // next run retries the recovery alert instead of losing it silently.
+    let alert_sent = match telegram::send_admin_alert(secrets, &recovery_msg).await {
+        Ok(true) => true,
+        Ok(false) => secrets.telegram_admin_chat_id.is_none(),
+        Err(err) => {
+            console_warn!(
+                "[Recovery Alert Failed] Failed to send recovery alert: {err}; will retry on the next run."
+            );
+            false
+        }
+    };
+
+    if alert_sent {
+        db::delete_app_state_keys(
+            db,
+            session,
+            &[AIUB_OUTAGE_DOWN_SINCE_KEY, AIUB_OUTAGE_ALERTED_KEY],
+        )
+        .await?;
+    } else {
+        console_warn!(
+            "[Recovery Alert Deferred] Recovery alert was not delivered; outage state kept for retry."
+        );
+    }
+
+    Ok(())
+}
+
+/// Pure debounce check (M2): returns true when an alert with the given
+/// last-sent RFC3339 timestamp may be sent again — i.e. no timestamp is
+/// stored, the stored value is corrupt (treat as expired), or it is older
+/// than `debounce_hours`.
+fn is_debounce_expired(
+    last_alert_str: Option<&str>,
+    now: DateTime<Utc>,
+    debounce_hours: i64,
+) -> bool {
+    let Some(last_alert_str) = last_alert_str else {
+        return true;
+    };
+    let Ok(last_alert) = DateTime::parse_from_rfc3339(last_alert_str) else {
+        return true;
+    };
+    last_alert.with_timezone(&Utc) <= now - Duration::hours(debounce_hours)
+}
+
+/// M2: sends the "0 notices parsed" admin alert at most once per
+/// `EMPTY_LISTING_ALERT_DEBOUNCE_HOURS`, instead of on every 5-minute run
+/// during a DOM break. The timestamp is only recorded when the alert was
+/// actually delivered (or no admin chat is configured).
+async fn send_debounced_empty_listing_alert(
+    db: &D1Database,
+    session: &D1DatabaseSession,
+    secrets: &Secrets,
+) -> worker::Result<()> {
+    let now = Utc::now();
+    if let Some(last_alert_str) = db::get_app_state(session, EMPTY_LISTING_ALERT_KEY).await? {
+        if !is_debounce_expired(
+            Some(&last_alert_str),
+            now,
+            EMPTY_LISTING_ALERT_DEBOUNCE_HOURS,
+        ) {
+            console_log!(
+                "Suppressing duplicate empty-listing alert (last sent at {})",
+                last_alert_str
+            );
+            return Ok(());
         }
     }
 
-    let _ = db::delete_app_state_keys(
-        db,
-        session,
-        &[AIUB_OUTAGE_DOWN_SINCE_KEY, AIUB_OUTAGE_ALERTED_KEY],
+    let alert_sent = match telegram::send_admin_alert(
+        secrets,
+        "⚠️ AIUB Notice Checker: 0 notices found on listing page 1. DOM layout may have changed.",
     )
-    .await;
+    .await
+    {
+        Ok(true) => true,
+        Ok(false) => secrets.telegram_admin_chat_id.is_none(),
+        Err(err) => {
+            console_warn!(
+                "[Empty Listing Alert Failed] Failed to send empty-listing alert: {err}; will retry on the next run."
+            );
+            false
+        }
+    };
 
+    if alert_sent {
+        let now_str = now.to_rfc3339();
+        db::set_app_state(db, session, EMPTY_LISTING_ALERT_KEY, &now_str).await?;
+    }
     Ok(())
 }
 
@@ -281,7 +414,17 @@ async fn run(env: &Env) -> worker::Result<()> {
         return Ok(());
     };
 
-    if let Err(err) = handle_upstream_recovery(&database, &session, &secrets, Utc::now()).await {
+    // M1: recovery is only evaluated against a listing that actually
+    // parsed notices; a 0-notice fetch keeps the outage state.
+    if let Err(err) = handle_upstream_recovery(
+        &database,
+        &session,
+        &secrets,
+        Utc::now(),
+        listing_notices.len(),
+    )
+    .await
+    {
         console_warn!("[Recovery State Warning] Failed to handle outage recovery: {err}");
     }
 
@@ -289,11 +432,12 @@ async fn run(env: &Env) -> worker::Result<()> {
         console_warn!(
             "[Listing Parse Failed] 0 notices parsed from listing page 1. DOM layout may have changed."
         );
-        let _ = telegram::send_admin_alert(
-            &secrets,
-            "⚠️ AIUB Notice Checker: 0 notices found on listing page 1. DOM layout may have changed.",
-        )
-        .await;
+        // M2: debounced — at most one alert per EMPTY_LISTING_ALERT_DEBOUNCE_HOURS.
+        if let Err(err) = send_debounced_empty_listing_alert(&database, &session, &secrets).await {
+            console_warn!(
+                "[Empty Listing Alert Warning] Failed to handle empty-listing alert: {err}"
+            );
+        }
         return Ok(());
     }
 
@@ -1120,11 +1264,16 @@ async fn run(env: &Env) -> worker::Result<()> {
                             }
                             Ok(facebook::FacebookPostResult::AuthError { message }) => {
                                 console_error!("[Facebook Auth Error] {}", message);
+                                // H2: store the pause with a timestamp so
+                                // is_facebook_paused() can expire it after
+                                // FACEBOOK_AUTH_PAUSE_TTL_HOURS.
+                                let pause_value =
+                                    facebook::format_auth_pause_value(&message);
                                 let _ = db::set_app_state(
                                     db_ref,
                                     session_ref,
-                                    "fb_auth_paused",
-                                    &message,
+                                    FACEBOOK_AUTH_PAUSED_KEY,
+                                    &pause_value,
                                 )
                                 .await;
                                 let _ = telegram::send_admin_alert(
@@ -1198,6 +1347,10 @@ fn has_utf8_mojibake(s: &str) -> bool {
 
 /// Strips both real Unicode punctuation and 3-char Latin-1 mojibake sequences (`\u{00e2}\u{0080}_`)
 /// so corrupted D1 strings compare equal to clean UTF-8 strings during silent healing.
+///
+/// L6: keeps Unicode alphanumerics (`is_alphanumeric`, not ASCII-only), so
+/// a notice whose only change is in Bengali / accented text is still
+/// detected as an edit instead of comparing equal.
 fn clean_mojibake(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -1211,8 +1364,8 @@ fn clean_mojibake(s: &str) -> String {
                 }
             }
         }
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
+        if c.is_alphanumeric() {
+            out.extend(c.to_lowercase());
         }
     }
     out
@@ -1220,15 +1373,16 @@ fn clean_mojibake(s: &str) -> String {
 
 /// Efficiently checks if two strings are equivalent after stripping mojibake and non-alphanumeric chars,
 /// without allocating any new heap Strings when no mojibake is present.
+/// Uses Unicode `is_alphanumeric` (L6) so Bengali/accented-only edits count.
 fn clean_mojibake_eq(a: &str, b: &str) -> bool {
     if !has_utf8_mojibake(a) && !has_utf8_mojibake(b) {
         let it_a = a
             .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
+            .filter(|c| c.is_alphanumeric())
             .flat_map(|c| c.to_lowercase());
         let it_b = b
             .chars()
-            .filter(|c| c.is_ascii_alphanumeric())
+            .filter(|c| c.is_alphanumeric())
             .flat_map(|c| c.to_lowercase());
         return it_a.eq(it_b);
     }

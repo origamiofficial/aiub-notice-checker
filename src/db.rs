@@ -148,6 +148,28 @@ pub fn build_upsert_statement(
     }
 }
 
+/// The SQL used by [`build_lightweight_detail_update`], extracted as a pure
+/// function so its semantics can be tested behaviourally against a real
+/// SQLite database in tests (L2) without a Cloudflare D1 binding.
+///
+/// The `COALESCE(detail_fetched_at, ?1)` form is deliberate: it preserves
+/// an existing `detail_fetched_at` and only sets it when it is NULL. The
+/// inverted form `COALESCE(?1, detail_fetched_at)` would overwrite the
+/// timestamp on every lightweight update (fixed in v6.2.0).
+///
+/// Test-only: the production builder below duplicates this SQL literally
+/// because the `worker::query!` macro requires a string literal — keep the
+/// two in sync if either changes.
+#[cfg(test)]
+pub fn lightweight_detail_update_sql(detail_fetched: bool) -> &'static str {
+    if detail_fetched {
+        "UPDATE notices SET last_seen_at = ?1, detail_checked_at = ?1, \
+         detail_fetched_at = COALESCE(detail_fetched_at, ?1) WHERE link = ?2"
+    } else {
+        "UPDATE notices SET last_seen_at = ?1, detail_checked_at = ?1 WHERE link = ?2"
+    }
+}
+
 /// Builds a lightweight UPDATE that only touches timestamp columns, leaving indexed
 /// fields (`published_date`, `content_hash`, etc.) untouched.
 pub fn build_lightweight_detail_update(
@@ -175,6 +197,20 @@ pub fn build_lightweight_detail_update(
 }
 
 /// Executes a batch of prepared statements on the `D1DatabaseSession` and aggregates `D1Metrics`.
+///
+/// D1 `batch()` atomicity (M4): a single `batch()` call is atomic — all of
+/// its statements apply, or none do (Cloudflare D1 docs: "All queries
+/// execute in single transaction"). Atomicity does NOT extend across
+/// chunks: each 50-statement chunk is its own transaction, so a failure in
+/// a later chunk never rolls back an earlier chunk. A partial chunk can
+/// therefore never leave a notice half-synced *within* that chunk.
+///
+/// Failure granularity (M4): if a whole chunk fails (e.g. one bad statement
+/// poisons the batch), fall back to executing that chunk's statements one
+/// at a time, log each per-statement failure, and continue with the
+/// remaining chunks instead of aborting the whole run / dispatch. Only if
+/// every statement in a chunk also fails individually is the error
+/// propagated, so a single bad row cannot silently discard the rest.
 pub async fn execute_batch(
     session: &D1DatabaseSession,
     statements: Vec<D1PreparedStatement>,
@@ -184,12 +220,65 @@ pub async fn execute_batch(
         return Ok(metrics);
     }
 
-    for chunk in statements.chunks(D1_BIND_CHUNK_SIZE) {
-        let results = session.batch(chunk.to_vec()).await?;
-        for res in results {
-            if let Ok(Some(meta)) = res.meta() {
-                metrics.rows_read += meta.rows_read.unwrap_or(0);
-                metrics.rows_written += meta.rows_written.unwrap_or(0);
+    for (chunk_idx, chunk) in statements.chunks(D1_BIND_CHUNK_SIZE).enumerate() {
+        match session.batch(chunk.to_vec()).await {
+            Ok(results) => {
+                for res in results {
+                    if let Ok(Some(meta)) = res.meta() {
+                        metrics.rows_read += meta.rows_read.unwrap_or(0);
+                        metrics.rows_written += meta.rows_written.unwrap_or(0);
+                    }
+                }
+            }
+            Err(batch_err) => {
+                worker::console_warn!(
+                    "[D1 Batch Fallback] Chunk {} ({} statements) failed as a batch: {}; retrying statements individually.",
+                    chunk_idx,
+                    chunk.len(),
+                    batch_err
+                );
+                let mut succeeded = 0usize;
+                let mut failed = 0usize;
+                for (stmt_idx, stmt) in chunk.iter().enumerate() {
+                    match session.batch(vec![stmt.clone()]).await {
+                        Ok(results) => {
+                            succeeded += 1;
+                            for res in results {
+                                if let Ok(Some(meta)) = res.meta() {
+                                    metrics.rows_read += meta.rows_read.unwrap_or(0);
+                                    metrics.rows_written += meta.rows_written.unwrap_or(0);
+                                }
+                            }
+                        }
+                        Err(stmt_err) => {
+                            failed += 1;
+                            worker::console_warn!(
+                                "[D1 Batch Fallback] Chunk {} statement {} failed individually: {}",
+                                chunk_idx,
+                                stmt_idx,
+                                stmt_err
+                            );
+                        }
+                    }
+                }
+                if succeeded == 0 {
+                    // Every statement in this chunk failed even on its own:
+                    // there is nothing salvageable, so propagate the error
+                    // instead of silently pretending the run succeeded.
+                    worker::console_error!(
+                        "[D1 Batch Failed] Chunk {} failed entirely ({} statements, all failed individually); aborting batch.",
+                        chunk_idx,
+                        chunk.len()
+                    );
+                    return Err(batch_err);
+                }
+                worker::console_warn!(
+                    "[D1 Batch Fallback] Chunk {} recovered: {}/{} statements applied individually ({} failed).",
+                    chunk_idx,
+                    succeeded,
+                    chunk.len(),
+                    failed
+                );
             }
         }
     }

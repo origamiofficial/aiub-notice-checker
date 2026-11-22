@@ -106,17 +106,70 @@ pub fn titles_equivalent(listing_title: &str, cached_title: &str) -> bool {
     listing_title.contains("...")
 }
 
+/// Length of a string in UTF-16 code units — the unit Telegram (and
+/// Facebook) count towards the 4,096 message limit. Rust `char`s are NOT
+/// equivalent: one emoji / non-BMP character is 1 `char` but 2 UTF-16 units
+/// (M5).
+pub fn utf16_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// Takes the longest prefix of `text` whose UTF-16 length is at most
+/// `max_units`, never splitting a character.
+fn take_utf16_prefix(text: &str, max_units: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in text.chars() {
+        let units = c.len_utf16();
+        if used + units > max_units {
+            break;
+        }
+        out.push(c);
+        used += units;
+    }
+    out
+}
+
+/// Truncates `text` to at most `limit` UTF-16 code units (M5), appending
+/// `...` when truncated. The result never exceeds `limit` UTF-16 units.
 pub fn truncate_text(text: &str, limit: usize) -> String {
     let trimmed = text.trim();
-    if trimmed.chars().count() <= limit {
+    if utf16_len(trimmed) <= limit {
         return trimmed.to_string();
     }
     if limit <= 3 {
-        return trimmed.chars().take(limit).collect();
+        return take_utf16_prefix(trimmed, limit);
     }
     let keep = limit.saturating_sub(3);
-    let prefix: String = trimmed.chars().take(keep).collect();
+    let prefix = take_utf16_prefix(trimmed, keep);
     format!("{}...", prefix.trim_end())
+}
+
+/// Assembles `header + footer` (attachments + notice URL) within
+/// `UNIFIED_MAX_MESSAGE_LEN` UTF-16 units, guaranteeing the footer — in
+/// particular the notice URL — is never truncated (M5). If the header and
+/// footer together are too long, attachments are dropped first (last one
+/// first), and only then is the header truncated.
+fn assemble_header_footer(header: &str, footer_parts: &[String]) -> String {
+    let mut parts: Vec<String> = footer_parts.to_vec();
+    loop {
+        let footer = parts.join("\n\n");
+        let total = utf16_len(header) + 2 + utf16_len(&footer);
+        if total <= UNIFIED_MAX_MESSAGE_LEN {
+            return format!("{header}\n\n{footer}");
+        }
+        if parts.len() > 1 {
+            // Drop the last attachment; the notice URL (last element) stays.
+            let drop_idx = parts.len() - 2;
+            parts.remove(drop_idx);
+            continue;
+        }
+        // Only the notice URL remains and it still does not fit with the
+        // header: truncate the header, never the URL.
+        let available_header = UNIFIED_MAX_MESSAGE_LEN.saturating_sub(utf16_len(&footer) + 2);
+        let header = truncate_text(header, available_header);
+        return format!("{header}\n\n{footer}");
+    }
 }
 
 pub fn display_date(iso_date: Option<&str>) -> String {
@@ -148,8 +201,10 @@ pub fn is_meaningful_text(text: &str) -> bool {
 /// - Zero HTML tags and zero Markdown syntax so it renders cleanly and natively across all platforms.
 /// - Clean whitespace and blank lines between paragraphs and URLs.
 /// - Preserves all attachment URLs and the main AIUB notice link at the bottom.
-/// - Defensively caps length at `UNIFIED_MAX_MESSAGE_LEN` (4,096 chars), preserving header,
-///   attachments, and the notice URL while gracefully truncating overflowing body text.
+/// - Defensively caps length at `UNIFIED_MAX_MESSAGE_LEN` (4,096 UTF-16 code
+///   units — the unit Telegram counts, see [`utf16_len`]), preserving header,
+///   attachments, and the notice URL while gracefully truncating overflowing
+///   body text. The footer is never truncated (M5).
 pub fn format_notice_message(notice: &Notice, edited: bool) -> String {
     let prefix = if edited { "[EDITED] " } else { "" };
     let title = truncate_text(&notice.title, 500);
@@ -173,12 +228,11 @@ pub fn format_notice_message(notice: &Notice, edited: bool) -> String {
         None
     };
 
-    // Construct footer (attachments + notice URL), each on its own line
-    let mut footer_parts = Vec::new();
-    for att in &valid_attachments {
-        footer_parts.push(*att);
-    }
-    footer_parts.push(notice_url);
+    // Construct footer (attachments + notice URL), each on its own line.
+    // `footer_parts` keeps the notice URL as the last element so it can
+    // always be preserved (M5).
+    let mut footer_parts: Vec<String> = valid_attachments.iter().map(|s| s.to_string()).collect();
+    footer_parts.push(notice_url.to_string());
     let footer = footer_parts.join("\n\n");
 
     let full_content = match (text_content, valid_attachments.is_empty()) {
@@ -200,34 +254,28 @@ pub fn format_notice_message(notice: &Notice, edited: bool) -> String {
         }
     };
 
-    if full_content.chars().count() <= UNIFIED_MAX_MESSAGE_LEN {
+    if utf16_len(&full_content) <= UNIFIED_MAX_MESSAGE_LEN {
         return full_content;
     }
 
-    // Defensive truncation: truncate body text, but preserve header, attachments, and notice URL
-    let suffix = format!("\n\n{footer}");
-    let suffix_chars = suffix.chars().count();
-    let header_chars = header.chars().count();
-    let fixed_overhead = header_chars + suffix_chars + 2; // "\n\n" between header and body
-
-    let available_body_chars = UNIFIED_MAX_MESSAGE_LEN.saturating_sub(fixed_overhead);
-    let truncated = if let Some(body) = text_content {
+    // Defensive truncation (M5): truncate body text first, but preserve
+    // header, attachments, and notice URL. The footer is never truncated —
+    // if there is no body, or no room for one, assemble header + footer
+    // directly (dropping attachments / truncating the header only if the
+    // header + footer alone still exceed the limit).
+    if let Some(body) = text_content {
+        let suffix = format!("\n\n{footer}");
+        let fixed_overhead = utf16_len(&header) + utf16_len(&suffix) + 2; // "\n\n" between header and body
+        let available_body_chars = UNIFIED_MAX_MESSAGE_LEN.saturating_sub(fixed_overhead);
         if available_body_chars >= 10 {
             let truncated_body = truncate_text(body, available_body_chars);
-            format!("{header}\n\n{truncated_body}{suffix}")
-        } else {
-            // Not enough room for body, preserve header and attachments/links
-            format!("{header}{suffix}")
+            let truncated = format!("{header}\n\n{truncated_body}{suffix}");
+            if utf16_len(&truncated) <= UNIFIED_MAX_MESSAGE_LEN {
+                return truncated;
+            }
         }
-    } else {
-        truncate_text(&full_content, UNIFIED_MAX_MESSAGE_LEN)
-    };
-
-    if truncated.chars().count() > UNIFIED_MAX_MESSAGE_LEN {
-        truncate_text(&truncated, UNIFIED_MAX_MESSAGE_LEN)
-    } else {
-        truncated
     }
+    assemble_header_footer(&header, &footer_parts)
 }
 
 /// Backwards-compatible alias for `format_notice_message`.

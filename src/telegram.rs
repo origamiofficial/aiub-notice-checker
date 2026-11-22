@@ -21,7 +21,8 @@ struct LinkPreviewOptions {
 struct SendMessagePayload<'a> {
     chat_id: &'a str,
     text: &'a str,
-    disable_web_page_preview: bool,
+    // L7: the deprecated `disable_web_page_preview` field was removed;
+    // `link_preview_options` is the only preview control sent.
     link_preview_options: LinkPreviewOptions,
 }
 
@@ -64,7 +65,6 @@ async fn send_raw_message(bot_api_key: &str, chat_id: &str, text: &str) -> Resul
     let payload = SendMessagePayload {
         chat_id,
         text,
-        disable_web_page_preview: true,
         link_preview_options: LinkPreviewOptions { is_disabled: true },
     };
 
@@ -147,11 +147,76 @@ async fn send_raw_message(bot_api_key: &str, chat_id: &str, text: &str) -> Resul
     Ok(false)
 }
 
-fn redact_token(msg: &str, bot_api_key: &str) -> String {
+/// Percent-encodes a token the way it would appear inside a URL/query string.
+fn url_encode_token(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    for b in token.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Replaces any run starting with `EAA` followed by alphanumerics (the shape
+/// of a Meta access token) with `[REDACTED]`.
+fn redact_eaa_tokens(msg: &str) -> String {
+    let bytes = msg.as_bytes();
+    let mut out = String::with_capacity(msg.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if msg[i..].starts_with("EAA") {
+            let mut j = i + 3;
+            while j < bytes.len() && bytes[j].is_ascii_alphanumeric() {
+                j += 1;
+            }
+            // Only redact if there is a real token body after the prefix.
+            if j > i + 3 {
+                out.push_str("[REDACTED]");
+                i = j;
+                continue;
+            }
+        }
+        // Copy one UTF-8 char.
+        let ch_len = msg[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        out.push_str(&msg[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+/// Redacts a secret token from an error string (L3, shared by Telegram and
+/// Facebook callers). Covers the exact token, its URL-encoded form, a
+/// truncated fragment (first/last 20 chars, when the token is long enough
+/// for the fragment to be distinctive), and any `EAA...` Meta token pattern.
+pub(crate) fn redact_token(msg: &str, bot_api_key: &str) -> String {
     let key = bot_api_key.trim();
     if key.is_empty() {
-        msg.to_string()
-    } else {
-        msg.replace(key, "[REDACTED]")
+        return redact_eaa_tokens(msg);
     }
+    let mut redacted = msg.replace(key, "[REDACTED]");
+    let encoded = url_encode_token(key);
+    if encoded != key {
+        redacted = redacted.replace(&encoded, "[REDACTED]");
+    }
+    if key.chars().count() >= 20 {
+        // A truncated error string may only contain the head or tail of the
+        // token; redact those distinctive fragments too.
+        let head: String = key.chars().take(20).collect();
+        let tail: String = key
+            .chars()
+            .rev()
+            .take(20)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        redacted = redacted.replace(&head, "[REDACTED]");
+        if tail != head {
+            redacted = redacted.replace(&tail, "[REDACTED]");
+        }
+    }
+    redact_eaa_tokens(&redacted)
 }

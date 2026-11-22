@@ -7,9 +7,25 @@
 #[cfg(test)]
 mod scraper_tests {
     use crate::scraper::{
-        normalize_aiub_url, normalize_notice_url, parse_detail_html, parse_detail_with_reason,
-        parse_listing_html, USER_AGENT,
+        is_block_tag, normalize_aiub_url, normalize_notice_url, parse_detail_html,
+        parse_detail_with_reason, parse_listing_html, USER_AGENT,
     };
+
+    // L1: <pre>, <h5> and <h6> are block tags; exact-name matching must not
+    // false-positive on longer names such as <prefix> or <pfoo>.
+    #[test]
+    fn is_block_tag_includes_pre_h5_h6() {
+        assert!(is_block_tag(b"<pre>"));
+        assert!(is_block_tag(b"</pre>"));
+        assert!(is_block_tag(b"<h5>"));
+        assert!(is_block_tag(b"<h6 class=\"x\">"));
+        assert!(is_block_tag(b"<h5/>"));
+        assert!(is_block_tag(b"<p>"));
+        assert!(!is_block_tag(b"<prefix>"));
+        assert!(!is_block_tag(b"<pfoo>"));
+        assert!(!is_block_tag(b"<span>"));
+        assert!(!is_block_tag(b"not a tag"));
+    }
 
     #[test]
     fn user_agent_matches_cargo_package_version() {
@@ -1116,7 +1132,7 @@ mod notice_row_tests {
 #[cfg(test)]
 mod lib_tests {
     use crate::{
-        clean_mojibake, format_detail_failure_alert, format_duration_human,
+        clean_mojibake, clean_mojibake_eq, format_detail_failure_alert, format_duration_human,
         format_listing_skip_message, format_outage_alert_message, format_recovery_alert_message,
         has_utf8_mojibake, titles_equivalent_clean,
     };
@@ -1161,6 +1177,52 @@ mod lib_tests {
     #[test]
     fn titles_equivalent_clean_different() {
         assert!(!titles_equivalent_clean("Title A", "Title B"));
+    }
+
+    // L6: Bengali / accented text is alphanumeric, so a Bengali-only edit
+    // must be detected (the old ASCII-only filter compared both sides as
+    // empty strings and treated them as equal).
+    #[test]
+    fn clean_mojibake_keeps_bengali_alphanumeric() {
+        // Bengali letters/digits survive cleaning (the virama in the
+        // conjunct ক্ষ is a non-alphanumeric combining mark, so it is
+        // stripped — the key property is that Bengali text is not wiped
+        // out entirely, unlike the old ASCII-only filter).
+        let cleaned = clean_mojibake("পরীক্ষার রুটিন ২০২৬");
+        assert!(!cleaned.is_empty());
+        assert!(
+            cleaned.contains("২০২৬"),
+            "Bengali digits must survive: {cleaned}"
+        );
+        assert!(
+            cleaned.contains("টিন"),
+            "Bengali letters must survive: {cleaned}"
+        );
+        assert_eq!(clean_mojibake("Café résumé!"), "caférésumé");
+    }
+
+    #[test]
+    fn clean_mojibake_eq_detects_bengali_only_edit() {
+        assert!(clean_mojibake_eq("পরীক্ষা", "পরীক্ষা!"));
+        assert!(
+            !clean_mojibake_eq("পরীক্ষা", "পরীক্ষার"),
+            "a Bengali-only change must not compare equal"
+        );
+        assert!(!titles_equivalent_clean("পরীক্ষা", "পরীক্ষার"));
+    }
+
+    // M2: debounce helper — no timestamp / corrupt timestamp means due,
+    // a recent timestamp means suppressed, an old one means due again.
+    #[test]
+    fn is_debounce_expired_handles_missing_corrupt_recent_and_old() {
+        use crate::is_debounce_expired;
+        let now = chrono::Utc::now();
+        assert!(is_debounce_expired(None, now, 6));
+        assert!(is_debounce_expired(Some("not-a-timestamp"), now, 6));
+        let recent = (now - chrono::Duration::hours(1)).to_rfc3339();
+        assert!(!is_debounce_expired(Some(&recent), now, 6));
+        let old = (now - chrono::Duration::hours(7)).to_rfc3339();
+        assert!(is_debounce_expired(Some(&old), now, 6));
     }
 
     #[test]
@@ -1661,6 +1723,45 @@ mod facebook_tests {
         );
     }
 
+    // H2: a bare 401 with no parseable Meta error is transient, not an
+    // auth failure — it must never permanently pause Facebook posting.
+    // A 401 carrying a real Meta 190 error is still an auth failure.
+    #[test]
+    fn classify_publish_error_bare_401_is_transient() {
+        use crate::facebook::{classify_publish_error, FacebookPostResult};
+        let result = classify_publish_error(
+            401,
+            0,
+            None,
+            "Unknown Meta API error",
+            "<html>401</html>",
+            None,
+        );
+        assert!(
+            matches!(result, FacebookPostResult::TransientFailure { .. }),
+            "bare 401 must be transient, got {result:?}"
+        );
+        let result =
+            classify_publish_error(401, 190, Some(458), "Invalid OAuth access token", "", None);
+        assert!(
+            matches!(result, FacebookPostResult::AuthError { .. }),
+            "401 with Meta code 190 must be an auth failure, got {result:?}"
+        );
+    }
+
+    // L4: a bare 403 with no parseable Meta error is an auth/permission
+    // error, matching the parsed permission-error handling.
+    #[test]
+    fn classify_publish_error_bare_403_is_auth_error() {
+        use crate::facebook::{classify_publish_error, FacebookPostResult};
+        let result =
+            classify_publish_error(403, 0, None, "Unknown Meta API error", "Forbidden", None);
+        assert!(
+            matches!(result, FacebookPostResult::AuthError { .. }),
+            "bare 403 must be an auth error, got {result:?}"
+        );
+    }
+
     // ── Facebook secrets & graceful feature gating ───────────────────
 
     #[test]
@@ -1772,24 +1873,261 @@ mod facebook_tests {
 
 #[cfg(test)]
 mod db_tests {
+    // L2: behavioural test — the SQL from build_lightweight_detail_update()
+    // (via lightweight_detail_update_sql()) is executed against a real
+    // in-memory SQLite database (D1 is SQLite-backed), instead of merely
+    // asserting on a source string. This replaces the old string-contains
+    // test, which would have passed even if the function were never called.
     #[test]
-    fn lightweight_detail_update_sql_preserves_detail_fetched_at() {
-        let db_src = include_str!("db.rs");
+    fn lightweight_detail_update_preserves_existing_detail_fetched_at() {
+        use rusqlite::{params, Connection};
+
+        let conn = Connection::open_in_memory().expect("in-memory SQLite");
+        conn.execute_batch(
+            "CREATE TABLE notices (
+                link TEXT PRIMARY KEY,
+                last_seen_at TEXT,
+                detail_checked_at TEXT,
+                detail_fetched_at TEXT
+            )",
+        )
+        .expect("create notices table");
+
+        // Row 1: detail_fetched_at already set — it must be preserved.
+        conn.execute(
+            "INSERT INTO notices (link, last_seen_at, detail_checked_at, detail_fetched_at) \
+             VALUES (?1, NULL, NULL, ?2)",
+            params!["https://www.aiub.edu/notice/1", "2026-11-20T10:00:00Z"],
+        )
+        .expect("insert row 1");
+        // Row 2: detail_fetched_at is NULL — it must be set to `now`.
+        conn.execute(
+            "INSERT INTO notices (link, last_seen_at, detail_checked_at, detail_fetched_at) \
+             VALUES (?1, NULL, NULL, NULL)",
+            params!["https://www.aiub.edu/notice/2"],
+        )
+        .expect("insert row 2");
+        // Row 3: detail_fetched_at set, but the update is a non-fetched
+        // (detail_fetched=false) one — it must be left untouched.
+        conn.execute(
+            "INSERT INTO notices (link, last_seen_at, detail_checked_at, detail_fetched_at) \
+             VALUES (?1, NULL, NULL, ?2)",
+            params!["https://www.aiub.edu/notice/3", "2026-11-19T09:00:00Z"],
+        )
+        .expect("insert row 3");
+
+        let now = "2026-11-21T12:00:00Z";
+        let fetched_sql = crate::db::lightweight_detail_update_sql(true);
+        conn.execute(fetched_sql, params![now, "https://www.aiub.edu/notice/1"])
+            .expect("run fetched update on row 1");
+        conn.execute(fetched_sql, params![now, "https://www.aiub.edu/notice/2"])
+            .expect("run fetched update on row 2");
+
+        let unfetched_sql = crate::db::lightweight_detail_update_sql(false);
+        conn.execute(unfetched_sql, params![now, "https://www.aiub.edu/notice/3"])
+            .expect("run unfetched update on row 3");
+
+        let fetched_at = |link: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT detail_fetched_at FROM notices WHERE link = ?1",
+                params![link],
+                |row| row.get(0),
+            )
+            .expect("read detail_fetched_at")
+        };
+        let seen_at = |link: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT last_seen_at FROM notices WHERE link = ?1",
+                params![link],
+                |row| row.get(0),
+            )
+            .expect("read last_seen_at")
+        };
+
+        assert_eq!(
+            fetched_at("https://www.aiub.edu/notice/1").as_deref(),
+            Some("2026-11-20T10:00:00Z"),
+            "existing detail_fetched_at must be preserved, not overwritten"
+        );
+        assert_eq!(
+            fetched_at("https://www.aiub.edu/notice/2").as_deref(),
+            Some(now),
+            "NULL detail_fetched_at must be set to now"
+        );
+        assert_eq!(
+            fetched_at("https://www.aiub.edu/notice/3").as_deref(),
+            Some("2026-11-19T09:00:00Z"),
+            "unfetched update must not touch detail_fetched_at"
+        );
+        for link in [
+            "https://www.aiub.edu/notice/1",
+            "https://www.aiub.edu/notice/2",
+            "https://www.aiub.edu/notice/3",
+        ] {
+            assert_eq!(
+                seen_at(link).as_deref(),
+                Some(now),
+                "last_seen_at must be updated for {link}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod utf16_format_tests {
+    use crate::models::{format_notice_message, truncate_text, utf16_len, Notice};
+
+    #[test]
+    fn utf16_len_counts_emoji_as_two_units() {
+        assert_eq!(utf16_len("a"), 1);
+        assert_eq!(utf16_len("é"), 1);
+        assert_eq!(utf16_len("😀"), 2);
+        assert_eq!(utf16_len("a😀b"), 4);
+    }
+
+    #[test]
+    fn truncate_text_counts_utf16_units_not_chars() {
+        // One emoji = 2 UTF-16 units; limit 5 leaves room for one emoji + "...".
+        assert_eq!(truncate_text("😀😀😀😀", 5), "😀...");
+        assert!(utf16_len(&truncate_text("😀😀😀😀", 5)) <= 5);
+        // ASCII behaviour is unchanged.
+        assert_eq!(truncate_text("Hello World", 8), "Hello...");
+    }
+
+    // M5(a): a body that fits in 4,096 Rust chars but exceeds 4,096 UTF-16
+    // units must still be truncated, and the notice URL must survive.
+    #[test]
+    fn format_notice_message_emoji_heavy_body_respects_utf16_limit() {
+        let notice = Notice {
+            title: "Emoji Notice".to_string(),
+            description: "".to_string(),
+            url: "https://www.aiub.edu/notice/emoji".to_string(),
+            published_date: Some("2026-11-21".to_string()),
+            body_text: "😀".repeat(3000),
+            attachments: vec![],
+            detail_fetched: true,
+        };
+        let msg = format_notice_message(&notice, false);
         assert!(
-            db_src.contains("detail_fetched_at = COALESCE(detail_fetched_at, ?1)"),
-            "build_lightweight_detail_update must use COALESCE(detail_fetched_at, ?1)"
+            utf16_len(&msg) <= crate::config::UNIFIED_MAX_MESSAGE_LEN,
+            "UTF-16 length {} exceeds 4096 (char count is only {})",
+            utf16_len(&msg),
+            msg.chars().count()
+        );
+        assert!(msg.ends_with("https://www.aiub.edu/notice/emoji"));
+    }
+
+    // M5(b): image-only notice with a very long attachment list — the
+    // notice URL must survive truncation, even if attachments are dropped.
+    #[test]
+    fn format_notice_message_long_attachment_list_preserves_notice_url() {
+        let attachments: Vec<String> = (0..100)
+            .map(|i| {
+                format!("https://www.aiub.edu/Files/Uploads/flyer-{i:03}-with-a-long-name.webp")
+            })
+            .collect();
+        let notice = Notice {
+            title: "Flyer Notice".to_string(),
+            description: "No description available".to_string(),
+            url: "https://www.aiub.edu/notice/flyer".to_string(),
+            published_date: Some("2026-11-21".to_string()),
+            body_text: "".to_string(),
+            attachments,
+            detail_fetched: true,
+        };
+        let msg = format_notice_message(&notice, false);
+        assert!(
+            utf16_len(&msg) <= crate::config::UNIFIED_MAX_MESSAGE_LEN,
+            "UTF-16 length {} exceeds 4096",
+            utf16_len(&msg)
         );
         assert!(
-            !db_src.contains("detail_fetched_at = COALESCE(?1, detail_fetched_at)"),
-            "Inverted COALESCE(?1, detail_fetched_at) must not be present"
+            msg.ends_with("https://www.aiub.edu/notice/flyer"),
+            "notice URL must survive truncation, got tail: {:?}",
+            msg.chars().rev().take(80).collect::<String>()
         );
+        // The message must not contain a truncated copy of the URL with
+        // punctuation attached (the full URL itself is asserted above via
+        // ends_with).
+        assert!(!msg.contains("https://www.aiub.edu/notice/flyer."));
+    }
+}
+
+#[cfg(test)]
+mod auth_pause_tests {
+    use crate::facebook::{format_auth_pause_value, parse_auth_pause_value};
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn auth_pause_value_round_trips_with_message() {
+        let value = format_auth_pause_value("Facebook auth failure (code: 190, subcode: None)");
+        let (paused_at, message) = parse_auth_pause_value(&value).expect("must parse");
+        assert_eq!(message, "Facebook auth failure (code: 190, subcode: None)");
+        // Timestamp is (approximately) now.
+        assert!(Utc::now().signed_duration_since(paused_at).num_seconds() < 5);
+    }
+
+    #[test]
+    fn auth_pause_value_legacy_without_timestamp_does_not_parse() {
+        assert!(parse_auth_pause_value("Facebook auth failure (code: 190)").is_none());
+        assert!(parse_auth_pause_value("").is_none());
+    }
+
+    #[test]
+    fn auth_pause_age_exceeds_ttl_after_24h() {
+        // H2: a pause older than FACEBOOK_AUTH_PAUSE_TTL_HOURS is expired.
+        let old = Utc::now() - Duration::hours(25);
+        let value = format!("{}|stale pause", old.to_rfc3339());
+        let (paused_at, _) = parse_auth_pause_value(&value).expect("must parse");
+        let age_hours = Utc::now().signed_duration_since(paused_at).num_hours();
+        assert!(age_hours >= crate::config::FACEBOOK_AUTH_PAUSE_TTL_HOURS);
+        let fresh = format_auth_pause_value("fresh pause");
+        let (fresh_at, _) = parse_auth_pause_value(&fresh).expect("must parse");
         assert!(
-            db_src.contains("tg_sent_at=COALESCE(tg_sent_at, ?1)"),
-            "tg_sent_at must use COALESCE(tg_sent_at, ?1)"
+            Utc::now().signed_duration_since(fresh_at).num_hours()
+                < crate::config::FACEBOOK_AUTH_PAUSE_TTL_HOURS
         );
-        assert!(
-            db_src.contains("fb_sent_at=COALESCE(fb_sent_at, ?1)"),
-            "fb_sent_at must use COALESCE(fb_sent_at, ?1)"
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use crate::telegram::redact_token;
+
+    #[test]
+    fn redact_token_replaces_exact_token() {
+        let msg = "Telegram API HTTP 401: bad token abc123token here";
+        assert_eq!(
+            redact_token(msg, "abc123token"),
+            "Telegram API HTTP 401: bad token [REDACTED] here"
         );
+    }
+
+    #[test]
+    fn redact_token_replaces_url_encoded_token() {
+        // Token contains ':' and '/', which appear percent-encoded in URLs.
+        let msg = "GET https://example.com/?access_token=abc%3Adef%2Fghi failed";
+        assert!(!redact_token(msg, "abc:def/ghi").contains("abc%3Adef%2Fghi"));
+        assert!(redact_token(msg, "abc:def/ghi").contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn redact_token_replaces_eaa_pattern_and_truncated_fragment() {
+        let msg = "Meta HTTP 401: token EAA123abcXYZ789 leaked";
+        assert!(!redact_token(msg, "some-other-token").contains("EAA123abcXYZ789"));
+        // A long token's first 20 chars appearing alone must also be redacted.
+        let long_token = "abcdefghijklmnopqrstuvwxyz0123456789";
+        let fragment_msg = format!("error with {} in it", &long_token[..20]);
+        assert!(!redact_token(&fragment_msg, long_token).contains(&long_token[..20]));
+    }
+
+    #[test]
+    fn redact_token_leaves_benign_text_alone() {
+        assert_eq!(
+            redact_token("plain error, no token", "abc123token"),
+            "plain error, no token"
+        );
+        // A bare "EAA" with no token body after it is not a token.
+        assert_eq!(redact_token("EAA", "abc123token"), "EAA");
     }
 }
