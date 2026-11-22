@@ -364,6 +364,24 @@ pub(crate) fn classify_publish_error(
         };
     }
 
+    // H3: a bare HTTP 429 is a rate limit even with no parseable Meta
+    // error payload. Previously it fell through to classify_meta_error(0)
+    // → Unknown, which set no fb_cooldown_until and sent no admin alert,
+    // so every run retried the same notice and worsened the limit. The
+    // RateLimited arm in lib.rs sets fb_cooldown_until and sends a
+    // debounced alert, so return that here, using the BUC
+    // estimated_time_to_regain_access when present, else the 60-min
+    // fallback — mirroring the parsed rate-limit arm below.
+    if status == 429 {
+        let cooldown = buc_usage
+            .map(|u| u.estimated_time_to_regain_access)
+            .filter(|&m| m > 0)
+            .unwrap_or(FACEBOOK_RATE_LIMIT_COOLDOWN_FALLBACK_MINS);
+        return FacebookPostResult::RateLimited {
+            cooldown_minutes: cooldown,
+        };
+    }
+
     let action = classify_meta_error(error_code, error_subcode);
     match action {
         MetaErrorAction::RateLimitCooldown { .. } => {

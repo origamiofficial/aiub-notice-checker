@@ -746,7 +746,8 @@ async fn run(env: &Env) -> worker::Result<()> {
     let mut statements = Vec::new();
     let mut tg_notifications: Vec<PendingNotification> = Vec::new();
     let mut fb_notifications: Vec<PendingNotification> = Vec::new();
-    let mut silent_sync_links: Vec<(String, String)> = Vec::new();
+    // (url, new_hash, tg_needs_sync, fb_needs_sync) — see H1.
+    let mut silent_sync_links: Vec<(String, String, bool, bool)> = Vec::new();
 
     // Cold-start guard: if D1 is completely empty and we scraped a full page of notices,
     // this is a fresh database seed — write all rows silently and populate tracking columns
@@ -842,6 +843,15 @@ async fn run(env: &Env) -> worker::Result<()> {
         // 2. Date-only, full-title, or UTF-8 mojibake healing when content is equivalent.
         // 3. Re-baselining rows from version `e1a14563` whose stored `body_text` was the sticky header.
         let mut silent_hash_sync = false;
+        // H1: per-platform sync flags. A platform only needs its hash
+        // synced when it has already sent this notice (sent_at is set) and
+        // its stored hash differs. In particular a platform that has never
+        // sent must never be marked sent by a silent sync — the old code
+        // pushed both platforms' sync statements unconditionally, and the
+        // Telegram statement set tg_sent_at, silently losing the first
+        // Telegram send for a notice Facebook had already posted.
+        let mut silent_sync_tg = false;
+        let mut silent_sync_fb = false;
         if let Some(row) = existing {
             let tg_needs_sync = row.tg_sent_at.is_some()
                 && row.tg_last_notified_hash.as_deref() != Some(new_hash.as_str());
@@ -868,6 +878,8 @@ async fn run(env: &Env) -> worker::Result<()> {
                     || sticky_header_rebaseline
                 {
                     silent_hash_sync = true;
+                    silent_sync_tg = tg_needs_sync;
+                    silent_sync_fb = fb_needs_sync;
                 }
             }
         }
@@ -885,7 +897,7 @@ async fn run(env: &Env) -> worker::Result<()> {
         }
 
         if silent_hash_sync {
-            silent_sync_links.push((item.url.clone(), new_hash));
+            silent_sync_links.push((item.url.clone(), new_hash, silent_sync_tg, silent_sync_fb));
             continue;
         }
 
@@ -1004,12 +1016,19 @@ async fn run(env: &Env) -> worker::Result<()> {
     }
 
     // Apply silent hash updates after the batch upsert completes in a single batch.
+    // H1: push each platform's sync statement ONLY when that platform
+    // needs sync. build_tg_hash_sync_statement() (unlike the old
+    // build_tg_notified_statement() used here) never sets tg_sent_at, so a
+    // never-sent Telegram notice can no longer be silently marked sent.
     if !silent_sync_links.is_empty() {
-        let now = Utc::now().to_rfc3339();
         let mut sync_stmts = Vec::with_capacity(silent_sync_links.len() * 2);
-        for (url, hash) in &silent_sync_links {
-            sync_stmts.push(db::build_tg_notified_statement(&database, url, hash, &now)?);
-            sync_stmts.push(db::build_fb_hash_sync_statement(&database, url, hash)?);
+        for (url, hash, tg_needs_sync, fb_needs_sync) in &silent_sync_links {
+            if *tg_needs_sync {
+                sync_stmts.push(db::build_tg_hash_sync_statement(&database, url, hash)?);
+            }
+            if *fb_needs_sync {
+                sync_stmts.push(db::build_fb_hash_sync_statement(&database, url, hash)?);
+            }
         }
         let sync_metrics = db::execute_batch(&session, sync_stmts).await?;
         total_d1.rows_read += sync_metrics.rows_read;

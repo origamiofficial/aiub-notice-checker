@@ -351,7 +351,7 @@ cargo install worker-build
 
 ### 3. Configure Local Secrets
 
-Create a local `.dev.vars` file in the root directory (never commit this file):
+Create a local `.dev.vars` file in the root directory (never commit this file — it is listed in `.gitignore`, and it holds live tokens):
 
 ```ini
 TELEGRAM_BOT_API_KEY="your-telegram-bot-token-from-botfather"
@@ -362,6 +362,8 @@ TELEGRAM_ADMIN_CHAT_ID="your-admin-chat-id"
 FACEBOOK_PAGE_ID="123456789012345"
 FACEBOOK_PAGE_ACCESS_TOKEN="your-permanent-page-access-token"
 ```
+
+> **Warning:** if a secrets file (`.dev.vars`, `.env`) is ever committed by mistake, rotate the affected tokens immediately — Telegram via BotFather, Facebook via the Meta app dashboard / Access Token Debugger — and purge the file from git history. Rotation is a manual step; no code in this repo can do it for you.
 
 ### 4. Initialize Local D1 Database
 
@@ -588,7 +590,7 @@ cargo fmt --check
 # Run Clippy with zero-warning tolerance
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Execute unit and integration tests (136 tests)
+# Execute unit and integration tests (139 tests)
 cargo test --all-features
 
 # Verify WebAssembly compilation target
@@ -609,7 +611,7 @@ aiub-notice-checker/
 │       ├── dependency-review.yml      # PR dependency review action
 │       ├── deploy.yml                 # Chained deployment: runs after test.yml succeeds
 │       ├── release.yml                # Automated version bump, 500-notice benchmark, and GitHub Release
-│       └── test.yml                   # CI pipeline: fmt, clippy, 136 unit tests, wasm check
+│       └── test.yml                   # CI pipeline: fmt, clippy, 139 unit tests, wasm check
 ├── migrations/
 │   ├── 0001_init.sql                  # Initial schema and indexes
 │   └── 0002_facebook_and_tg_rename.sql # Facebook tracking columns, tg_ rename, and flood backfill
@@ -625,7 +627,7 @@ aiub-notice-checker/
 │   ├── models.rs                      # Notice data models, hashing, and unified cross-platform message formatter
 │   ├── scraper.rs                     # HTML fetching, redirect handling, and tl DOM parsing
 │   ├── telegram.rs                    # Telegram Bot API client, rate-limit handler, and retries
-│   ├── tests.rs                       # Comprehensive unit and regression test suite (136 tests)
+│   ├── tests.rs                       # Comprehensive unit and regression test suite (139 tests)
 │   └── version.rs                     # Single-digit rolling semver rollover calculation logic
 ├── Cargo.toml                         # Rust crate manifest, dependencies, and release profiles
 ├── LICENSE                            # MIT License

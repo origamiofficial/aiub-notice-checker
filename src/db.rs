@@ -170,6 +170,36 @@ pub fn lightweight_detail_update_sql(detail_fetched: bool) -> &'static str {
     }
 }
 
+/// Test-only SQL mirrors for the silent-sync / duplicate-handled
+/// statements, so their semantics can be tested behaviourally against a
+/// real SQLite database in tests (same pattern as
+/// `lightweight_detail_update_sql()` above).
+///
+/// The production builders duplicate these SQL literals because the
+/// `worker::query!` macro requires a string literal — keep the two in
+/// sync if either changes.
+///
+/// - `tg_hash_sync_sql()`: H1 — updates only the hash, only for rows
+///   Telegram has already sent; it must never set `tg_sent_at`.
+/// - `fb_hash_sync_sql()`: the Facebook mirror (guarded on `fb_sent_at`).
+/// - `fb_duplicate_handled_sql()`: H2 — a 506 means Meta already has
+///   this content, so it also sets `fb_sent_at` (COALESCE, preserving
+///   an existing timestamp) so the notice is not re-queued as new.
+#[cfg(test)]
+pub fn tg_hash_sync_sql() -> &'static str {
+    "UPDATE notices SET tg_last_notified_hash=?1 WHERE link=?2 AND tg_sent_at IS NOT NULL"
+}
+
+#[cfg(test)]
+pub fn fb_hash_sync_sql() -> &'static str {
+    "UPDATE notices SET fb_last_notified_hash=?1 WHERE link=?2 AND fb_sent_at IS NOT NULL"
+}
+
+#[cfg(test)]
+pub fn fb_duplicate_handled_sql() -> &'static str {
+    "UPDATE notices SET fb_sent_at=COALESCE(fb_sent_at, ?1), fb_last_notified_hash=?2, fb_notification_attempted_at=?3 WHERE link=?4"
+}
+
 /// Builds a lightweight UPDATE that only touches timestamp columns, leaving indexed
 /// fields (`published_date`, `content_hash`, etc.) untouched.
 pub fn build_lightweight_detail_update(
@@ -320,6 +350,38 @@ pub fn build_tg_notified_statement(
     )
 }
 
+/// Builds an UPDATE statement for Telegram silent hash sync.
+///
+/// H1: unlike `build_tg_notified_statement()` (which sets `tg_sent_at`),
+/// this only updates the stored hash, and only for rows Telegram has
+/// already sent (`tg_sent_at IS NOT NULL`). A silent backfill must never
+/// mark a never-sent notice as sent — that silently lost the first
+/// Telegram send for notices Facebook had already posted.
+pub fn build_tg_hash_sync_statement(
+    db: &D1Database,
+    link: &str,
+    content_hash: &str,
+) -> Result<D1PreparedStatement> {
+    query!(
+        db,
+        "UPDATE notices SET tg_last_notified_hash=?1 WHERE link=?2 AND tg_sent_at IS NOT NULL",
+        content_hash,
+        link,
+    )
+}
+
+/// Silent hash sync for Telegram (keeps tg_last_notified_hash in sync without re-posting).
+#[allow(dead_code)]
+pub async fn mark_tg_hash_sync(
+    db: &D1Database,
+    session: &D1DatabaseSession,
+    link: &str,
+    content_hash: &str,
+) -> Result<D1Metrics> {
+    let stmt = build_tg_hash_sync_statement(db, link, content_hash)?;
+    execute_batch(session, vec![stmt]).await
+}
+
 /// Marks a notice as notified via Telegram for the given `content_hash`.
 pub async fn mark_tg_notified(
     db: &D1Database,
@@ -371,6 +433,12 @@ pub async fn mark_fb_notified(
 }
 
 /// Marks a Facebook duplicate (error 506) as handled to stop retry loops.
+///
+/// H2: also sets `fb_sent_at = COALESCE(fb_sent_at, now)`. Meta has
+/// already seen this content on the Page (that is what a 506 means), so
+/// the notice counts as sent for queueing purposes. The old version only
+/// updated the hash, so `fb_sent_at` stayed NULL and the next run
+/// re-queued the notice as new, got 506 again, and looped forever.
 pub async fn mark_fb_duplicate_handled(
     db: &D1Database,
     session: &D1DatabaseSession,
@@ -380,7 +448,8 @@ pub async fn mark_fb_duplicate_handled(
     let now = Utc::now().to_rfc3339();
     let stmt = query!(
         db,
-        "UPDATE notices SET fb_last_notified_hash=?1, fb_notification_attempted_at=?2 WHERE link=?3",
+        "UPDATE notices SET fb_sent_at=COALESCE(fb_sent_at, ?1), fb_last_notified_hash=?2, fb_notification_attempted_at=?3 WHERE link=?4",
+        &now,
         content_hash,
         &now,
         link,
