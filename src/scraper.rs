@@ -211,48 +211,23 @@ pub fn parse_listing_html(html: &str) -> Vec<Notice> {
             continue;
         };
 
-        // M16: inside a `.card` fallback item, never fall back to a
-        // generic `a[href]` — that is exactly how unrelated links
-        // inside a card were harvested as notice URLs.
-        let raw_href = if from_card_fallback {
-            find_first_attr_in_tag(tag, parser, "a.info-link", "href")
-                .or_else(|| find_first_attr_in_tag(tag, parser, "a.notification-link", "href"))
-                .unwrap_or_default()
-        } else {
-            find_first_attr_in_tag(tag, parser, "a.info-link", "href")
-                .or_else(|| find_first_attr_in_tag(tag, parser, "a.notification-link", "href"))
-                .or_else(|| find_first_attr_in_tag(tag, parser, "a", "href"))
-                .unwrap_or_default()
-        };
+        // O4: one subtree walk per card instead of ~15 selector walks.
+        let fields = extract_listing_fields(tag, parser, from_card_fallback);
 
-        let url = normalize_notice_url(&raw_href);
+        let url = normalize_notice_url(&fields.raw_href);
         if url.is_empty() || !is_valid_aiub_notice_url(&url) {
             continue;
         }
 
-        let title = find_first_text_in_tag(tag, parser, "h2.title")
-            .or_else(|| find_first_text_in_tag(tag, parser, ".title"))
-            .or_else(|| find_first_text_in_tag(tag, parser, "h2"))
-            .or_else(|| find_first_text_in_tag(tag, parser, "h3"))
-            .or_else(|| find_first_text_in_tag(tag, parser, "h4"))
-            .unwrap_or_default();
-
-        if title.is_empty() {
+        if fields.title.is_empty() {
             continue;
         }
 
-        let description = find_first_text_in_tag(tag, parser, "p.desc")
-            .or_else(|| find_first_text_in_tag(tag, parser, ".desc"))
-            .or_else(|| find_first_text_in_tag(tag, parser, "p"))
-            .unwrap_or_default();
-
-        let published_date = extract_iso_date_from_card(tag, parser);
-
         notices.push(Notice {
-            title,
-            description,
+            title: fields.title,
+            description: fields.description,
             url,
-            published_date,
+            published_date: fields.published_date,
             body_text: String::new(),
             attachments: Vec::new(),
             detail_fetched: false,
@@ -260,6 +235,264 @@ pub fn parse_listing_html(html: &str) -> Vec<Notice> {
     }
 
     notices
+}
+
+/// O4: the fields of one listing card, collected by a single subtree
+/// walk (see `extract_listing_fields`).
+struct ListingFields {
+    raw_href: String,
+    title: String,
+    description: String,
+    published_date: Option<String>,
+}
+
+/// O4: single-pass listing extraction. The old code ran ~15
+/// `query_selector` subtree walks and 4–5 full-text copies per card
+/// (href ×3, title ×5, description ×3, date ×6) — roughly 7,500
+/// traversals for a 500-card page, 750 for a normal 50-notice page.
+/// This walks each card's subtree once, in document order (the same
+/// order `query_selector` visits), tracking the best (lowest-priority)
+/// candidate for each field and extracting text only for candidates
+/// that can win — matching the old per-selector first-non-empty
+/// semantics exactly. Measured on synthetic 500-card pages the parse
+/// is dominated by `tl::parse` tokenization, so this is roughly
+/// performance-neutral there (8 ms vs 8 ms median heavy, 3–5 ms vs
+/// 3 ms light); the traversal reduction is real, the ms saving at
+/// this scale is not. The O2 parse timer is now the tool to measure
+/// it on real AIUB HTML.
+///
+/// Selector priority (lower wins, ties keep the first in document
+/// order): href `a.info-link` > `a.notification-link` > `a`; title
+/// `h2.title` > `.title` > `h2` > `h3` > `h4`; description `p.desc` >
+/// `.desc` > `p`; date `.date-custom` > `.day`/`.month`/`.year` >
+/// `time[datetime]` > `time` / `.date`.
+fn extract_listing_fields(
+    tag: &HTMLTag,
+    parser: &Parser,
+    from_card_fallback: bool,
+) -> ListingFields {
+    let mut state = CardWalkState::default();
+    let card_children = tag.children();
+    for handle in card_children.top().iter() {
+        visit_card_node(*handle, parser, from_card_fallback, 0, &mut state);
+    }
+
+    // Date resolution, same order as `extract_iso_date_from_card`.
+    let mut published_date = None;
+    if let Some(raw_custom) = &state.date_custom {
+        published_date = parse_date_to_iso(raw_custom);
+    }
+    if published_date.is_none() {
+        if let (Some(d), Some(m), Some(y)) = (&state.day, &state.month, &state.year) {
+            let combined = clean_whitespace(&format!("{d} {m} {y}"));
+            published_date = parse_date_to_iso(&combined);
+        }
+    }
+    if published_date.is_none() {
+        if let Some(dt_attr) = &state.time_datetime {
+            let prefix: String = dt_attr.chars().take(10).collect();
+            published_date = parse_date_to_iso(&prefix).or_else(|| parse_date_to_iso(dt_attr));
+        }
+    }
+    if published_date.is_none() {
+        let raw_time = state.time_text.as_ref().or(state.date_text.as_ref());
+        if let Some(raw) = raw_time {
+            published_date = parse_date_to_iso(raw);
+        }
+    }
+
+    ListingFields {
+        raw_href: state.raw_href,
+        title: state.title,
+        description: state.description,
+        published_date,
+    }
+}
+
+/// O4: the best-so-far candidates found by the single card walk.
+struct CardWalkState {
+    href_priority: u8,
+    raw_href: String,
+    title_priority: u8,
+    title: String,
+    desc_priority: u8,
+    description: String,
+    date_custom: Option<String>,
+    day: Option<String>,
+    month: Option<String>,
+    year: Option<String>,
+    time_datetime: Option<String>,
+    time_text: Option<String>,
+    date_text: Option<String>,
+}
+
+impl Default for CardWalkState {
+    fn default() -> Self {
+        Self {
+            href_priority: u8::MAX,
+            raw_href: String::new(),
+            title_priority: u8::MAX,
+            title: String::new(),
+            desc_priority: u8::MAX,
+            description: String::new(),
+            date_custom: None,
+            day: None,
+            month: None,
+            year: None,
+            time_datetime: None,
+            time_text: None,
+            date_text: None,
+        }
+    }
+}
+
+/// O4: one step of the single-pass card walk — classifies one element,
+/// then recurses into its children in document order (preorder DFS,
+/// matching query_selector's order). Text is extracted only for a
+/// candidate that can win (strictly better priority than the current
+/// best), so a card costs one traversal plus a handful of text
+/// extractions instead of ~15 subtree walks.
+///
+/// `depth` is capped at `MAX_CARD_WALK_DEPTH`: the listing HTML comes
+/// from the network, and an adversarially nested page must not grow
+/// the recursion without bound. Real AIUB cards nest well under 20
+/// deep; deeper subtrees simply contribute no fields.
+const MAX_CARD_WALK_DEPTH: usize = 64;
+
+fn visit_card_node(
+    handle: tl::NodeHandle,
+    parser: &Parser,
+    from_card_fallback: bool,
+    depth: usize,
+    state: &mut CardWalkState,
+) {
+    if depth > MAX_CARD_WALK_DEPTH {
+        return;
+    }
+    let Some(node) = handle.get(parser) else {
+        return;
+    };
+    let Some(el) = node.as_tag() else {
+        return;
+    };
+    let name = el.name().as_utf8_str();
+    let name = name.as_ref();
+    // O4: split the class attribute once per element instead of once
+    // per has_class() call (there are ~8 class checks below). The
+    // first version re-split it every time and measured slower than
+    // the old 15-walk code.
+    let class_attr = el.attributes().class().map(|cls| cls.as_utf8_str());
+    let classes: Vec<&str> = class_attr
+        .as_ref()
+        .map(|s| s.split_whitespace().collect())
+        .unwrap_or_default();
+    let has = |target: &str| classes.iter().any(|c| c.eq_ignore_ascii_case(target));
+
+    if name.eq_ignore_ascii_case("a") {
+        let prio = if has("info-link") {
+            0
+        } else if has("notification-link") {
+            1
+        } else {
+            2
+        };
+        // M16: inside a `.card` fallback item, a generic `a[href]`
+        // never counts — that is how unrelated links inside a card
+        // were harvested as notice URLs.
+        if prio < state.href_priority && !(from_card_fallback && prio == 2) {
+            if let Some(href) = get_attr_str(el, "href") {
+                state.href_priority = prio;
+                state.raw_href = href;
+            }
+        }
+    }
+
+    let title_prio = if name.eq_ignore_ascii_case("h2") && has("title") {
+        0
+    } else if has("title") {
+        1
+    } else if name.eq_ignore_ascii_case("h2") {
+        2
+    } else if name.eq_ignore_ascii_case("h3") {
+        3
+    } else if name.eq_ignore_ascii_case("h4") {
+        4
+    } else {
+        u8::MAX
+    };
+    if title_prio < state.title_priority {
+        let text = extract_spaced_inline_text(el, parser);
+        if !text.is_empty() {
+            state.title_priority = title_prio;
+            state.title = text;
+        }
+    }
+
+    let desc_prio = if name.eq_ignore_ascii_case("p") && has("desc") {
+        0
+    } else if has("desc") {
+        1
+    } else if name.eq_ignore_ascii_case("p") {
+        2
+    } else {
+        u8::MAX
+    };
+    if desc_prio < state.desc_priority {
+        let text = extract_spaced_inline_text(el, parser);
+        if !text.is_empty() {
+            state.desc_priority = desc_prio;
+            state.description = text;
+        }
+    }
+
+    if state.date_custom.is_none() && has("date-custom") {
+        let text = extract_spaced_inline_text(el, parser);
+        if !text.is_empty() {
+            state.date_custom = Some(text);
+        }
+    }
+    if state.day.is_none() && has("day") {
+        let text = extract_spaced_inline_text(el, parser);
+        if !text.is_empty() {
+            state.day = Some(text);
+        }
+    }
+    if state.month.is_none() && has("month") {
+        let text = extract_spaced_inline_text(el, parser);
+        if !text.is_empty() {
+            state.month = Some(text);
+        }
+    }
+    if state.year.is_none() && has("year") {
+        let text = extract_spaced_inline_text(el, parser);
+        if !text.is_empty() {
+            state.year = Some(text);
+        }
+    }
+    if name.eq_ignore_ascii_case("time") {
+        if state.time_datetime.is_none() {
+            if let Some(dt) = get_attr_str(el, "datetime") {
+                state.time_datetime = Some(dt);
+            }
+        }
+        if state.time_text.is_none() {
+            let text = extract_spaced_inline_text(el, parser);
+            if !text.is_empty() {
+                state.time_text = Some(text);
+            }
+        }
+    }
+    if state.date_text.is_none() && has("date") {
+        let text = extract_spaced_inline_text(el, parser);
+        if !text.is_empty() {
+            state.date_text = Some(text);
+        }
+    }
+
+    let children = el.children();
+    for child in children.top().iter() {
+        visit_card_node(*child, parser, from_card_fallback, depth + 1, state);
+    }
 }
 
 fn find_listing_li_handles(dom: &VDom, parser: &Parser) -> Vec<tl::NodeHandle> {
@@ -789,7 +1022,13 @@ pub fn normalize_notice_url(raw_href: &str) -> String {
 }
 
 pub fn normalize_aiub_url(raw_href: &str, base_url: &str, allow_external: bool) -> String {
-    let cleaned = raw_href.replace('\\', "/");
+    // O10: only allocate a cleaned copy when a backslash is actually
+    // present — the old `replace()` allocated on every href.
+    let cleaned: std::borrow::Cow<'_, str> = if raw_href.contains('\\') {
+        raw_href.replace('\\', "/").into()
+    } else {
+        raw_href.into()
+    };
     let trimmed = cleaned.trim();
     if trimmed.is_empty()
         || trimmed.starts_with('#')

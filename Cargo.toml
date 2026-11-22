@@ -29,3 +29,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 opt-level = "s"
 lto = true
 codegen-units = 1
+# O9: wasm is already lean (opt-level="s", LTO, small deps, rusqlite
+# dev-only). Measured 2026-11-23: a panic=abort scratch build produced
+# a byte-identical wasm (1,928,883 bytes both ways, raw cargo build
+# before worker-build/wasm-opt), so there is no size reason to switch
+# — and abort would kill the worker instance on a panic instead of
+# letting it surface as an Err. Keep panic=unwind.

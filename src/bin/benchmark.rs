@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::env;
 use std::fs;
 use std::process;
+use std::time::Instant;
 
 #[derive(Debug, Serialize)]
 struct BenchmarkNotice {
@@ -20,11 +21,35 @@ struct BenchmarkReport {
     pub total_notices_scraped: usize,
     pub success_count: usize,
     pub failure_count: usize,
+    /// O2: the fetch duration passed in by the release workflow (curl
+    /// wall time). This is NOT parse latency — the old report divided
+    /// this by the notice count and called it latency, which is why
+    /// 6,263 ms vs 3,859 ms looked like a regression on identical HTML.
     pub total_duration_ms: u64,
     pub avg_latency_per_notice_ms: u64,
+    /// O2: parse-only timing — `parse_listing_html` run
+    /// `PARSE_RUNS` times over the already-fetched HTML, with the
+    /// median reported. This is the actual parser performance signal;
+    /// the fetch duration above is network-bound and must not be used
+    /// as one.
+    pub parse_runs: usize,
+    pub parse_durations_ms: Vec<u64>,
+    pub parse_duration_ms_median: u64,
+    pub avg_parse_latency_per_notice_ms: u64,
     pub html_size_bytes: usize,
     pub threshold_met: bool,
     pub notices: Vec<BenchmarkNotice>,
+}
+
+/// O2: number of parse repetitions; the median discards a cold first
+/// run (allocator warm-up) and any single slow outlier.
+pub const PARSE_RUNS: usize = 5;
+
+/// Median of a non-empty slice (upper median for even lengths).
+/// Pure and unit-tested below.
+pub fn median_u64(values: &mut [u64]) -> u64 {
+    values.sort_unstable();
+    values[values.len() / 2]
 }
 
 fn main() {
@@ -51,7 +76,21 @@ fn main() {
     };
 
     let html_size = html.len();
-    let raw_notices = parse_listing_html(&html);
+    // O2: time the parse itself, separately from the fetch. The fetch
+    // duration arrives as an argument from the release workflow's curl
+    // step; the parse runs here, PARSE_RUNS times, and the median is
+    // the reported parse signal.
+    let mut parse_durations_ms: Vec<u64> = Vec::with_capacity(PARSE_RUNS);
+    let mut raw_notices = Vec::new();
+    for run_idx in 0..PARSE_RUNS {
+        let started = Instant::now();
+        let parsed = parse_listing_html(&html);
+        parse_durations_ms.push(started.elapsed().as_millis() as u64);
+        if run_idx == 0 {
+            raw_notices = parsed;
+        }
+    }
+    let parse_duration_ms_median = median_u64(&mut parse_durations_ms.clone());
     let total_scraped = raw_notices.len();
 
     let mut notices = Vec::with_capacity(total_scraped);
@@ -81,6 +120,12 @@ fn main() {
         0
     };
 
+    let avg_parse_latency_ms = if total_scraped > 0 {
+        parse_duration_ms_median / (total_scraped as u64)
+    } else {
+        0
+    };
+
     let threshold_met = total_scraped >= 500;
     let failure_count = if threshold_met { 0 } else { 1 };
 
@@ -94,6 +139,10 @@ fn main() {
         failure_count,
         total_duration_ms: duration_ms,
         avg_latency_per_notice_ms: avg_latency_ms,
+        parse_runs: PARSE_RUNS,
+        parse_durations_ms,
+        parse_duration_ms_median,
+        avg_parse_latency_per_notice_ms: avg_parse_latency_ms,
         html_size_bytes: html_size,
         threshold_met,
         notices,
@@ -116,6 +165,10 @@ fn main() {
         "Successfully scraped and benchmarked {} notices (threshold_met={})",
         total_scraped, threshold_met
     );
+    println!(
+        "Fetch: {} ms ({} ms/notice); parse (median of {} runs): {} ms ({} ms/notice)",
+        duration_ms, avg_latency_ms, PARSE_RUNS, parse_duration_ms_median, avg_parse_latency_ms
+    );
 
     if !threshold_met {
         eprintln!(
@@ -123,5 +176,31 @@ fn main() {
             total_scraped
         );
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::median_u64;
+
+    #[test]
+    fn median_odd_count() {
+        assert_eq!(median_u64(&mut [5, 1, 3]), 3);
+    }
+
+    #[test]
+    fn median_even_count_takes_upper() {
+        assert_eq!(median_u64(&mut [4, 1, 3, 2]), 3);
+    }
+
+    #[test]
+    fn median_single_value() {
+        assert_eq!(median_u64(&mut [42]), 42);
+    }
+
+    #[test]
+    fn median_ignores_a_slow_outlier() {
+        // O2: a cold first run must not move the reported parse time.
+        assert_eq!(median_u64(&mut [900, 12, 11, 13, 12]), 12);
     }
 }

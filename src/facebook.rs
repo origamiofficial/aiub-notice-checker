@@ -458,8 +458,16 @@ pub async fn is_facebook_paused(
     db: &D1Database,
     session: &D1DatabaseSession,
 ) -> Result<(bool, Option<String>)> {
-    if let Some(reason) = db::get_app_state(session, FACEBOOK_AUTH_PAUSED_KEY).await? {
-        match parse_auth_pause_value(&reason) {
+    // O7: both pause keys in one round-trip instead of two sequential
+    // get_app_state calls.
+    let states = db::get_app_states(
+        session,
+        &[FACEBOOK_AUTH_PAUSED_KEY, FACEBOOK_COOLDOWN_UNTIL_KEY],
+    )
+    .await?;
+
+    if let Some(reason) = states.get(FACEBOOK_AUTH_PAUSED_KEY) {
+        match parse_auth_pause_value(reason) {
             Some((paused_at, message)) => {
                 let age = Utc::now().signed_duration_since(paused_at);
                 if age.num_hours() >= FACEBOOK_AUTH_PAUSE_TTL_HOURS {
@@ -483,13 +491,13 @@ pub async fn is_facebook_paused(
         }
     }
 
-    if let Some(cooldown_until) = db::get_app_state(session, FACEBOOK_COOLDOWN_UNTIL_KEY).await? {
+    if let Some(cooldown_until) = states.get(FACEBOOK_COOLDOWN_UNTIL_KEY) {
         // M2: compare parsed timestamps, not strings. A corrupt stored
         // value previously compared lexicographically against `now` and
         // could suppress Facebook posting forever ("garbage" > any
         // RFC3339 string). On parse failure the key is deleted and the
         // cooldown treated as expired; a real rate limit re-sets it.
-        match stored_time_is_after(&cooldown_until, Utc::now()) {
+        match stored_time_is_after(cooldown_until, Utc::now()) {
             Some(true) => {
                 return Ok((
                     true,

@@ -99,13 +99,15 @@ pub struct D1Metrics {
 }
 
 pub fn titles_equivalent(listing_title: &str, cached_title: &str) -> bool {
-    let normalize = |s: &str| -> String {
+    // O10: compare lazily over normalized char iterators instead of
+    // allocating two normalized Strings per call — this runs for every
+    // listing item on every run, and for detail-target selection too.
+    fn normalized_chars(s: &str) -> impl Iterator<Item = char> + '_ {
         s.chars()
             .filter(|c| c.is_alphanumeric())
             .flat_map(|c| c.to_lowercase())
-            .collect()
-    };
-    if normalize(listing_title) == normalize(cached_title) {
+    }
+    if normalized_chars(listing_title).eq(normalized_chars(cached_title)) {
         return true;
     }
     // M1: a truncated listing title ("Long title...") is only equivalent
@@ -116,11 +118,15 @@ pub fn titles_equivalent(listing_title: &str, cached_title: &str) -> bool {
     let Some(prefix) = trimmed.strip_suffix("...") else {
         return false;
     };
-    let prefix_norm = normalize(prefix);
-    if prefix_norm.is_empty() {
-        return false;
+    let mut cached = normalized_chars(cached_title);
+    let mut any_prefix_char = false;
+    for c in normalized_chars(prefix) {
+        any_prefix_char = true;
+        if cached.next() != Some(c) {
+            return false;
+        }
     }
-    normalize(cached_title).starts_with(&prefix_norm)
+    any_prefix_char
 }
 
 /// Length of a string in UTF-16 code units — the unit Telegram (and
@@ -169,23 +175,30 @@ pub fn truncate_text(text: &str, limit: usize) -> String {
 /// first), and only then is the header truncated.
 fn assemble_header_footer(header: &str, footer_parts: &[String]) -> String {
     let mut parts: Vec<String> = footer_parts.to_vec();
+    // O6: cache each part's UTF-16 length once and track the footer
+    // length arithmetically as attachments are dropped, instead of
+    // re-joining the footer and rescanning it on every loop iteration.
+    let mut part_lens: Vec<usize> = parts.iter().map(|p| utf16_len(p)).collect();
+    let header_len = utf16_len(header);
     loop {
-        let footer = parts.join("\n\n");
-        let total = utf16_len(header) + 2 + utf16_len(&footer);
+        let footer_len: usize =
+            part_lens.iter().sum::<usize>() + 2 * part_lens.len().saturating_sub(1);
+        let total = header_len + 2 + footer_len;
         if total <= UNIFIED_MAX_MESSAGE_LEN {
-            return format!("{header}\n\n{footer}");
+            return format!("{header}\n\n{}", parts.join("\n\n"));
         }
         if parts.len() > 1 {
             // Drop the last attachment; the notice URL (last element) stays.
             let drop_idx = parts.len() - 2;
             parts.remove(drop_idx);
+            part_lens.remove(drop_idx);
             continue;
         }
         // Only the notice URL remains and it still does not fit with the
         // header: truncate the header, never the URL.
-        let available_header = UNIFIED_MAX_MESSAGE_LEN.saturating_sub(utf16_len(&footer) + 2);
+        let available_header = UNIFIED_MAX_MESSAGE_LEN.saturating_sub(footer_len + 2);
         let header = truncate_text(header, available_header);
-        return format!("{header}\n\n{footer}");
+        return format!("{header}\n\n{}", parts.join("\n\n"));
     }
 }
 
@@ -252,6 +265,17 @@ pub fn format_notice_message(notice: &Notice, edited: bool) -> String {
     footer_parts.push(notice_url.to_string());
     let footer = footer_parts.join("\n\n");
 
+    // O6: cache the UTF-16 lengths of the pieces instead of
+    // rescanning the assembled message 5–10 times (the old code called
+    // utf16_len() on the full content, then again on header/suffix/
+    // truncated, and once per loop iteration in
+    // assemble_header_footer). Every length below is computed once
+    // from the same strings that are joined, so the arithmetic matches
+    // the built string's length exactly.
+    let header_len = utf16_len(&header);
+    let footer_len = utf16_len(&footer);
+    let notice_url_len = utf16_len(notice_url);
+
     let full_content = match (text_content, valid_attachments.is_empty()) {
         (Some(body), true) => {
             // Standard text notice without attachments
@@ -271,7 +295,15 @@ pub fn format_notice_message(notice: &Notice, edited: bool) -> String {
         }
     };
 
-    if utf16_len(&full_content) <= UNIFIED_MAX_MESSAGE_LEN {
+    let full_len = match (text_content, valid_attachments.is_empty()) {
+        (Some(body), true) => header_len + 2 + utf16_len(body) + 2 + notice_url_len,
+        (Some(body), false) => header_len + 2 + utf16_len(body) + 2 + footer_len,
+        (None, false) => header_len + 2 + footer_len,
+        (None, true) => {
+            header_len + 2 + utf16_len("Please click the link for details.") + 2 + notice_url_len
+        }
+    };
+    if full_len <= UNIFIED_MAX_MESSAGE_LEN {
         return full_content;
     }
 
@@ -281,14 +313,16 @@ pub fn format_notice_message(notice: &Notice, edited: bool) -> String {
     // directly (dropping attachments / truncating the header only if the
     // header + footer alone still exceed the limit).
     if let Some(body) = text_content {
-        let suffix = format!("\n\n{footer}");
-        let fixed_overhead = utf16_len(&header) + utf16_len(&suffix) + 2; // "\n\n" between header and body
+        let suffix_len = 2 + footer_len; // "\n\n{footer}"
+        let fixed_overhead = header_len + suffix_len + 2; // "\n\n" between header and body
         let available_body_chars = UNIFIED_MAX_MESSAGE_LEN.saturating_sub(fixed_overhead);
         if available_body_chars >= 10 {
             let truncated_body = truncate_text(body, available_body_chars);
-            let truncated = format!("{header}\n\n{truncated_body}{suffix}");
-            if utf16_len(&truncated) <= UNIFIED_MAX_MESSAGE_LEN {
-                return truncated;
+            // O6: length from the cached pieces plus one scan of the
+            // truncated body, not a rescan of the whole message.
+            let truncated_len = header_len + 2 + utf16_len(&truncated_body) + suffix_len;
+            if truncated_len <= UNIFIED_MAX_MESSAGE_LEN {
+                return format!("{header}\n\n{truncated_body}\n\n{footer}");
             }
         }
     }

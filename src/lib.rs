@@ -3,7 +3,7 @@ use futures_util::stream::{self, StreamExt};
 use std::collections::{HashMap, HashSet};
 use worker::{
     console_error, console_log, console_warn,
-    d1::{D1Database, D1DatabaseSession},
+    d1::{D1Database, D1DatabaseSession, D1PreparedStatement},
     event,
     observability::{enter_span, enter_span_async, SpanStatus},
     signal::is_near_cpu_limit,
@@ -153,7 +153,14 @@ async fn handle_upstream_outage(
     secrets: &Secrets,
     now: DateTime<Utc>,
 ) -> worker::Result<()> {
-    let down_since_str = db::get_app_state(session, AIUB_OUTAGE_DOWN_SINCE_KEY).await?;
+    // O7: both outage keys in one round-trip instead of two sequential
+    // get_app_state calls.
+    let states = db::get_app_states(
+        session,
+        &[AIUB_OUTAGE_DOWN_SINCE_KEY, AIUB_OUTAGE_ALERTED_KEY],
+    )
+    .await?;
+    let down_since_str = states.get(AIUB_OUTAGE_DOWN_SINCE_KEY).cloned();
     let down_since = match down_since_str {
         Some(ref s) if !s.is_empty() => match DateTime::parse_from_rfc3339(s) {
             Ok(dt) => dt.with_timezone(&Utc),
@@ -184,10 +191,8 @@ async fn handle_upstream_outage(
 
     let elapsed = now.signed_duration_since(down_since);
     if elapsed.num_minutes() >= AIUB_OUTAGE_ALERT_THRESHOLD_MINS {
-        let already_alerted = db::get_app_state(session, AIUB_OUTAGE_ALERTED_KEY)
-            .await?
-            .as_deref()
-            == Some("true");
+        let already_alerted =
+            states.get(AIUB_OUTAGE_ALERTED_KEY).map(String::as_str) == Some("true");
 
         if !already_alerted {
             let duration_str = format_duration_human(elapsed);
@@ -214,7 +219,14 @@ async fn handle_upstream_recovery(
     now: DateTime<Utc>,
     listing_count: usize,
 ) -> worker::Result<()> {
-    let down_since_str = db::get_app_state(session, AIUB_OUTAGE_DOWN_SINCE_KEY).await?;
+    // O7: both outage keys in one round-trip instead of two sequential
+    // get_app_state calls.
+    let states = db::get_app_states(
+        session,
+        &[AIUB_OUTAGE_DOWN_SINCE_KEY, AIUB_OUTAGE_ALERTED_KEY],
+    )
+    .await?;
+    let down_since_str = states.get(AIUB_OUTAGE_DOWN_SINCE_KEY).cloned();
     let Some(down_since_str) = down_since_str else {
         return Ok(());
     };
@@ -222,10 +234,7 @@ async fn handle_upstream_recovery(
         return Ok(());
     }
 
-    let already_alerted = db::get_app_state(session, AIUB_OUTAGE_ALERTED_KEY)
-        .await?
-        .as_deref()
-        == Some("true");
+    let already_alerted = states.get(AIUB_OUTAGE_ALERTED_KEY).map(String::as_str) == Some("true");
 
     if !already_alerted {
         // The outage never reached the alert threshold, so no recovery
@@ -295,6 +304,12 @@ async fn handle_upstream_recovery(
     }
 
     Ok(())
+}
+
+/// O2: elapsed milliseconds between two Utc timestamps, for per-phase
+/// timing in the Run Summary.
+fn elapsed_ms_since(start: DateTime<Utc>) -> i64 {
+    Utc::now().signed_duration_since(start).num_milliseconds()
 }
 
 /// Pure debounce check (M2): returns true when an alert with the given
@@ -375,6 +390,59 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
     .await;
 }
 
+/// O1/O3: the outcome of one dispatch phase. Sends are complete when
+/// this is returned; the D1 marks are only collected statements, to be
+/// flushed sequentially by the caller after both phases finish (O3),
+/// so no two D1 batches ever run concurrently on the same session.
+#[derive(Default)]
+struct DispatchOutcome {
+    sent_count: usize,
+    deferred_count: usize,
+    failed_count: usize,
+    attempt_stmts: Vec<D1PreparedStatement>,
+    notified_stmts: Vec<D1PreparedStatement>,
+    duplicate_stmts: Vec<D1PreparedStatement>,
+}
+
+/// O1: flushes accumulated dispatch marks in one batch per mark kind
+/// (attempt, notified, duplicate), instead of one round-trip per send.
+/// A batch that fails entirely is logged and its statement count added
+/// to `failed_statements` — those marks did not apply, so the affected
+/// notices may re-send on the next run (safe direction, same as M4).
+async fn flush_dispatch_marks(
+    session: &D1DatabaseSession,
+    label: &str,
+    attempt_stmts: Vec<D1PreparedStatement>,
+    notified_stmts: Vec<D1PreparedStatement>,
+    duplicate_stmts: Vec<D1PreparedStatement>,
+) -> D1Metrics {
+    let mut metrics = D1Metrics::default();
+    for (kind, stmts) in [
+        ("attempt", attempt_stmts),
+        ("notified", notified_stmts),
+        ("duplicate", duplicate_stmts),
+    ] {
+        if stmts.is_empty() {
+            continue;
+        }
+        let count = stmts.len();
+        match db::execute_batch(session, stmts).await {
+            Ok(m) => {
+                metrics.rows_read += m.rows_read;
+                metrics.rows_written += m.rows_written;
+                metrics.failed_statements += m.failed_statements;
+            }
+            Err(err) => {
+                console_error!(
+                    "[Dispatch Mark Flush Failed] {label} {kind} batch ({count} marks) failed entirely: {err}; affected notices may re-send on the next run."
+                );
+                metrics.failed_statements += count;
+            }
+        }
+    }
+    metrics
+}
+
 async fn run(env: &Env) -> worker::Result<()> {
     let secrets = Secrets::from_env(env)?;
     let database = env.d1("DB")?;
@@ -382,6 +450,12 @@ async fn run(env: &Env) -> worker::Result<()> {
     // Start a sequentially consistent D1 session anchored to the primary instance.
     let session = database.with_session(Some("first-primary"))?;
     let mut total_d1 = D1Metrics::default();
+
+    // O2: per-phase wall-time accounting for the Run Summary. Chrono
+    // timestamps are used instead of std::time::Instant: this is
+    // logging-grade timing, and it works unchanged on wasm.
+    let run_started = Utc::now();
+    let mut phase_started = run_started;
 
     // 1. Fetch the latest notices on listing page 1.
     let listing_notices: Option<Vec<Notice>> =
@@ -414,6 +488,9 @@ async fn run(env: &Env) -> worker::Result<()> {
         }
         return Ok(());
     };
+
+    let fetch_listing_ms = elapsed_ms_since(phase_started);
+    phase_started = Utc::now();
 
     // M1: recovery is only evaluated against a listing that actually
     // parsed notices; a 0-notice fetch keeps the outage state.
@@ -501,6 +578,9 @@ async fn run(env: &Env) -> worker::Result<()> {
 
     total_d1.rows_read += read_metrics.rows_read;
     total_d1.rows_written += read_metrics.rows_written;
+
+    let load_existing_ms = elapsed_ms_since(phase_started);
+    phase_started = Utc::now();
 
     // 3. Select up to MAX_DETAIL_FETCHES_PER_RUN (5) detail pages strictly from the visible notices.
     //    See select_detail_targets() (M15) for the Priority A/B/C rules.
@@ -608,6 +688,8 @@ async fn run(env: &Env) -> worker::Result<()> {
     .await;
 
     let attempted_count = detail_results.len();
+    let detail_fetch_ms = elapsed_ms_since(phase_started);
+    phase_started = Utc::now();
     let mut detail_succeeded_count = 0usize;
     let mut detail_http_error_count = 0usize;
     let mut detail_parse_error_count = 0usize;
@@ -682,7 +764,12 @@ async fn run(env: &Env) -> worker::Result<()> {
     struct PendingNotification {
         notice: Notice,
         content_hash: String,
-        is_edited: bool,
+        // O5: the formatted message, computed once at queue time. The
+        // Telegram and Facebook formats are identical, so formatting
+        // twice per notice (once per phase) was pure waste. The
+        // is_edited flag used to live here too, but dispatch no longer
+        // reads it — it only exists while formatting the message.
+        message: String,
     }
 
     let mut statements = Vec::new();
@@ -774,6 +861,9 @@ async fn run(env: &Env) -> worker::Result<()> {
         }
 
         let new_hash = item.content_hash();
+        // O5: serialize the attachments once; the upsert and the
+        // silent-sync check previously each serialized them again.
+        let attachments_json = item.attachments_json();
 
         // Determine whether this row needs a full upsert or just a lightweight timestamp update.
         let (needs_db_write, use_lightweight_update) = match existing {
@@ -797,9 +887,14 @@ async fn run(env: &Env) -> worker::Result<()> {
         // Silent hash sync for non-edit backfills — see silent_sync_flags()
         // (M15) for the eligibility rules.
         let (silent_sync_tg, silent_sync_fb) = match existing {
-            Some(row) => {
-                silent_sync_flags(row, &listing_title, &item, &new_hash, matched_legacy_sticky)
-            }
+            Some(row) => silent_sync_flags(
+                row,
+                &listing_title,
+                &item,
+                &new_hash,
+                &attachments_json,
+                matched_legacy_sticky,
+            ),
             None => (false, false),
         };
         let silent_hash_sync = silent_sync_tg || silent_sync_fb;
@@ -810,8 +905,13 @@ async fn run(env: &Env) -> worker::Result<()> {
                     db::build_lightweight_detail_update(&database, &item.url, item.detail_fetched)?;
                 statements.push(stmt);
             } else {
-                let stmt =
-                    db::build_upsert_statement(&database, &item, &new_hash, detail_attempted)?;
+                let stmt = db::build_upsert_statement(
+                    &database,
+                    &item,
+                    &new_hash,
+                    &attachments_json,
+                    detail_attempted,
+                )?;
                 statements.push(stmt);
             }
         }
@@ -830,15 +930,20 @@ async fn run(env: &Env) -> worker::Result<()> {
         match existing {
             None => {
                 if item.detail_fetched || detail_attempted {
+                    // O5: format once — both platforms get the identical
+                    // message for a new notice (is_edited is false for
+                    // both), so the second push clones the string
+                    // instead of re-running the formatter.
+                    let message = format_notice_message(&item, false);
                     tg_notifications.push(PendingNotification {
                         notice: item.clone(),
                         content_hash: new_hash.clone(),
-                        is_edited: false,
+                        message: message.clone(),
                     });
                     fb_notifications.push(PendingNotification {
                         notice: item,
                         content_hash: new_hash,
-                        is_edited: false,
+                        message,
                     });
                 }
             }
@@ -847,6 +952,7 @@ async fn run(env: &Env) -> worker::Result<()> {
                 // Facebook rules are identical given each platform's own
                 // sent_at / last-notified-hash, so one pure function
                 // serves both phases.
+                let mut tg_message: Option<(bool, String)> = None;
                 if let Some(is_edited) = platform_notification(
                     row.tg_sent_at.as_deref(),
                     row.tg_last_notified_hash.as_deref(),
@@ -855,10 +961,14 @@ async fn run(env: &Env) -> worker::Result<()> {
                     row.detail_checked_at.is_some(),
                     &new_hash,
                 ) {
+                    // O5: format here, once; the Facebook push below
+                    // reuses this message when its is_edited matches.
+                    let message = format_notice_message(&item, is_edited);
+                    tg_message = Some((is_edited, message.clone()));
                     tg_notifications.push(PendingNotification {
                         notice: item.clone(),
                         content_hash: new_hash.clone(),
-                        is_edited,
+                        message,
                     });
                 }
 
@@ -870,10 +980,14 @@ async fn run(env: &Env) -> worker::Result<()> {
                     row.detail_checked_at.is_some(),
                     &new_hash,
                 ) {
+                    let message = match &tg_message {
+                        Some((tg_edited, m)) if *tg_edited == is_edited => m.clone(),
+                        _ => format_notice_message(&item, is_edited),
+                    };
                     fb_notifications.push(PendingNotification {
                         notice: item,
                         content_hash: new_hash,
-                        is_edited,
+                        message,
                     });
                 }
             }
@@ -977,67 +1091,99 @@ async fn run(env: &Env) -> worker::Result<()> {
         total_d1.failed_statements += sync_metrics.failed_statements;
     }
 
-    // 7. Dispatch queued Telegram notifications (oldest-first).
-    // M8: skipped entirely when the upsert batch partially failed.
-    if !upsert_failed && !tg_notifications.is_empty() {
+    let upsert_ms = elapsed_ms_since(phase_started);
+    phase_started = Utc::now();
+
+    // 7+8. Dispatch queued notifications.
+    // O3: the Telegram and Facebook phases overlap. Their wall time was
+    // 10x1.0s + 5x1.5s = 17.5s of sequential pacing; overlapped it is the
+    // longer of the two, with per-platform pacing unchanged.
+    // O1: each phase only *collects* D1 mark statements while sending;
+    // the marks are flushed sequentially after both phases finish, so no
+    // two D1 batches ever run concurrently on the same session.
+    // M8: both phases are skipped entirely when the upsert batch
+    // partially failed.
+    if !upsert_failed {
+        // Sequential D1 read before the overlap: the Facebook phase must
+        // not do D1 reads while Telegram is sending.
+        let fb_paused = if !fb_notifications.is_empty() && secrets.facebook.is_some() {
+            facebook::is_facebook_paused(&database, &session).await?
+        } else {
+            (false, None)
+        };
+        if fb_paused.0 {
+            console_log!(
+                "[Facebook Dispatch Skipped] {}",
+                fb_paused.1.as_deref().unwrap_or("paused")
+            );
+        }
+
         tg_notifications.reverse();
+        fb_notifications.reverse();
         let db_ref = &database;
         let secrets_ref = &secrets;
+        let session_ref = &session;
+        let fb_secrets_ref = secrets.facebook.as_ref();
+        let fb_paused_flag = fb_paused.0;
 
-        let notify_metrics =
+        // O3: both phases run concurrently; each only collects D1 marks.
+        let tg_future = async move {
+            if tg_notifications.is_empty() {
+                return Ok::<DispatchOutcome, worker::Error>(DispatchOutcome::default());
+            }
             enter_span_async("dispatch_telegram_notifications", |span| async move {
                 span.set_attribute("queued", tg_notifications.len() as i64);
-                let mut sent_count = 0usize;
-                let mut deferred_count = 0usize;
-                let mut failed_count = 0usize;
-                let mut metrics = D1Metrics::default();
+                let mut outcome = DispatchOutcome::default();
 
                 for item in tg_notifications.into_iter().take(MAX_TELEGRAM_SENDS_PER_RUN) {
                     if is_near_cpu_limit() {
                         console_warn!(
                             "[Telegram Deferred] Near CPU limit during Telegram dispatch; deferring remaining."
                         );
-                        deferred_count += 1;
+                        outcome.deferred_count += 1;
                         break;
                     }
 
-                    if let Ok(m) =
-                        db::mark_tg_notification_attempt(db_ref, session_ref, &item.notice.url).await
+                    // O1: accumulate the attempt mark; flushed after the
+                    // phase instead of one round-trip per send.
+                    let attempt_now = Utc::now().to_rfc3339();
+                    match db::build_tg_attempt_statement(db_ref, &item.notice.url, &attempt_now)
                     {
-                        metrics.rows_read += m.rows_read;
-                        metrics.rows_written += m.rows_written;
+                        Ok(stmt) => outcome.attempt_stmts.push(stmt),
+                        Err(err) => {
+                            console_warn!(
+                                "[Telegram Attempt Mark Failed] Could not build attempt mark for {}: {}; send continues.",
+                                item.notice.url, err
+                            );
+                        }
                     }
 
-                    match telegram::send_notice_alert(secrets_ref, &item.notice, item.is_edited)
-                        .await
-                    {
+                    match telegram::send_notice_alert(secrets_ref, &item.message).await {
                         Ok(true) => {
-                            // M4: a failed mark must not abort the rest of
-                            // dispatch (or the Facebook phase below). The
-                            // send already happened; log the mark failure
-                            // and continue — the notice may re-send on the
-                            // next run, which is safer than dropping the
-                            // remaining queue.
-                            match db::mark_tg_notified(
+                            // O1: accumulate the notified mark. M4: a
+                            // failed mark must not abort the rest of
+                            // dispatch — the send already happened, so
+                            // log it and continue; the notice may
+                            // re-send on the next run, which is safer
+                            // than dropping the remaining queue.
+                            let now = Utc::now().to_rfc3339();
+                            match db::build_tg_notified_statement(
                                 db_ref,
-                                session_ref,
                                 &item.notice.url,
                                 &item.content_hash,
-                            )
-                            .await
-                            {
-                                Ok(m) => {
-                                    metrics.rows_read += m.rows_read;
-                                    metrics.rows_written += m.rows_written;
-                                    sent_count += 1;
+                                &now,
+                            ) {
+                                Ok(stmt) => {
+                                    outcome.notified_stmts.push(stmt);
+                                    outcome.sent_count += 1;
                                 }
                                 Err(err) => {
                                     console_error!(
-                                        "[Telegram Mark Failed] Send succeeded for {} but marking it notified failed: {}; it may re-send on the next run.",
+                                        "[Telegram Mark Failed] Send succeeded for {} but building its notified mark failed: {}; it may re-send on the next run.",
                                         item.notice.url,
                                         err
                                     );
-                                    failed_count += 1;
+                                    outcome.failed_count += 1;
                                 }
                             }
                         }
@@ -1046,7 +1192,7 @@ async fn run(env: &Env) -> worker::Result<()> {
                                 "[Telegram Deferred] Rate limit hit for notice {}; deferring to next run.",
                                 item.notice.url
                             );
-                            deferred_count += 1;
+                            outcome.deferred_count += 1;
                             break;
                         }
                         Err(err) => {
@@ -1055,321 +1201,343 @@ async fn run(env: &Env) -> worker::Result<()> {
                                 item.notice.url,
                                 err
                             );
-                            failed_count += 1;
+                            outcome.failed_count += 1;
                         }
                     }
                 }
 
-                span.set_attribute("sent", sent_count as i64);
-                span.set_attribute("deferred", deferred_count as i64);
-                span.set_attribute("failed", failed_count as i64);
-                if failed_count > 0 {
-                    span.set_status(SpanStatus::Error(Some(format!("{failed_count} sends failed"))));
+                span.set_attribute("sent", outcome.sent_count as i64);
+                span.set_attribute("deferred", outcome.deferred_count as i64);
+                span.set_attribute("failed", outcome.failed_count as i64);
+                if outcome.failed_count > 0 {
+                    span.set_status(SpanStatus::Error(Some(format!(
+                        "{} sends failed",
+                        outcome.failed_count
+                    ))));
                 } else {
                     span.set_status(SpanStatus::Ok);
                 }
-                Ok::<D1Metrics, worker::Error>(metrics)
+                Ok::<DispatchOutcome, worker::Error>(outcome)
             })
-            .await?;
+            .await
+        };
 
-        total_d1.rows_read += notify_metrics.rows_read;
-        total_d1.rows_written += notify_metrics.rows_written;
-        total_d1.failed_statements += notify_metrics.failed_statements;
-    }
+        let fb_future = async move {
+            if fb_notifications.is_empty() || fb_secrets_ref.is_none() || fb_paused_flag {
+                return Ok::<DispatchOutcome, worker::Error>(DispatchOutcome::default());
+            }
+            let fb_secrets = fb_secrets_ref.expect("Facebook secrets present (checked above)");
+            enter_span_async("dispatch_facebook_notifications", |span| async move {
+                span.set_attribute("queued", fb_notifications.len() as i64);
+                let mut outcome = DispatchOutcome::default();
 
-    // 8. Dispatch queued Facebook notifications (oldest-first, independent phase).
-    // M8: skipped entirely when the upsert batch partially failed.
-    if !upsert_failed {
-        if let Some(fb_secrets) = &secrets.facebook {
-            if !fb_notifications.is_empty() {
-                fb_notifications.reverse();
-                let db_ref = &database;
-                let secrets_ref = &secrets;
-                let fb_secrets_ref = fb_secrets;
-
-                let fb_metrics =
-                enter_span_async("dispatch_facebook_notifications", |span| async move {
-                    span.set_attribute("queued", fb_notifications.len() as i64);
-
-                    let (paused, pause_reason) =
-                        facebook::is_facebook_paused(db_ref, session_ref).await?;
-                    if paused {
-                        console_log!(
-                            "[Facebook Dispatch Skipped] {}",
-                            pause_reason.as_deref().unwrap_or("paused")
+                for item in fb_notifications.into_iter().take(MAX_FACEBOOK_SENDS_PER_RUN) {
+                    if is_near_cpu_limit() {
+                        console_warn!(
+                            "[Facebook Deferred] Near CPU limit during Facebook dispatch; deferring remaining."
                         );
-                        span.set_attribute(
-                            "skipped_reason",
-                            pause_reason.unwrap_or_else(|| "paused".to_string()),
-                        );
-                        span.set_status(SpanStatus::Ok);
-                        return Ok::<D1Metrics, worker::Error>(D1Metrics::default());
+                        outcome.deferred_count += 1;
+                        break;
                     }
 
-                    let mut sent_count = 0usize;
-                    let mut deferred_count = 0usize;
-                    let mut failed_count = 0usize;
-                    let mut metrics = D1Metrics::default();
-
-                    for item in fb_notifications.into_iter().take(MAX_FACEBOOK_SENDS_PER_RUN) {
-                        if is_near_cpu_limit() {
+                    // O1: accumulate the attempt mark; flushed after the
+                    // phase instead of one round-trip per send.
+                    let attempt_now = Utc::now().to_rfc3339();
+                    match db::build_fb_attempt_statement(db_ref, &item.notice.url, &attempt_now)
+                    {
+                        Ok(stmt) => outcome.attempt_stmts.push(stmt),
+                        Err(err) => {
                             console_warn!(
-                                "[Facebook Deferred] Near CPU limit during Facebook dispatch; deferring remaining."
+                                "[Facebook Attempt Mark Failed] Could not build attempt mark for {}: {}; send continues.",
+                                item.notice.url, err
                             );
-                            deferred_count += 1;
+                        }
+                    }
+
+                    // O5: the message was formatted once at queue time;
+                    // the Facebook phase no longer re-formats it.
+                    let message = &item.message;
+                    let post_outcome = facebook::publish_post(fb_secrets, message).await;
+
+                    match post_outcome {
+                        Ok(facebook::FacebookPostResult::Success { post_id, usage }) => {
+                            // O1: accumulate the notified mark. M4: same
+                            // log-and-continue rule as the Telegram
+                            // mark — a failed mark must not abort the
+                            // remaining dispatch.
+                            let now = Utc::now().to_rfc3339();
+                            match db::build_fb_notified_statement(
+                                db_ref,
+                                &item.notice.url,
+                                &item.content_hash,
+                                &post_id,
+                                &now,
+                            ) {
+                                Ok(stmt) => {
+                                    outcome.notified_stmts.push(stmt);
+                                    outcome.sent_count += 1;
+                                }
+                                Err(err) => {
+                                    console_error!(
+                                        "[Facebook Mark Failed] Post {} published for {} but building its notified mark failed: {}; it may re-send (and hit a 506 duplicate) on the next run.",
+                                        post_id,
+                                        item.notice.url,
+                                        err
+                                    );
+                                    outcome.failed_count += 1;
+                                }
+                            }
+
+                            if let Some(u) = usage {
+                                if u.is_approaching_limit() {
+                                    let until =
+                                        (Utc::now() + Duration::minutes(15)).to_rfc3339();
+                                    let _ = db::set_app_state(
+                                        db_ref,
+                                        session_ref,
+                                        "fb_cooldown_until",
+                                        &until,
+                                    )
+                                    .await;
+                                    console_warn!(
+                                        "[Facebook BUC High] Usage reached {}%; cooling down until {}.",
+                                        u.max_usage(),
+                                        until
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(facebook::FacebookPostResult::RateLimited { cooldown_minutes }) => {
+                            let until =
+                                (Utc::now() + Duration::minutes(cooldown_minutes)).to_rfc3339();
+                            let _ = db::set_app_state(
+                                db_ref,
+                                session_ref,
+                                "fb_cooldown_until",
+                                &until,
+                            )
+                            .await;
+                            console_warn!(
+                                "[Facebook Rate Limited] Setting cooldown until {} ({} mins).",
+                                until,
+                                cooldown_minutes
+                            );
+                            let _ = facebook::send_debounced_fb_admin_alert(
+                                db_ref,
+                                session_ref,
+                                secrets_ref,
+                                "rate_limit",
+                                &format!(
+                                    "⚠️ AIUB Notice Facebook: Rate limit reached. Dispatch paused until {until}."
+                                ),
+                            )
+                            .await;
+                            outcome.deferred_count += 1;
                             break;
                         }
-
-                        if let Ok(m) =
-                            db::mark_fb_notification_attempt(db_ref, session_ref, &item.notice.url)
-                                .await
-                        {
-                            metrics.rows_read += m.rows_read;
-                            metrics.rows_written += m.rows_written;
+                        Ok(facebook::FacebookPostResult::SpamBlocked) => {
+                            let until = (Utc::now()
+                                + Duration::hours(FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS))
+                            .to_rfc3339();
+                            let _ = db::set_app_state(
+                                db_ref,
+                                session_ref,
+                                "fb_cooldown_until",
+                                &until,
+                            )
+                            .await;
+                            console_error!(
+                                "[Facebook Spam Block] Meta error 368: policy/spam block. Pausing until {}.",
+                                until
+                            );
+                            let _ = facebook::send_debounced_fb_admin_alert(
+                                db_ref,
+                                session_ref,
+                                secrets_ref,
+                                "spam_block",
+                                &format!(
+                                    "🚨 AIUB Notice Facebook: Meta blocked post for policy/spam (error 368). Dispatch paused until {until}. Please inspect Facebook Page!"
+                                ),
+                            )
+                            .await;
+                            outcome.failed_count += 1;
+                            break;
                         }
-
-                        let message = format_notice_message(&item.notice, item.is_edited);
-                        let post_outcome = facebook::publish_post(fb_secrets_ref, &message).await;
-
-                        match post_outcome {
-                            Ok(facebook::FacebookPostResult::Success { post_id, usage }) => {
-                                // M4: same log-and-continue rule as the
-                                // Telegram mark — a failed mark must not
-                                // abort the remaining dispatch.
-                                match db::mark_fb_notified(
-                                    db_ref,
-                                    session_ref,
-                                    &item.notice.url,
-                                    &item.content_hash,
-                                    &post_id,
-                                )
-                                .await
-                                {
-                                    Ok(m) => {
-                                        metrics.rows_read += m.rows_read;
-                                        metrics.rows_written += m.rows_written;
-                                        sent_count += 1;
-                                    }
-                                    Err(err) => {
-                                        console_error!(
-                                            "[Facebook Mark Failed] Post {} published for {} but marking it notified failed: {}; it may re-send (and hit a 506 duplicate) on the next run.",
-                                            post_id,
-                                            item.notice.url,
-                                            err
-                                        );
-                                        failed_count += 1;
-                                    }
-                                }
-
-                                if let Some(u) = usage {
-                                    if u.is_approaching_limit() {
-                                        let until = (Utc::now() + Duration::minutes(15)).to_rfc3339();
-                                        let _ = db::set_app_state(
-                                            db_ref,
-                                            session_ref,
-                                            "fb_cooldown_until",
-                                            &until,
-                                        )
-                                        .await;
-                                        console_warn!(
-                                            "[Facebook BUC High] Usage reached {}%; cooling down until {}.",
-                                            u.max_usage(),
-                                            until
-                                        );
-                                        break;
-                                    }
+                        Ok(facebook::FacebookPostResult::Duplicate) => {
+                            console_warn!(
+                                "[Facebook Duplicate] Error 506 duplicate post for {}; marking handled.",
+                                item.notice.url
+                            );
+                            // O1: accumulate the duplicate-handled mark.
+                            // M4: log-and-continue — a failed mark must
+                            // not abort the remaining dispatch.
+                            let now = Utc::now().to_rfc3339();
+                            match db::build_fb_duplicate_handled_statement(
+                                db_ref,
+                                &item.notice.url,
+                                &item.content_hash,
+                                &now,
+                            ) {
+                                Ok(stmt) => outcome.duplicate_stmts.push(stmt),
+                                Err(err) => {
+                                    console_error!(
+                                        "[Facebook Duplicate Mark Failed] Could not build duplicate-handled mark for {}: {}; it will be retried on the next run.",
+                                        item.notice.url,
+                                        err
+                                    );
+                                    outcome.failed_count += 1;
                                 }
                             }
-                            Ok(facebook::FacebookPostResult::RateLimited { cooldown_minutes }) => {
-                                let until = (Utc::now() + Duration::minutes(cooldown_minutes)).to_rfc3339();
-                                let _ = db::set_app_state(
-                                    db_ref,
-                                    session_ref,
-                                    "fb_cooldown_until",
-                                    &until,
-                                )
-                                .await;
-                                console_warn!(
-                                    "[Facebook Rate Limited] Setting cooldown until {} ({} mins).",
-                                    until,
-                                    cooldown_minutes
-                                );
-                                let _ = facebook::send_debounced_fb_admin_alert(
-                                    db_ref,
-                                    session_ref,
-                                    secrets_ref,
-                                    "rate_limit",
-                                    &format!(
-                                        "⚠️ AIUB Notice Facebook: Rate limit reached. Dispatch paused until {until}."
-                                    ),
-                                )
-                                .await;
-                                deferred_count += 1;
-                                break;
-                            }
-                            Ok(facebook::FacebookPostResult::SpamBlocked) => {
-                                let until = (Utc::now()
-                                    + Duration::hours(FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS))
-                                .to_rfc3339();
-                                let _ = db::set_app_state(
-                                    db_ref,
-                                    session_ref,
-                                    "fb_cooldown_until",
-                                    &until,
-                                )
-                                .await;
-                                console_error!(
-                                    "[Facebook Spam Block] Meta error 368: policy/spam block. Pausing until {}.",
-                                    until
-                                );
-                                let _ = facebook::send_debounced_fb_admin_alert(
-                                    db_ref,
-                                    session_ref,
-                                    secrets_ref,
-                                    "spam_block",
-                                    &format!(
-                                        "🚨 AIUB Notice Facebook: Meta blocked post for policy/spam (error 368). Dispatch paused until {until}. Please inspect Facebook Page!"
-                                    ),
-                                )
-                                .await;
-                                failed_count += 1;
-                                break;
-                            }
-                            Ok(facebook::FacebookPostResult::Duplicate) => {
-                                console_warn!(
-                                    "[Facebook Duplicate] Error 506 duplicate post for {}; marking handled.",
+                            let _ = facebook::send_debounced_fb_admin_alert(
+                                db_ref,
+                                session_ref,
+                                secrets_ref,
+                                "duplicate_post",
+                                &format!(
+                                    "⚠️ AIUB Notice Facebook: Consecutive duplicate rejected by Meta (error 506): {}",
                                     item.notice.url
-                                );
-                                // M4: log-and-continue — a failed mark
-                                // must not abort the remaining dispatch.
-                                match db::mark_fb_duplicate_handled(
-                                    db_ref,
-                                    session_ref,
-                                    &item.notice.url,
-                                    &item.content_hash,
-                                )
-                                .await
-                                {
-                                    Ok(m) => {
-                                        metrics.rows_read += m.rows_read;
-                                        metrics.rows_written += m.rows_written;
-                                    }
-                                    Err(err) => {
-                                        console_error!(
-                                            "[Facebook Duplicate Mark Failed] Could not mark 506 duplicate handled for {}: {}; it will be retried on the next run.",
-                                            item.notice.url,
-                                            err
-                                        );
-                                        failed_count += 1;
-                                    }
-                                }
-                                let _ = facebook::send_debounced_fb_admin_alert(
-                                    db_ref,
-                                    session_ref,
-                                    secrets_ref,
-                                    "duplicate_post",
-                                    &format!(
-                                        "⚠️ AIUB Notice Facebook: Consecutive duplicate rejected by Meta (error 506): {}",
-                                        item.notice.url
-                                    ),
-                                )
-                                .await;
-                            }
-                            Ok(facebook::FacebookPostResult::AuthError { message }) => {
-                                console_error!("[Facebook Auth Error] {}", message);
-                                // H2: store the pause with a timestamp so
-                                // is_facebook_paused() can expire it after
-                                // FACEBOOK_AUTH_PAUSE_TTL_HOURS.
-                                let pause_value =
-                                    facebook::format_auth_pause_value(&message);
-                                let _ = db::set_app_state(
-                                    db_ref,
-                                    session_ref,
-                                    FACEBOOK_AUTH_PAUSED_KEY,
-                                    &pause_value,
-                                )
-                                .await;
-                                let _ = telegram::send_admin_alert(
-                                    secrets_ref,
-                                    &format!("🚨 AIUB Notice Facebook: Authentication paused: {message}"),
-                                )
-                                .await;
-                                failed_count += 1;
-                                break;
-                            }
-                            Ok(facebook::FacebookPostResult::TransientFailure { message }) => {
-                                console_warn!(
-                                    "[Facebook Transient] Error: {}; will retry at next cron.",
-                                    message
-                                );
-                                deferred_count += 1;
-                                break;
-                            }
-                            Ok(facebook::FacebookPostResult::UnknownError { message }) => {
-                                console_error!("[Facebook Unknown Error] {}", message);
-                                // M10: an unclassified Meta error previously
-                                // got no admin alert, no pause and no
-                                // cooldown — it failed silently every run
-                                // until someone noticed the logs. Route it
-                                // through the existing debounced FB admin
-                                // alert (6h, category "unknown_error") so
-                                // it is seen once without spamming. No
-                                // cooldown/pause is set: the error is
-                                // unclassified, so pausing could suppress
-                                // good posts for a transient Meta glitch.
-                                let _ = facebook::send_debounced_fb_admin_alert(
-                                    db_ref,
-                                    session_ref,
-                                    secrets_ref,
-                                    "unknown_error",
-                                    &format!(
-                                        "⚠️ AIUB Notice Facebook: Unclassified Meta error, dispatch paused for this run (no cooldown set): {message}"
-                                    ),
-                                )
-                                .await;
-                                failed_count += 1;
-                                break;
-                            }
-                            Err(err) => {
-                                console_error!(
-                                    "[Facebook Worker Error] Failed to publish notice {}: {}",
-                                    item.notice.url,
-                                    err
-                                );
-                                failed_count += 1;
-                                break;
-                            }
+                                ),
+                            )
+                            .await;
+                        }
+                        Ok(facebook::FacebookPostResult::AuthError { message }) => {
+                            console_error!("[Facebook Auth Error] {}", message);
+                            // H2: store the pause with a timestamp so
+                            // is_facebook_paused() can expire it after
+                            // FACEBOOK_AUTH_PAUSE_TTL_HOURS.
+                            let pause_value = facebook::format_auth_pause_value(&message);
+                            let _ = db::set_app_state(
+                                db_ref,
+                                session_ref,
+                                FACEBOOK_AUTH_PAUSED_KEY,
+                                &pause_value,
+                            )
+                            .await;
+                            let _ = telegram::send_admin_alert(
+                                secrets_ref,
+                                &format!("🚨 AIUB Notice Facebook: Authentication paused: {message}"),
+                            )
+                            .await;
+                            outcome.failed_count += 1;
+                            break;
+                        }
+                        Ok(facebook::FacebookPostResult::TransientFailure { message }) => {
+                            console_warn!(
+                                "[Facebook Transient] Error: {}; will retry at next cron.",
+                                message
+                            );
+                            outcome.deferred_count += 1;
+                            break;
+                        }
+                        Ok(facebook::FacebookPostResult::UnknownError { message }) => {
+                            console_error!("[Facebook Unknown Error] {}", message);
+                            // M10: an unclassified Meta error previously
+                            // got no admin alert, no pause and no
+                            // cooldown — it failed silently every run
+                            // until someone noticed the logs. Route it
+                            // through the existing debounced FB admin
+                            // alert (6h, category "unknown_error") so
+                            // it is seen once without spamming. No
+                            // cooldown/pause is set: the error is
+                            // unclassified, so pausing could suppress
+                            // good posts for a transient Meta glitch.
+                            let _ = facebook::send_debounced_fb_admin_alert(
+                                db_ref,
+                                session_ref,
+                                secrets_ref,
+                                "unknown_error",
+                                &format!(
+                                    "⚠️ AIUB Notice Facebook: Unclassified Meta error, dispatch paused for this run (no cooldown set): {message}"
+                                ),
+                            )
+                            .await;
+                            outcome.failed_count += 1;
+                            break;
+                        }
+                        Err(err) => {
+                            console_error!(
+                                "[Facebook Worker Error] Failed to publish notice {}: {}",
+                                item.notice.url,
+                                err
+                            );
+                            outcome.failed_count += 1;
+                            break;
                         }
                     }
+                }
 
-                    span.set_attribute("sent", sent_count as i64);
-                    span.set_attribute("deferred", deferred_count as i64);
-                    span.set_attribute("failed", failed_count as i64);
-                    if failed_count > 0 {
-                        span.set_status(SpanStatus::Error(Some(format!("{failed_count} sends failed"))));
-                    } else {
-                        span.set_status(SpanStatus::Ok);
-                    }
-                    Ok::<D1Metrics, worker::Error>(metrics)
-                })
-                .await?;
+                span.set_attribute("sent", outcome.sent_count as i64);
+                span.set_attribute("deferred", outcome.deferred_count as i64);
+                span.set_attribute("failed", outcome.failed_count as i64);
+                if outcome.failed_count > 0 {
+                    span.set_status(SpanStatus::Error(Some(format!(
+                        "{} sends failed",
+                        outcome.failed_count
+                    ))));
+                } else {
+                    span.set_status(SpanStatus::Ok);
+                }
+                Ok::<DispatchOutcome, worker::Error>(outcome)
+            })
+            .await
+        };
 
-                total_d1.rows_read += fb_metrics.rows_read;
-                total_d1.rows_written += fb_metrics.rows_written;
-                total_d1.failed_statements += fb_metrics.failed_statements;
+        // O3: run both phases concurrently, then flush the collected
+        // marks sequentially (O1) — Telegram first, then Facebook.
+        let (tg_result, fb_result) = futures_util::future::join(tg_future, fb_future).await;
+        let tg_outcome = match tg_result {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                console_error!("[Telegram Dispatch Failed] {err}");
+                DispatchOutcome::default()
             }
-        }
+        };
+        let fb_outcome = match fb_result {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                console_error!("[Facebook Dispatch Failed] {err}");
+                DispatchOutcome::default()
+            }
+        };
+        let tg_flush = flush_dispatch_marks(
+            &session,
+            "Telegram",
+            tg_outcome.attempt_stmts,
+            tg_outcome.notified_stmts,
+            tg_outcome.duplicate_stmts,
+        )
+        .await;
+        let fb_flush = flush_dispatch_marks(
+            &session,
+            "Facebook",
+            fb_outcome.attempt_stmts,
+            fb_outcome.notified_stmts,
+            fb_outcome.duplicate_stmts,
+        )
+        .await;
+        total_d1.rows_read += tg_flush.rows_read + fb_flush.rows_read;
+        total_d1.rows_written += tg_flush.rows_written + fb_flush.rows_written;
+        total_d1.failed_statements += tg_flush.failed_statements + fb_flush.failed_statements;
     }
 
+    let dispatch_ms = elapsed_ms_since(phase_started);
+
     console_log!(
-        "[Run Summary] rows_read={}, rows_written={}, failed_statements={}, silent_backfills={}, detail_succeeded={}, detail_http_errors={}, detail_parse_errors={}",
+        "[Run Summary] rows_read={}, rows_written={}, failed_statements={}, silent_backfills={}, detail_succeeded={}, detail_http_errors={}, detail_parse_errors={}, fetch_ms={}, load_ms={}, detail_ms={}, upsert_ms={}, dispatch_ms={}, total_ms={}",
         total_d1.rows_read,
         total_d1.rows_written,
         total_d1.failed_statements,
         silent_backfills,
         detail_succeeded_count,
         detail_http_error_count,
-        detail_parse_error_count
+        detail_parse_error_count,
+        fetch_listing_ms,
+        load_existing_ms,
+        detail_fetch_ms,
+        upsert_ms,
+        dispatch_ms,
+        elapsed_ms_since(run_started)
     );
 
     Ok(())
@@ -1559,11 +1727,15 @@ pub(crate) fn platform_notification(
 /// H1 (preserved): a platform that has never sent must never be marked
 /// sent by a silent sync — only its hash is synced, and only when it
 /// has already sent.
+///
+/// O5: `attachments_json` is computed once by the caller (`run()`),
+/// not re-serialized here.
 pub(crate) fn silent_sync_flags(
     row: &NoticeRow,
     listing_title: &str,
     item: &Notice,
     new_hash: &str,
+    attachments_json: &str,
     matched_legacy_sticky: bool,
 ) -> (bool, bool) {
     let tg_needs_sync =
@@ -1587,7 +1759,7 @@ pub(crate) fn silent_sync_flags(
 
     let metadata_or_mojibake_backfill = listing_unchanged
         && clean_mojibake_eq(&row.body_text, &item.body_text)
-        && row.attachments_json == item.attachments_json();
+        && row.attachments_json == attachments_json;
 
     let sticky_header_rebaseline =
         matched_legacy_sticky && item.detail_fetched && listing_unchanged;

@@ -590,7 +590,7 @@ cargo fmt --check
 # Run Clippy with zero-warning tolerance
 cargo clippy --all-targets --all-features -- -D warnings
 
-# Execute unit and integration tests (154 tests)
+# Execute unit and integration tests (156 tests)
 cargo test --all-features
 
 # Verify WebAssembly compilation target
@@ -611,7 +611,7 @@ aiub-notice-checker/
 │       ├── dependency-review.yml      # PR dependency review action
 │       ├── deploy.yml                 # Chained deployment: runs after test.yml succeeds
 │       ├── release.yml                # Automated version bump, 500-notice benchmark, and GitHub Release
-│       └── test.yml                   # CI pipeline: fmt, clippy, 154 unit tests, wasm check
+│       └── test.yml                   # CI pipeline: fmt, clippy, 156 unit tests, wasm check
 ├── migrations/
 │   ├── 0001_init.sql                  # Initial schema and indexes
 │   └── 0002_facebook_and_tg_rename.sql # Facebook tracking columns, tg_ rename, and flood backfill
@@ -627,7 +627,7 @@ aiub-notice-checker/
 │   ├── models.rs                      # Notice data models, hashing, and unified cross-platform message formatter
 │   ├── scraper.rs                     # HTML fetching, redirect handling, and tl DOM parsing
 │   ├── telegram.rs                    # Telegram Bot API client, rate-limit handler, and retries
-│   ├── tests.rs                       # Comprehensive unit and regression test suite (154 tests)
+│   ├── tests.rs                       # Comprehensive unit and regression test suite (156 tests)
 │   └── version.rs                     # Single-digit rolling semver rollover calculation logic
 ├── Cargo.toml                         # Rust crate manifest, dependencies, and release profiles
 ├── LICENSE                            # MIT License
