@@ -7,8 +7,8 @@
 #[cfg(test)]
 mod scraper_tests {
     use crate::scraper::{
-        is_block_tag, normalize_aiub_url, normalize_notice_url, parse_detail_html,
-        parse_detail_with_reason, parse_listing_html, USER_AGENT,
+        USER_AGENT, is_block_tag, normalize_aiub_url, normalize_notice_url, parse_detail_html,
+        parse_detail_with_reason, parse_listing_html,
     };
 
     // L1: <pre>, <h5> and <h6> are block tags; exact-name matching must not
@@ -645,8 +645,8 @@ mod scraper_tests {
 #[cfg(test)]
 mod model_tests {
     use crate::models::{
-        display_date, format_facebook_message, format_notice_message, titles_equivalent,
-        truncate_text, Notice,
+        Notice, display_date, format_facebook_message, format_notice_message, titles_equivalent,
+        truncate_text,
     };
 
     // ── Content hashing ──────────────────────────────────────────────
@@ -1311,7 +1311,9 @@ mod lib_tests {
         let msg = format_listing_skip_message(timeout_err);
         assert_eq!(
             msg,
-            format!("[Listing Fetch Skipped] AIUB listing page unreachable: {timeout_err}. Skipping this run.")
+            format!(
+                "[Listing Fetch Skipped] AIUB listing page unreachable: {timeout_err}. Skipping this run."
+            )
         );
 
         let status_err =
@@ -1811,11 +1813,11 @@ mod version_tests {
 
 #[cfg(test)]
 mod facebook_tests {
-    use crate::config::FACEBOOK_MAX_MESSAGE_LEN;
+    use crate::config::{FACEBOOK_MAX_MESSAGE_LEN, FacebookSecrets};
     use crate::facebook::{
-        classify_meta_error, parse_buc_usage_header, stored_time_is_after, MetaErrorAction,
+        MetaErrorAction, classify_meta_error, parse_buc_usage_header, stored_time_is_after,
     };
-    use crate::models::{format_facebook_message, Notice};
+    use crate::models::{Notice, format_facebook_message};
 
     #[test]
     fn stored_time_is_after_handles_future_past_and_corrupt() {
@@ -2002,6 +2004,31 @@ mod facebook_tests {
         assert!(parse_buc_usage_header("{}").is_none());
     }
 
+    #[test]
+    fn parse_buc_usage_header_caps_regain_access_at_seven_days() {
+        // Medium #6: the header value is untrusted input — an absurd
+        // estimated_time_to_regain_access must not push the cooldown
+        // arbitrarily far into the future.
+        let header = r#"{"1234567890":[{"type":"pages","call_count":99,"total_cputime":99,"total_time":99,"estimated_time_to_regain_access":999999}]}"#;
+        let usage = parse_buc_usage_header(header).expect("valid BUC header");
+        assert_eq!(
+            usage.estimated_time_to_regain_access,
+            crate::config::FACEBOOK_BUC_MAX_COOLDOWN_MINS
+        );
+        assert_eq!(usage.estimated_time_to_regain_access, 60 * 24 * 7);
+    }
+
+    #[test]
+    fn facebook_secrets_debug_redacts_token() {
+        // Medium #9: the hand-written Debug must never print the token.
+        let secrets = FacebookSecrets::from_raw(Some("1234567890"), Some("EAABsekrit-token-value"))
+            .expect("valid secrets");
+        let rendered = format!("{secrets:?}");
+        assert!(rendered.contains("1234567890"));
+        assert!(!rendered.contains("EAABsekrit-token-value"));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
     // ── Meta error classification ────────────────────────────────────
 
     #[test]
@@ -2087,7 +2114,7 @@ mod facebook_tests {
     // A 401 carrying a real Meta 190 error is still an auth failure.
     #[test]
     fn classify_publish_error_bare_401_is_transient() {
-        use crate::facebook::{classify_publish_error, FacebookPostResult};
+        use crate::facebook::{FacebookPostResult, classify_publish_error};
         let result = classify_publish_error(
             401,
             0,
@@ -2112,7 +2139,7 @@ mod facebook_tests {
     // error, matching the parsed permission-error handling.
     #[test]
     fn classify_publish_error_bare_403_is_auth_error() {
-        use crate::facebook::{classify_publish_error, FacebookPostResult};
+        use crate::facebook::{FacebookPostResult, classify_publish_error};
         let result =
             classify_publish_error(403, 0, None, "Unknown Meta API error", "Forbidden", None);
         assert!(
@@ -2127,7 +2154,7 @@ mod facebook_tests {
     #[test]
     fn classify_publish_error_bare_429_is_rate_limited() {
         use crate::config::FACEBOOK_RATE_LIMIT_COOLDOWN_FALLBACK_MINS;
-        use crate::facebook::{classify_publish_error, BucUsage, FacebookPostResult};
+        use crate::facebook::{BucUsage, FacebookPostResult, classify_publish_error};
 
         // No BUC usage: fall back to the 60-minute cooldown.
         let result =
@@ -2218,8 +2245,10 @@ mod facebook_tests {
         assert!(
             migration_sql.contains("ALTER TABLE notices ADD COLUMN fb_last_notified_hash TEXT;")
         );
-        assert!(migration_sql
-            .contains("ALTER TABLE notices ADD COLUMN fb_notification_attempted_at TEXT;"));
+        assert!(
+            migration_sql
+                .contains("ALTER TABLE notices ADD COLUMN fb_notification_attempted_at TEXT;")
+        );
         assert!(migration_sql.contains("ALTER TABLE notices ADD COLUMN fb_post_id TEXT;"));
 
         // Verify historical backfill preventing archive flood
@@ -2306,7 +2335,7 @@ mod db_tests {
     // test, which would have passed even if the function were never called.
     #[test]
     fn lightweight_detail_update_preserves_existing_detail_fetched_at() {
-        use rusqlite::{params, Connection};
+        use rusqlite::{Connection, params};
 
         let conn = Connection::open_in_memory().expect("in-memory SQLite");
         conn.execute_batch(
@@ -2406,7 +2435,7 @@ mod db_tests {
     // and preserve the existing tg_sent_at timestamp.
     #[test]
     fn tg_hash_sync_never_marks_unsent_as_sent() {
-        use rusqlite::{params, Connection};
+        use rusqlite::{Connection, params};
 
         let conn = Connection::open_in_memory().expect("in-memory SQLite");
         conn.execute_batch(
@@ -2501,7 +2530,7 @@ mod db_tests {
     // as new (fb_sent_at.is_none()) and loops on 506 forever.
     #[test]
     fn fb_duplicate_handled_marks_notice_as_sent() {
-        use rusqlite::{params, Connection};
+        use rusqlite::{Connection, params};
 
         let conn = Connection::open_in_memory().expect("in-memory SQLite");
         conn.execute_batch(
@@ -2577,7 +2606,7 @@ mod db_tests {
     // requested keys, and no others.
     #[test]
     fn app_states_in_sql_returns_only_requested_keys() {
-        use rusqlite::{params, Connection};
+        use rusqlite::{Connection, params};
 
         let conn = Connection::open_in_memory().expect("in-memory SQLite");
         conn.execute_batch("CREATE TABLE app_state (key TEXT PRIMARY KEY, value TEXT)")
@@ -2604,12 +2633,14 @@ mod db_tests {
             .collect::<Result<_, _>>()
             .expect("collect rows");
         assert_eq!(rows.len(), 2, "exactly the two requested keys");
-        assert!(rows
-            .iter()
-            .any(|(k, v)| k == "fb_auth_paused" && v == "paused:401"));
-        assert!(rows
-            .iter()
-            .any(|(k, v)| k == "fb_cooldown_until" && v == "2026-11-23T10:00:00Z"));
+        assert!(
+            rows.iter()
+                .any(|(k, v)| k == "fb_auth_paused" && v == "paused:401")
+        );
+        assert!(
+            rows.iter()
+                .any(|(k, v)| k == "fb_cooldown_until" && v == "2026-11-23T10:00:00Z")
+        );
     }
 
     #[test]
@@ -2627,7 +2658,7 @@ mod db_tests {
 
 #[cfg(test)]
 mod utf16_format_tests {
-    use crate::models::{format_notice_message, truncate_text, utf16_len, Notice};
+    use crate::models::{Notice, format_notice_message, truncate_text, utf16_len};
 
     #[test]
     fn utf16_len_counts_emoji_as_two_units() {
@@ -2781,5 +2812,1296 @@ mod redact_tests {
         );
         // A bare "EAA" with no token body after it is not a token.
         assert_eq!(redact_token("EAA", "abc123token"), "EAA");
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use crate::errors::AppError;
+
+    #[test]
+    fn app_error_display_labels_the_layer() {
+        assert_eq!(
+            AppError::Fetch("boom".to_string()).to_string(),
+            "fetch error: boom"
+        );
+        assert_eq!(
+            AppError::D1("boom".to_string()).to_string(),
+            "D1 error: boom"
+        );
+        assert_eq!(
+            AppError::Config("boom".to_string()).to_string(),
+            "config error: boom"
+        );
+    }
+
+    #[test]
+    fn app_error_converts_to_worker_error() {
+        let err: worker::Error =
+            AppError::Config("missing TELEGRAM_BOT_API_KEY secret: test".to_string()).into();
+        assert!(err.to_string().contains("config error:"));
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use crate::config::{
+        FACEBOOK_BUC_MAX_COOLDOWN_MINS, FACEBOOK_COOLDOWN_UNTIL_KEY, FacebookSecrets, Secrets,
+        TELEGRAM_AUTH_PAUSED_KEY,
+    };
+    use crate::dispatch::{
+        DispatchLog, DispatchOutcome, FacebookSendStep, FacebookSender, MarkSink,
+        PendingNotification, TelegramSendStep, TelegramSender, dispatch_facebook_phase,
+        dispatch_telegram_phase, facebook_send_step, telegram_send_step,
+    };
+    use crate::errors::AppError;
+    use crate::facebook::{
+        BucUsage, FacebookPostResult, classify_publish_error, parse_auth_pause_value,
+        parse_buc_usage_header,
+    };
+    use crate::models::Notice;
+    use crate::telegram::TelegramSendResult;
+    use chrono::{DateTime, Utc};
+    use futures_util::future::FutureExt;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    // ── Fakes ────────────────────────────────────────────────────────
+    //
+    // The dispatch traits exist precisely so the phases can run
+    // natively: the real sender needs Worker `Fetch`, real mark
+    // building needs a `D1Database`, and the `console_*` macros abort
+    // on non-wasm targets. These fakes record every call in order.
+
+    struct FakeTelegramSender {
+        script: RefCell<VecDeque<worker::Result<TelegramSendResult>>>,
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl FakeTelegramSender {
+        fn new(script: Vec<worker::Result<TelegramSendResult>>) -> Self {
+            Self {
+                script: RefCell::new(script.into()),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl TelegramSender for FakeTelegramSender {
+        async fn send_notice(
+            &self,
+            _secrets: &Secrets,
+            message: &str,
+        ) -> worker::Result<TelegramSendResult> {
+            self.calls.borrow_mut().push(message.to_string());
+            self.script
+                .borrow_mut()
+                .pop_front()
+                .expect("fake Telegram sender ran out of scripted results")
+        }
+    }
+
+    struct FakeFacebookSender {
+        script: RefCell<VecDeque<worker::Result<FacebookPostResult>>>,
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl FakeFacebookSender {
+        fn new(script: Vec<worker::Result<FacebookPostResult>>) -> Self {
+            Self {
+                script: RefCell::new(script.into()),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl FacebookSender for FakeFacebookSender {
+        async fn publish(
+            &self,
+            _secrets: &FacebookSecrets,
+            message: &str,
+        ) -> worker::Result<FacebookPostResult> {
+            self.calls.borrow_mut().push(message.to_string());
+            self.script
+                .borrow_mut()
+                .pop_front()
+                .expect("fake Facebook sender ran out of scripted results")
+        }
+    }
+
+    struct FakeMarkSink {
+        calls: Vec<String>,
+        fail_on: Vec<&'static str>,
+    }
+
+    impl FakeMarkSink {
+        fn new() -> Self {
+            Self {
+                calls: Vec::new(),
+                fail_on: Vec::new(),
+            }
+        }
+
+        fn failing(fail_on: Vec<&'static str>) -> Self {
+            Self {
+                calls: Vec::new(),
+                fail_on,
+            }
+        }
+
+        fn record(&mut self, key: String) -> worker::Result<()> {
+            if self.fail_on.iter().any(|prefix| key.starts_with(prefix)) {
+                return Err(AppError::D1(format!("fake mark failure for {key}")).into());
+            }
+            self.calls.push(key);
+            Ok(())
+        }
+    }
+
+    impl MarkSink for FakeMarkSink {
+        fn record_tg_attempt(
+            &mut self,
+            _outcome: &mut DispatchOutcome,
+            url: &str,
+            _now: &str,
+        ) -> worker::Result<()> {
+            self.record(format!("tg_attempt:{url}"))
+        }
+
+        fn record_tg_notified(
+            &mut self,
+            _outcome: &mut DispatchOutcome,
+            url: &str,
+            _content_hash: &str,
+            _now: &str,
+        ) -> worker::Result<()> {
+            self.record(format!("tg_notified:{url}"))
+        }
+
+        fn record_fb_attempt(
+            &mut self,
+            _outcome: &mut DispatchOutcome,
+            url: &str,
+            _now: &str,
+        ) -> worker::Result<()> {
+            self.record(format!("fb_attempt:{url}"))
+        }
+
+        fn record_fb_notified(
+            &mut self,
+            _outcome: &mut DispatchOutcome,
+            url: &str,
+            _content_hash: &str,
+            post_id: &str,
+            _now: &str,
+        ) -> worker::Result<()> {
+            self.record(format!("fb_notified:{url}:{post_id}"))
+        }
+
+        fn record_fb_duplicate(
+            &mut self,
+            _outcome: &mut DispatchOutcome,
+            url: &str,
+            _content_hash: &str,
+            _now: &str,
+        ) -> worker::Result<()> {
+            self.record(format!("fb_duplicate:{url}"))
+        }
+    }
+
+    struct FakeLog {
+        lines: Vec<(bool, String)>,
+    }
+
+    impl FakeLog {
+        fn new() -> Self {
+            Self { lines: Vec::new() }
+        }
+
+        fn warns(&self) -> Vec<&str> {
+            self.lines
+                .iter()
+                .filter(|(is_warn, _)| *is_warn)
+                .map(|(_, m)| m.as_str())
+                .collect()
+        }
+
+        fn errors(&self) -> Vec<&str> {
+            self.lines
+                .iter()
+                .filter(|(is_warn, _)| !*is_warn)
+                .map(|(_, m)| m.as_str())
+                .collect()
+        }
+    }
+
+    impl DispatchLog for FakeLog {
+        fn warn(&mut self, message: String) {
+            self.lines.push((true, message));
+        }
+
+        fn error(&mut self, message: String) {
+            self.lines.push((false, message));
+        }
+    }
+
+    fn test_secrets() -> Secrets {
+        Secrets {
+            telegram_bot_api_key: "test-bot-key".to_string(),
+            telegram_chat_id: "123".to_string(),
+            telegram_admin_chat_id: None,
+            facebook: None,
+        }
+    }
+
+    fn test_fb_secrets() -> FacebookSecrets {
+        FacebookSecrets::from_raw(Some("1234567890"), Some("EAABtest-token"))
+            .expect("valid fb secrets")
+    }
+
+    fn notification(url: &str) -> PendingNotification {
+        PendingNotification {
+            notice: Notice {
+                title: format!("Notice {url}"),
+                description: "Desc".to_string(),
+                url: url.to_string(),
+                published_date: None,
+                body_text: "Body".to_string(),
+                attachments: vec![],
+                detail_fetched: true,
+            },
+            content_hash: format!("hash-{url}"),
+            message: format!("Message for {url}"),
+        }
+    }
+
+    fn minutes_until(rfc3339: &str) -> i64 {
+        let dt = DateTime::parse_from_rfc3339(rfc3339)
+            .expect("cooldown value is RFC3339")
+            .with_timezone(&Utc);
+        dt.signed_duration_since(Utc::now()).num_minutes()
+    }
+
+    fn run_tg_phase(
+        queue: Vec<PendingNotification>,
+        paused: bool,
+        sender: &FakeTelegramSender,
+        marks: &mut FakeMarkSink,
+        log: &mut FakeLog,
+    ) -> DispatchOutcome {
+        let secrets = test_secrets();
+        dispatch_telegram_phase(&secrets, queue, paused, sender, marks, log)
+            .now_or_never()
+            .expect("Telegram phase completes synchronously with a fake sender")
+            .expect("Telegram phase returns Ok")
+    }
+
+    fn run_fb_phase(
+        queue: Vec<PendingNotification>,
+        paused: bool,
+        sender: &FakeFacebookSender,
+        marks: &mut FakeMarkSink,
+        log: &mut FakeLog,
+    ) -> DispatchOutcome {
+        let secrets = test_fb_secrets();
+        dispatch_facebook_phase(&secrets, queue, paused, sender, marks, log)
+            .now_or_never()
+            .expect("Facebook phase completes synchronously with a fake sender")
+            .expect("Facebook phase returns Ok")
+    }
+
+    // ── (a) Telegram auth pause ──────────────────────────────────────
+
+    #[test]
+    fn tg_phase_auth_failure_pauses_and_stops() {
+        // 401/403 sets tg_auth_paused and stops the phase: the third
+        // notice is never attempted.
+        let sender = FakeTelegramSender::new(vec![
+            Ok(TelegramSendResult::Sent),
+            Ok(TelegramSendResult::AuthFailure {
+                message: "Telegram API HTTP 403: Forbidden: bot was blocked by the user"
+                    .to_string(),
+            }),
+            Ok(TelegramSendResult::Sent),
+        ]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let queue = vec![
+            notification("https://www.aiub.edu/notice/1"),
+            notification("https://www.aiub.edu/notice/2"),
+            notification("https://www.aiub.edu/notice/3"),
+        ];
+        let outcome = run_tg_phase(queue, false, &sender, &mut marks, &mut log);
+
+        assert_eq!(outcome.sent_count, 1);
+        assert_eq!(outcome.failed_count, 1);
+        assert_eq!(outcome.deferred_count, 0);
+        assert_eq!(
+            sender.calls().len(),
+            2,
+            "phase must stop after the auth failure and never send the third notice"
+        );
+        assert_eq!(
+            marks.calls,
+            vec![
+                "tg_attempt:https://www.aiub.edu/notice/1",
+                "tg_notified:https://www.aiub.edu/notice/1",
+                "tg_attempt:https://www.aiub.edu/notice/2",
+            ]
+        );
+        // The pause is collected for the post-join flush: timestamped
+        // and parseable, carrying the auth message.
+        assert_eq!(outcome.app_state_sets.len(), 1);
+        assert_eq!(outcome.app_state_sets[0].0, TELEGRAM_AUTH_PAUSED_KEY);
+        let (_, message) =
+            parse_auth_pause_value(&outcome.app_state_sets[0].1).expect("pause value parses");
+        assert!(message.contains("403"));
+        assert!(outcome.tg_auth_failure.as_deref().unwrap().contains("403"));
+        assert!(
+            log.errors()
+                .iter()
+                .any(|m| m.contains("[Telegram Auth Error]"))
+        );
+    }
+
+    #[test]
+    fn tg_send_step_auth_failure_collects_pause_and_alert() {
+        let mut outcome = DispatchOutcome::default();
+        let result: worker::Result<TelegramSendResult> = Ok(TelegramSendResult::AuthFailure {
+            message: "Telegram API HTTP 401: Unauthorized".to_string(),
+        });
+        let step = telegram_send_step(&mut outcome, "https://www.aiub.edu/notice/1", &result);
+        assert!(matches!(step, TelegramSendStep::AuthFailureStop { .. }));
+        assert_eq!(outcome.failed_count, 1);
+        assert_eq!(outcome.app_state_sets.len(), 1);
+        assert_eq!(outcome.app_state_sets[0].0, TELEGRAM_AUTH_PAUSED_KEY);
+        let (paused_at, message) =
+            parse_auth_pause_value(&outcome.app_state_sets[0].1).expect("pause value parses");
+        assert_eq!(message, "Telegram API HTTP 401: Unauthorized");
+        assert!(
+            Utc::now().signed_duration_since(paused_at).num_seconds() < 5,
+            "pause timestamp is approximately now"
+        );
+        assert_eq!(
+            outcome.tg_auth_failure.as_deref(),
+            Some(
+                "🚨 AIUB Notice Telegram: Authentication failed: Telegram API HTTP 401: Unauthorized"
+            )
+        );
+    }
+
+    #[test]
+    fn tg_phase_deferred_stops_without_pause() {
+        // A 429 beyond the inline budget surfaces as Deferred: the
+        // phase defers the rest of the queue without setting any pause.
+        let sender = FakeTelegramSender::new(vec![
+            Ok(TelegramSendResult::Sent),
+            Ok(TelegramSendResult::Deferred),
+            Ok(TelegramSendResult::Sent),
+        ]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let queue = vec![
+            notification("https://www.aiub.edu/notice/1"),
+            notification("https://www.aiub.edu/notice/2"),
+            notification("https://www.aiub.edu/notice/3"),
+        ];
+        let outcome = run_tg_phase(queue, false, &sender, &mut marks, &mut log);
+
+        assert_eq!(outcome.sent_count, 1);
+        assert_eq!(outcome.deferred_count, 1);
+        assert_eq!(outcome.failed_count, 0);
+        assert_eq!(sender.calls().len(), 2);
+        assert!(
+            outcome.app_state_sets.is_empty(),
+            "a deferral sets no pause"
+        );
+        assert!(outcome.tg_auth_failure.is_none());
+        assert_eq!(
+            marks.calls,
+            vec![
+                "tg_attempt:https://www.aiub.edu/notice/1",
+                "tg_notified:https://www.aiub.edu/notice/1",
+                "tg_attempt:https://www.aiub.edu/notice/2",
+            ]
+        );
+        assert!(
+            log.warns()
+                .iter()
+                .any(|m| m.contains("[Telegram Deferred]"))
+        );
+    }
+
+    #[test]
+    fn tg_send_step_deferred_counts_and_stops() {
+        let mut outcome = DispatchOutcome::default();
+        let result: worker::Result<TelegramSendResult> = Ok(TelegramSendResult::Deferred);
+        let step = telegram_send_step(&mut outcome, "https://www.aiub.edu/notice/1", &result);
+        assert!(matches!(step, TelegramSendStep::DeferredStop { .. }));
+        assert_eq!(outcome.deferred_count, 1);
+        assert!(outcome.app_state_sets.is_empty());
+    }
+
+    #[test]
+    fn tg_phase_send_error_continues_to_next_notice() {
+        // A generic send error is not an auth failure and not a rate
+        // limit: it counts as failed and the phase continues.
+        let sender = FakeTelegramSender::new(vec![
+            Err(worker::Error::RustError("boom".into())),
+            Ok(TelegramSendResult::Sent),
+        ]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let queue = vec![
+            notification("https://www.aiub.edu/notice/1"),
+            notification("https://www.aiub.edu/notice/2"),
+        ];
+        let outcome = run_tg_phase(queue, false, &sender, &mut marks, &mut log);
+
+        assert_eq!(outcome.sent_count, 1);
+        assert_eq!(outcome.failed_count, 1);
+        assert_eq!(sender.calls().len(), 2);
+        assert_eq!(
+            marks.calls,
+            vec![
+                "tg_attempt:https://www.aiub.edu/notice/1",
+                "tg_attempt:https://www.aiub.edu/notice/2",
+                "tg_notified:https://www.aiub.edu/notice/2",
+            ]
+        );
+        assert!(
+            log.errors()
+                .iter()
+                .any(|m| m.contains("[Telegram Send Failed]"))
+        );
+    }
+
+    #[test]
+    fn tg_phase_skipped_while_paused() {
+        // A pause set by a previous run's 401/403 skips Telegram
+        // dispatch before any send is attempted.
+        let sender = FakeTelegramSender::new(vec![Ok(TelegramSendResult::Sent)]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let outcome = run_tg_phase(
+            vec![notification("https://www.aiub.edu/notice/1")],
+            true,
+            &sender,
+            &mut marks,
+            &mut log,
+        );
+
+        assert_eq!(sender.calls().len(), 0, "no send while paused");
+        assert!(marks.calls.is_empty());
+        assert_eq!(outcome.sent_count, 0);
+        assert_eq!(outcome.failed_count, 0);
+        assert_eq!(outcome.deferred_count, 0);
+    }
+
+    #[test]
+    fn tg_phase_empty_queue_returns_default_outcome() {
+        let sender = FakeTelegramSender::new(vec![Ok(TelegramSendResult::Sent)]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let outcome = run_tg_phase(vec![], false, &sender, &mut marks, &mut log);
+        assert_eq!(sender.calls().len(), 0);
+        assert!(marks.calls.is_empty());
+        assert_eq!(outcome.sent_count, 0);
+    }
+
+    #[test]
+    fn tg_phase_notified_mark_failure_counts_failed_not_sent() {
+        // M4: a send that cannot be marked counts as failed (it may
+        // re-send next run) instead of being counted as sent.
+        let sender = FakeTelegramSender::new(vec![
+            Ok(TelegramSendResult::Sent),
+            Ok(TelegramSendResult::Sent),
+        ]);
+        let mut marks = FakeMarkSink::failing(vec!["tg_notified"]);
+        let mut log = FakeLog::new();
+        let queue = vec![
+            notification("https://www.aiub.edu/notice/1"),
+            notification("https://www.aiub.edu/notice/2"),
+        ];
+        let outcome = run_tg_phase(queue, false, &sender, &mut marks, &mut log);
+
+        assert_eq!(outcome.sent_count, 0);
+        assert_eq!(outcome.failed_count, 2);
+        assert_eq!(
+            marks.calls,
+            vec![
+                "tg_attempt:https://www.aiub.edu/notice/1",
+                "tg_attempt:https://www.aiub.edu/notice/2",
+            ]
+        );
+        assert_eq!(log.errors().len(), 2);
+        assert!(
+            log.errors()
+                .iter()
+                .all(|m| m.contains("[Telegram Mark Failed]"))
+        );
+    }
+
+    #[test]
+    fn tg_phase_attempt_mark_failure_still_sends() {
+        // A failed attempt mark must not block the send itself.
+        let sender = FakeTelegramSender::new(vec![Ok(TelegramSendResult::Sent)]);
+        let mut marks = FakeMarkSink::failing(vec!["tg_attempt"]);
+        let mut log = FakeLog::new();
+        let outcome = run_tg_phase(
+            vec![notification("https://www.aiub.edu/notice/1")],
+            false,
+            &sender,
+            &mut marks,
+            &mut log,
+        );
+
+        assert_eq!(outcome.sent_count, 1);
+        assert_eq!(outcome.failed_count, 0);
+        assert_eq!(sender.calls().len(), 1);
+        assert!(
+            log.warns()
+                .iter()
+                .any(|m| m.contains("[Telegram Attempt Mark Failed]"))
+        );
+    }
+
+    // ── (a) 401/403 classification + bounded 429 retry ───────────────
+
+    #[test]
+    fn telegram_status_classifies_401_and_403_as_auth_failure() {
+        use crate::telegram::{TelegramStatusAction, classify_telegram_status};
+        assert_eq!(classify_telegram_status(200), TelegramStatusAction::Success);
+        assert_eq!(classify_telegram_status(201), TelegramStatusAction::Success);
+        assert_eq!(
+            classify_telegram_status(429),
+            TelegramStatusAction::RateLimited
+        );
+        assert_eq!(
+            classify_telegram_status(401),
+            TelegramStatusAction::AuthFailure
+        );
+        assert_eq!(
+            classify_telegram_status(403),
+            TelegramStatusAction::AuthFailure
+        );
+        assert_eq!(classify_telegram_status(500), TelegramStatusAction::Error);
+        assert_eq!(classify_telegram_status(400), TelegramStatusAction::Error);
+    }
+
+    #[test]
+    fn telegram_429_retry_is_bounded() {
+        use crate::telegram::should_retry_telegram_429;
+        // Attempts remain and retry_after fits the 10s inline budget.
+        assert!(should_retry_telegram_429(0, 5));
+        assert!(should_retry_telegram_429(1, 10));
+        // Out of attempts (TELEGRAM_MAX_RETRIES = 2): defer, never retry again.
+        assert!(!should_retry_telegram_429(2, 5));
+        assert!(!should_retry_telegram_429(3, 1));
+        // retry_after exceeds the inline budget: defer even on the first attempt.
+        assert!(!should_retry_telegram_429(0, 11));
+        assert!(!should_retry_telegram_429(0, 60));
+    }
+
+    // ── Facebook phase ───────────────────────────────────────────────
+
+    #[test]
+    fn fb_phase_success_records_marks_in_order() {
+        let sender = FakeFacebookSender::new(vec![
+            Ok(FacebookPostResult::Success {
+                post_id: "1_1".to_string(),
+                usage: None,
+            }),
+            Ok(FacebookPostResult::Success {
+                post_id: "1_2".to_string(),
+                usage: None,
+            }),
+        ]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let queue = vec![
+            notification("https://www.aiub.edu/notice/1"),
+            notification("https://www.aiub.edu/notice/2"),
+        ];
+        let outcome = run_fb_phase(queue, false, &sender, &mut marks, &mut log);
+
+        assert_eq!(outcome.sent_count, 2);
+        assert_eq!(outcome.failed_count, 0);
+        assert_eq!(outcome.deferred_count, 0);
+        assert_eq!(sender.calls().len(), 2);
+        assert_eq!(
+            marks.calls,
+            vec![
+                "fb_attempt:https://www.aiub.edu/notice/1",
+                "fb_notified:https://www.aiub.edu/notice/1:1_1",
+                "fb_attempt:https://www.aiub.edu/notice/2",
+                "fb_notified:https://www.aiub.edu/notice/2:1_2",
+            ]
+        );
+        assert!(log.lines.is_empty(), "clean success logs nothing");
+    }
+
+    #[test]
+    fn fb_phase_duplicate_then_rate_limited_collects_writes_in_order() {
+        // (d) FB write-flush ordering: the phase only *collects* D1
+        // writes (marks, app_state sets, alerts) while running — the
+        // flush happens after the join in dispatch_both_phases. The
+        // collected writes must be in causal order: the duplicate mark
+        // and alert for notice 1, then the attempt mark, cooldown set
+        // and alert for notice 2; notice 3 is never attempted.
+        let sender = FakeFacebookSender::new(vec![
+            Ok(FacebookPostResult::Duplicate),
+            Ok(FacebookPostResult::RateLimited {
+                cooldown_minutes: 60,
+            }),
+            Ok(FacebookPostResult::Success {
+                post_id: "1_3".to_string(),
+                usage: None,
+            }),
+        ]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let queue = vec![
+            notification("https://www.aiub.edu/notice/1"),
+            notification("https://www.aiub.edu/notice/2"),
+            notification("https://www.aiub.edu/notice/3"),
+        ];
+        let outcome = run_fb_phase(queue, false, &sender, &mut marks, &mut log);
+
+        assert_eq!(outcome.sent_count, 0);
+        assert_eq!(outcome.deferred_count, 1);
+        assert_eq!(outcome.failed_count, 0);
+        assert_eq!(sender.calls().len(), 2, "rate limit stops the phase");
+        assert_eq!(
+            marks.calls,
+            vec![
+                "fb_attempt:https://www.aiub.edu/notice/1",
+                "fb_duplicate:https://www.aiub.edu/notice/1",
+                "fb_attempt:https://www.aiub.edu/notice/2",
+            ]
+        );
+        assert_eq!(
+            outcome
+                .fb_alerts
+                .iter()
+                .map(|(category, _)| category.as_str())
+                .collect::<Vec<_>>(),
+            vec!["duplicate_post", "rate_limit"],
+            "alerts are collected in the order the errors happened"
+        );
+        assert_eq!(outcome.app_state_sets.len(), 1);
+        assert_eq!(
+            outcome.app_state_sets[0].0, FACEBOOK_COOLDOWN_UNTIL_KEY,
+            "only the rate-limit cooldown is collected"
+        );
+        assert!(
+            (59..=60).contains(&minutes_until(&outcome.app_state_sets[0].1)),
+            "cooldown is ~60 minutes out"
+        );
+        assert!(
+            log.warns()
+                .iter()
+                .any(|m| m.contains("[Facebook Duplicate]"))
+        );
+        assert!(
+            log.warns()
+                .iter()
+                .any(|m| m.contains("[Facebook Rate Limited]"))
+        );
+    }
+
+    #[test]
+    fn fb_send_step_rate_limited_collects_cooldown_and_alert() {
+        let mut outcome = DispatchOutcome::default();
+        let result: worker::Result<FacebookPostResult> = Ok(FacebookPostResult::RateLimited {
+            cooldown_minutes: 60,
+        });
+        let step = facebook_send_step(&mut outcome, "https://www.aiub.edu/notice/1", &result);
+        assert!(matches!(step, FacebookSendStep::RateLimitedStop { .. }));
+        assert_eq!(outcome.deferred_count, 1);
+        assert_eq!(outcome.app_state_sets.len(), 1);
+        assert_eq!(outcome.app_state_sets[0].0, FACEBOOK_COOLDOWN_UNTIL_KEY);
+        assert!(
+            (59..=60).contains(&minutes_until(&outcome.app_state_sets[0].1)),
+            "cooldown is ~60 minutes out"
+        );
+        assert_eq!(
+            outcome
+                .fb_alerts
+                .iter()
+                .map(|(category, _)| category.as_str())
+                .collect::<Vec<_>>(),
+            vec!["rate_limit"]
+        );
+    }
+
+    #[test]
+    fn fb_send_step_duplicate_collects_alert_and_continues() {
+        let mut outcome = DispatchOutcome::default();
+        let result: worker::Result<FacebookPostResult> = Ok(FacebookPostResult::Duplicate);
+        let step = facebook_send_step(&mut outcome, "https://www.aiub.edu/notice/1", &result);
+        assert!(matches!(step, FacebookSendStep::RecordDuplicate));
+        assert_eq!(outcome.failed_count, 0);
+        assert_eq!(outcome.deferred_count, 0);
+        assert_eq!(
+            outcome
+                .fb_alerts
+                .iter()
+                .map(|(category, _)| category.as_str())
+                .collect::<Vec<_>>(),
+            vec!["duplicate_post"]
+        );
+        assert!(outcome.app_state_sets.is_empty());
+    }
+
+    #[test]
+    fn fb_phase_buc_high_sets_cooldown_and_stops() {
+        // BUC usage approaching the limit: the post still counts as
+        // sent, the 15-minute cooldown is collected, and the phase
+        // stops after this item.
+        let sender = FakeFacebookSender::new(vec![
+            Ok(FacebookPostResult::Success {
+                post_id: "1_1".to_string(),
+                usage: Some(BucUsage {
+                    call_count: 85,
+                    total_cputime: 10,
+                    total_time: 10,
+                    estimated_time_to_regain_access: 0,
+                }),
+            }),
+            Ok(FacebookPostResult::Success {
+                post_id: "1_2".to_string(),
+                usage: None,
+            }),
+        ]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let queue = vec![
+            notification("https://www.aiub.edu/notice/1"),
+            notification("https://www.aiub.edu/notice/2"),
+        ];
+        let outcome = run_fb_phase(queue, false, &sender, &mut marks, &mut log);
+
+        assert_eq!(outcome.sent_count, 1);
+        assert_eq!(sender.calls().len(), 1, "BUC-high stops the phase");
+        assert_eq!(outcome.app_state_sets.len(), 1);
+        assert_eq!(outcome.app_state_sets[0].0, FACEBOOK_COOLDOWN_UNTIL_KEY);
+        assert!(
+            (14..=15).contains(&minutes_until(&outcome.app_state_sets[0].1)),
+            "BUC cooldown is ~15 minutes out"
+        );
+        assert!(
+            log.warns()
+                .iter()
+                .any(|m| m.contains("[Facebook BUC High]") && m.contains("85%"))
+        );
+    }
+
+    #[test]
+    fn fb_send_step_success_with_buc_high_collects_cooldown() {
+        let mut outcome = DispatchOutcome::default();
+        let result: worker::Result<FacebookPostResult> = Ok(FacebookPostResult::Success {
+            post_id: "1_1".to_string(),
+            usage: Some(BucUsage {
+                call_count: 82,
+                total_cputime: 50,
+                total_time: 40,
+                estimated_time_to_regain_access: 15,
+            }),
+        });
+        let step = facebook_send_step(&mut outcome, "https://www.aiub.edu/notice/1", &result);
+        match step {
+            FacebookSendStep::RecordNotified {
+                post_id,
+                cooldown_until,
+            } => {
+                assert_eq!(post_id, "1_1");
+                let (until, max_usage) = cooldown_until.expect("BUC-high collects a cooldown");
+                assert_eq!(max_usage, 82);
+                assert!((14..=15).contains(&minutes_until(&until)));
+            }
+            other => panic!("expected RecordNotified with cooldown, got {other:?}"),
+        }
+        assert_eq!(outcome.app_state_sets.len(), 1);
+    }
+
+    #[test]
+    fn fb_phase_auth_error_pauses_and_alerts() {
+        let sender = FakeFacebookSender::new(vec![
+            Ok(FacebookPostResult::AuthError {
+                message: "Facebook auth failure (code: 190, subcode: Some(458)): Invalid OAuth access token"
+                    .to_string(),
+            }),
+            Ok(FacebookPostResult::Success {
+                post_id: "1_2".to_string(),
+                usage: None,
+            }),
+        ]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let queue = vec![
+            notification("https://www.aiub.edu/notice/1"),
+            notification("https://www.aiub.edu/notice/2"),
+        ];
+        let outcome = run_fb_phase(queue, false, &sender, &mut marks, &mut log);
+
+        assert_eq!(outcome.failed_count, 1);
+        assert_eq!(outcome.sent_count, 0);
+        assert_eq!(sender.calls().len(), 1, "auth failure stops the phase");
+        assert_eq!(outcome.app_state_sets.len(), 1);
+        assert_eq!(
+            outcome.app_state_sets[0].0,
+            crate::config::FACEBOOK_AUTH_PAUSED_KEY
+        );
+        let (_, message) =
+            parse_auth_pause_value(&outcome.app_state_sets[0].1).expect("pause value parses");
+        assert!(message.contains("190"));
+        assert!(outcome.fb_auth_alert.as_deref().unwrap().contains("190"));
+        assert!(
+            log.errors()
+                .iter()
+                .any(|m| m.contains("[Facebook Auth Error]"))
+        );
+    }
+
+    #[test]
+    fn fb_phase_spam_block_sets_twelve_hour_cooldown() {
+        let sender = FakeFacebookSender::new(vec![Ok(FacebookPostResult::SpamBlocked)]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let outcome = run_fb_phase(
+            vec![notification("https://www.aiub.edu/notice/1")],
+            false,
+            &sender,
+            &mut marks,
+            &mut log,
+        );
+
+        assert_eq!(outcome.failed_count, 1);
+        assert_eq!(outcome.deferred_count, 0);
+        assert_eq!(
+            outcome
+                .fb_alerts
+                .iter()
+                .map(|(category, _)| category.as_str())
+                .collect::<Vec<_>>(),
+            vec!["spam_block"]
+        );
+        assert_eq!(outcome.app_state_sets.len(), 1);
+        assert_eq!(outcome.app_state_sets[0].0, FACEBOOK_COOLDOWN_UNTIL_KEY);
+        assert!(
+            (719..=720).contains(&minutes_until(&outcome.app_state_sets[0].1)),
+            "spam-block cooldown is ~12 hours out"
+        );
+        assert!(
+            log.errors()
+                .iter()
+                .any(|m| m.contains("[Facebook Spam Block]"))
+        );
+    }
+
+    #[test]
+    fn fb_phase_transient_defers_without_cooldown() {
+        let sender = FakeFacebookSender::new(vec![Ok(FacebookPostResult::TransientFailure {
+            message: "Meta HTTP 500: internal error".to_string(),
+        })]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let outcome = run_fb_phase(
+            vec![notification("https://www.aiub.edu/notice/1")],
+            false,
+            &sender,
+            &mut marks,
+            &mut log,
+        );
+
+        assert_eq!(outcome.deferred_count, 1);
+        assert_eq!(outcome.failed_count, 0);
+        assert!(
+            outcome.app_state_sets.is_empty(),
+            "no cooldown for transient"
+        );
+        assert!(outcome.fb_alerts.is_empty(), "no alert for transient");
+        assert!(
+            log.warns()
+                .iter()
+                .any(|m| m.contains("[Facebook Transient]"))
+        );
+    }
+
+    #[test]
+    fn fb_phase_unknown_error_alerts_without_cooldown_or_pause() {
+        // M10: an unclassified Meta error alerts once (debounced) but
+        // sets no cooldown and no pause.
+        let sender = FakeFacebookSender::new(vec![Ok(FacebookPostResult::UnknownError {
+            message: "Meta error 99999 (subcode: None): something new".to_string(),
+        })]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let outcome = run_fb_phase(
+            vec![notification("https://www.aiub.edu/notice/1")],
+            false,
+            &sender,
+            &mut marks,
+            &mut log,
+        );
+
+        assert_eq!(outcome.failed_count, 1);
+        assert_eq!(
+            outcome
+                .fb_alerts
+                .iter()
+                .map(|(category, _)| category.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unknown_error"]
+        );
+        assert!(
+            outcome.app_state_sets.is_empty(),
+            "no cooldown or pause for an unclassified error"
+        );
+        assert!(
+            log.errors()
+                .iter()
+                .any(|m| m.contains("[Facebook Unknown Error]"))
+        );
+    }
+
+    #[test]
+    fn fb_phase_worker_error_stops() {
+        let sender = FakeFacebookSender::new(vec![
+            Err(worker::Error::RustError("fetch error: boom".into())),
+            Ok(FacebookPostResult::Success {
+                post_id: "1_2".to_string(),
+                usage: None,
+            }),
+        ]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let queue = vec![
+            notification("https://www.aiub.edu/notice/1"),
+            notification("https://www.aiub.edu/notice/2"),
+        ];
+        let outcome = run_fb_phase(queue, false, &sender, &mut marks, &mut log);
+
+        assert_eq!(outcome.failed_count, 1);
+        assert_eq!(outcome.sent_count, 0);
+        assert_eq!(sender.calls().len(), 1, "worker error stops the phase");
+        assert!(
+            log.errors()
+                .iter()
+                .any(|m| m.contains("[Facebook Worker Error]"))
+        );
+    }
+
+    #[test]
+    fn fb_phase_skipped_while_paused() {
+        let sender = FakeFacebookSender::new(vec![Ok(FacebookPostResult::Success {
+            post_id: "1_1".to_string(),
+            usage: None,
+        })]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let outcome = run_fb_phase(
+            vec![notification("https://www.aiub.edu/notice/1")],
+            true,
+            &sender,
+            &mut marks,
+            &mut log,
+        );
+
+        assert_eq!(sender.calls().len(), 0, "no publish while paused");
+        assert!(marks.calls.is_empty());
+        assert_eq!(outcome.sent_count, 0);
+    }
+
+    #[test]
+    fn fb_phase_notified_mark_failure_counts_failed() {
+        let sender = FakeFacebookSender::new(vec![Ok(FacebookPostResult::Success {
+            post_id: "1_1".to_string(),
+            usage: None,
+        })]);
+        let mut marks = FakeMarkSink::failing(vec!["fb_notified"]);
+        let mut log = FakeLog::new();
+        let outcome = run_fb_phase(
+            vec![notification("https://www.aiub.edu/notice/1")],
+            false,
+            &sender,
+            &mut marks,
+            &mut log,
+        );
+
+        assert_eq!(outcome.sent_count, 0);
+        assert_eq!(outcome.failed_count, 1);
+        assert!(
+            log.errors()
+                .iter()
+                .any(|m| m.contains("[Facebook Mark Failed]"))
+        );
+    }
+
+    #[test]
+    fn fb_phase_duplicate_mark_failure_counts_failed_and_continues() {
+        // M4: a failed duplicate mark counts as failed but must not
+        // abort the remaining dispatch; the debounced alert is still
+        // collected.
+        let sender = FakeFacebookSender::new(vec![
+            Ok(FacebookPostResult::Duplicate),
+            Ok(FacebookPostResult::Success {
+                post_id: "1_2".to_string(),
+                usage: None,
+            }),
+        ]);
+        let mut marks = FakeMarkSink::failing(vec!["fb_duplicate"]);
+        let mut log = FakeLog::new();
+        let queue = vec![
+            notification("https://www.aiub.edu/notice/1"),
+            notification("https://www.aiub.edu/notice/2"),
+        ];
+        let outcome = run_fb_phase(queue, false, &sender, &mut marks, &mut log);
+
+        assert_eq!(outcome.sent_count, 1);
+        assert_eq!(outcome.failed_count, 1);
+        assert_eq!(
+            sender.calls().len(),
+            2,
+            "duplicate continues to the next notice"
+        );
+        assert_eq!(
+            marks.calls,
+            vec![
+                "fb_attempt:https://www.aiub.edu/notice/1",
+                "fb_attempt:https://www.aiub.edu/notice/2",
+                "fb_notified:https://www.aiub.edu/notice/2:1_2",
+            ]
+        );
+        assert_eq!(
+            outcome
+                .fb_alerts
+                .iter()
+                .map(|(category, _)| category.as_str())
+                .collect::<Vec<_>>(),
+            vec!["duplicate_post"]
+        );
+        assert!(
+            log.errors()
+                .iter()
+                .any(|m| m.contains("[Facebook Duplicate Mark Failed]"))
+        );
+    }
+
+    // ── (b) FB cooldown cap, end to end ──────────────────────────────
+
+    #[test]
+    fn fb_cooldown_cap_end_to_end_regain_access_capped_at_seven_days() {
+        // Medium #6: an absurd estimated_time_to_regain_access in the
+        // BUC header must cap the cooldown at 7 days, end to end:
+        // header -> parse -> classify -> phase step.
+        let header = r#"{"1234567890":[{"type":"pages","call_count":99,"total_cputime":99,"total_time":99,"estimated_time_to_regain_access":999999}]}"#;
+        let usage = parse_buc_usage_header(header).expect("valid BUC header");
+        assert_eq!(
+            usage.estimated_time_to_regain_access,
+            FACEBOOK_BUC_MAX_COOLDOWN_MINS
+        );
+        let result = classify_publish_error(
+            429,
+            0,
+            None,
+            "Too Many Requests",
+            "rate limited",
+            Some(&usage),
+        );
+        let cooldown = match result {
+            FacebookPostResult::RateLimited { cooldown_minutes } => cooldown_minutes,
+            other => panic!("expected RateLimited, got {other:?}"),
+        };
+        assert_eq!(cooldown, 60 * 24 * 7);
+
+        let wrapped: worker::Result<FacebookPostResult> = Ok(result);
+        let mut outcome = DispatchOutcome::default();
+        let step = facebook_send_step(&mut outcome, "https://www.aiub.edu/notice/1", &wrapped);
+        assert!(matches!(step, FacebookSendStep::RateLimitedStop { .. }));
+        assert_eq!(outcome.app_state_sets.len(), 1);
+        assert_eq!(outcome.app_state_sets[0].0, FACEBOOK_COOLDOWN_UNTIL_KEY);
+        let mins = minutes_until(&outcome.app_state_sets[0].1);
+        assert!(
+            (60 * 24 * 7 - 1..=60 * 24 * 7).contains(&mins),
+            "cooldown must be ~7 days out, got {mins} mins"
+        );
+    }
+
+    // ── (c) run-level deadline ───────────────────────────────────────
+
+    #[test]
+    fn run_with_deadline_finishes_before_deadline() {
+        use crate::{DeadlineOutcome, run_with_deadline};
+        use std::future::{pending, ready};
+        let outcome = run_with_deadline(ready(Ok::<(), worker::Error>(())), pending::<()>())
+            .now_or_never()
+            .expect("deadline race completes synchronously");
+        assert!(matches!(outcome, DeadlineOutcome::Finished(Ok(()))));
+    }
+
+    #[test]
+    fn run_with_deadline_expires_when_run_never_finishes() {
+        use crate::{DeadlineOutcome, run_with_deadline};
+        use std::future::{pending, ready};
+        let outcome = run_with_deadline(pending::<worker::Result<()>>(), ready(()))
+            .now_or_never()
+            .expect("deadline race completes synchronously");
+        assert!(matches!(outcome, DeadlineOutcome::Expired));
+    }
+
+    #[test]
+    fn run_with_deadline_propagates_run_error_unchanged() {
+        use crate::{DeadlineOutcome, run_with_deadline};
+        use std::future::{pending, ready};
+        let outcome = run_with_deadline(
+            ready(Err::<(), worker::Error>(worker::Error::RustError(
+                "boom".into(),
+            ))),
+            pending::<()>(),
+        )
+        .now_or_never()
+        .expect("deadline race completes synchronously");
+        assert!(matches!(outcome, DeadlineOutcome::Finished(Err(_))));
+    }
+
+    // ── Detail analysis + listing helpers ────────────────────────────
+
+    #[test]
+    fn analyze_detail_results_counts_outcomes_and_builds_map() {
+        use crate::analyze_detail_results;
+        use crate::scraper::{DetailFetchOutcome, ParsedDetail};
+
+        let detail = ParsedDetail {
+            title: Some("Title".to_string()),
+            published_date: None,
+            body_text: "Body".to_string(),
+            attachments: vec![],
+            legacy_sticky_body: String::new(),
+        };
+        let results = vec![
+            (
+                "https://www.aiub.edu/notice/1".to_string(),
+                DetailFetchOutcome::Success(detail),
+            ),
+            (
+                "https://www.aiub.edu/notice/2".to_string(),
+                DetailFetchOutcome::HttpError("timeout".to_string()),
+            ),
+            (
+                "https://www.aiub.edu/notice/3".to_string(),
+                DetailFetchOutcome::ParseError {
+                    reason: "empty body",
+                    html_len: 123,
+                },
+            ),
+            (
+                "https://www.aiub.edu/notice/4".to_string(),
+                DetailFetchOutcome::CpuSkipped,
+            ),
+        ];
+        let analysis = analyze_detail_results(results);
+
+        assert_eq!(analysis.attempted, 4);
+        assert_eq!(analysis.succeeded, 1);
+        assert_eq!(analysis.http_errors, 1);
+        assert_eq!(analysis.parse_errors, 1);
+        assert_eq!(analysis.cpu_skipped, 1);
+        assert_eq!(analysis.diagnostics.len(), 3);
+        assert!(
+            analysis.diagnostics[0].contains("HTTP: timeout"),
+            "HTTP diagnostic names the failure"
+        );
+        assert!(
+            analysis.diagnostics[1].contains("DOM: empty body"),
+            "parse diagnostic names the reason"
+        );
+        assert_eq!(analysis.detail_map.len(), 4);
+        assert!(
+            analysis
+                .detail_map
+                .get("https://www.aiub.edu/notice/1")
+                .unwrap()
+                .is_some(),
+            "successful fetch maps to its detail"
+        );
+        assert!(
+            analysis
+                .detail_map
+                .get("https://www.aiub.edu/notice/2")
+                .unwrap()
+                .is_none(),
+            "failed fetch maps to None"
+        );
+    }
+
+    #[test]
+    fn deduplicate_listing_notices_keeps_first_occurrence_in_order() {
+        use crate::{deduplicate_listing_notices, models::Notice};
+        let mk = |url: &str| Notice {
+            title: url.to_string(),
+            description: String::new(),
+            url: url.to_string(),
+            published_date: None,
+            body_text: String::new(),
+            attachments: vec![],
+            detail_fetched: false,
+        };
+        let listing = vec![
+            mk("https://www.aiub.edu/notice/1"),
+            mk("https://www.aiub.edu/notice/2"),
+            mk("https://www.aiub.edu/notice/1"),
+            mk("https://www.aiub.edu/notice/3"),
+            mk("https://www.aiub.edu/notice/2"),
+        ];
+        let unique = deduplicate_listing_notices(listing);
+        assert_eq!(
+            unique.iter().map(|n| n.url.as_str()).collect::<Vec<_>>(),
+            vec![
+                "https://www.aiub.edu/notice/1",
+                "https://www.aiub.edu/notice/2",
+                "https://www.aiub.edu/notice/3",
+            ]
+        );
+    }
+
+    #[test]
+    fn listing_coverage_measures_date_and_description_fractions() {
+        use crate::{listing_coverage, models::Notice};
+        let mk = |dated: bool, described: bool| Notice {
+            title: "T".to_string(),
+            description: if described {
+                "D".to_string()
+            } else {
+                String::new()
+            },
+            url: "https://www.aiub.edu/notice/x".to_string(),
+            published_date: if dated {
+                Some("2026-11-20".to_string())
+            } else {
+                None
+            },
+            body_text: String::new(),
+            attachments: vec![],
+            detail_fetched: false,
+        };
+        let listing = vec![
+            mk(true, true),
+            mk(true, false),
+            mk(false, true),
+            mk(false, false),
+        ];
+        let (date_coverage, desc_coverage) = listing_coverage(&listing);
+        assert_eq!(date_coverage, 0.5);
+        assert_eq!(desc_coverage, 0.5);
     }
 }

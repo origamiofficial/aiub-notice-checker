@@ -16,6 +16,7 @@ pub struct Notice {
 }
 
 impl Notice {
+    #[must_use]
     pub fn attachments_json(&self) -> String {
         let mut sorted: Vec<&str> = self.attachments.iter().map(|s| s.as_str()).collect();
         sorted.sort_unstable();
@@ -23,6 +24,7 @@ impl Notice {
         serde_json::to_string(&sorted).unwrap_or_else(|_| "[]".to_string())
     }
 
+    #[must_use]
     pub fn content_hash(&self) -> String {
         let mut sorted_attachments: Vec<&str> =
             self.attachments.iter().map(|s| s.as_str()).collect();
@@ -72,10 +74,12 @@ pub struct NoticeRow {
 }
 
 impl NoticeRow {
+    #[must_use]
     pub fn parsed_attachments(&self) -> Vec<String> {
         serde_json::from_str::<Vec<String>>(&self.attachments_json).unwrap_or_default()
     }
 
+    #[must_use]
     pub fn detail_due(&self, retry_cutoff_iso: &str) -> bool {
         match (&self.detail_checked_at, &self.detail_fetched_at) {
             (Some(checked), None) => checked.as_str() <= retry_cutoff_iso,
@@ -88,6 +92,7 @@ impl NoticeRow {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
+#[must_use = "only partially applied; callers must check it"]
 pub struct D1Metrics {
     pub rows_read: usize,
     pub rows_written: usize,
@@ -98,6 +103,7 @@ pub struct D1Metrics {
     pub failed_statements: usize,
 }
 
+#[must_use]
 pub fn titles_equivalent(listing_title: &str, cached_title: &str) -> bool {
     // O10: compare lazily over normalized char iterators instead of
     // allocating two normalized Strings per call — this runs for every
@@ -133,6 +139,7 @@ pub fn titles_equivalent(listing_title: &str, cached_title: &str) -> bool {
 /// Facebook) count towards the 4,096 message limit. Rust `char`s are NOT
 /// equivalent: one emoji / non-BMP character is 1 `char` but 2 UTF-16 units
 /// (M5).
+#[must_use]
 pub fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
 }
@@ -155,6 +162,7 @@ fn take_utf16_prefix(text: &str, max_units: usize) -> String {
 
 /// Truncates `text` to at most `limit` UTF-16 code units (M5), appending
 /// `...` when truncated. The result never exceeds `limit` UTF-16 units.
+#[must_use]
 pub fn truncate_text(text: &str, limit: usize) -> String {
     let trimmed = text.trim();
     if utf16_len(trimmed) <= limit {
@@ -202,6 +210,7 @@ fn assemble_header_footer(header: &str, footer_parts: &[String]) -> String {
     }
 }
 
+#[must_use]
 pub fn display_date(iso_date: Option<&str>) -> String {
     match iso_date {
         Some(raw) => match NaiveDate::parse_from_str(raw, "%Y-%m-%d") {
@@ -212,6 +221,7 @@ pub fn display_date(iso_date: Option<&str>) -> String {
     }
 }
 
+#[must_use]
 pub fn is_meaningful_text(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -235,6 +245,7 @@ pub fn is_meaningful_text(text: &str) -> bool {
 ///   units — the unit Telegram counts, see [`utf16_len`]), preserving header,
 ///   attachments, and the notice URL while gracefully truncating overflowing
 ///   body text. The footer is never truncated (M5).
+#[must_use]
 pub fn format_notice_message(notice: &Notice, edited: bool) -> String {
     let prefix = if edited { "[EDITED] " } else { "" };
     let title = truncate_text(&notice.title, 500);
@@ -332,6 +343,7 @@ pub fn format_notice_message(notice: &Notice, edited: bool) -> String {
 /// Backwards-compatible alias for `format_notice_message`.
 /// Guarantees that Facebook and future platforms receive the exact same unified visible text.
 #[inline]
+#[must_use]
 pub fn format_facebook_message(notice: &Notice, edited: bool) -> String {
     format_notice_message(notice, edited)
 }

@@ -1,18 +1,19 @@
 use chrono::NaiveDate;
-use futures_util::future::{select, Either};
+use futures_util::future::{Either, select};
 use std::collections::HashSet;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::time::Duration;
 use tl::{HTMLTag, Node, Parser, ParserOptions, VDom};
 use worker::{
-    url::Url, AbortController, Delay, Error, Fetch, Headers, Method, Request, RequestInit,
-    RequestRedirect, Result,
+    AbortController, Delay, Fetch, Headers, Method, Request, RequestInit, RequestRedirect, Result,
+    console_warn, url::Url,
 };
 
 use crate::config::{
     BASE_HOST, BASE_URL, HTTP_TIMEOUT_MS, LIST_PAGE_SIZE, MAX_HTML_BYTES, MAX_REDIRECTS,
     MAX_URL_LENGTH, NOTICE_PATH,
 };
+use crate::errors::AppError;
 use crate::models::Notice;
 
 pub(crate) const USER_AGENT: &str = concat!(
@@ -48,6 +49,7 @@ pub enum DetailFetchOutcome {
     CpuSkipped,
 }
 
+#[must_use]
 pub fn listing_page_url(page_no: usize) -> String {
     format!(
         "{}{}?pageNo={}&pageSize={}",
@@ -62,9 +64,7 @@ pub async fn fetch_html(target_url: &str) -> Result<String> {
 
     for _hop in 0..=MAX_REDIRECTS {
         if current_url.len() > MAX_URL_LENGTH {
-            return Err(Error::RustError(
-                "URL exceeds maximum allowed length".into(),
-            ));
+            return Err(AppError::Fetch("URL exceeds maximum allowed length".into()).into());
         }
 
         let headers = Headers::new();
@@ -86,86 +86,92 @@ pub async fn fetch_html(target_url: &str) -> Result<String> {
 
         let fetch = Fetch::Request(req);
         let send_fut = fetch.send_with_signal(&signal);
-        let timeout_fut = Delay::from(Duration::from_millis(HTTP_TIMEOUT_MS));
+        // Medium #5: ONE shared 15s deadline covers `send()` AND the
+        // body read — a fresh Delay per phase previously allowed one
+        // fetch to take up to 30s. `select` returns the losing future,
+        // so the same Delay is reused for the body read below.
+        // `timeout` is a named local (not `pin!(...)` inline): the
+        // Pin borrowing it is returned by `select` and reused for the
+        // body read below, so it must outlive this statement.
+        let mut timeout = Delay::from(Duration::from_millis(HTTP_TIMEOUT_MS));
 
-        let mut resp = match select(pin!(send_fut), pin!(timeout_fut)).await {
-            Either::Left((res, _)) => res?,
+        let (mut resp, timeout_fut) = match select(pin!(send_fut), Pin::new(&mut timeout)).await {
+            Either::Left((res, timeout_fut)) => match res {
+                Ok(r) => (r, timeout_fut),
+                Err(e) => return Err(AppError::Fetch(e.to_string()).into()),
+            },
             Either::Right(((), _)) => {
                 controller.abort();
-                return Err(Error::RustError(format!(
-                    "HTTP timeout after {}ms fetching {}",
-                    HTTP_TIMEOUT_MS, current_url
-                )));
+                return Err(AppError::Fetch(format!(
+                    "HTTP timeout after {HTTP_TIMEOUT_MS}ms fetching {current_url}"
+                ))
+                .into());
             }
         };
 
         let status = resp.status_code();
-        if (300..400).contains(&status) {
-            if let Some(loc) = resp.headers().get("Location")? {
-                current_url = normalize_aiub_url(&loc, &current_url, false);
-                if current_url.is_empty() {
-                    return Err(Error::RustError(format!(
-                        "Unsafe redirect location from {}",
-                        target_url
-                    )));
-                }
-                continue;
+        if (300..400).contains(&status)
+            && let Some(loc) = resp.headers().get("Location")?
+        {
+            current_url = normalize_aiub_url(&loc, &current_url, false);
+            if current_url.is_empty() {
+                return Err(
+                    AppError::Fetch(format!("Unsafe redirect location from {target_url}")).into(),
+                );
             }
+            continue;
         }
 
         if !(200..300).contains(&status) {
-            return Err(Error::RustError(format!(
-                "HTTP {} when fetching {}",
-                status, current_url
-            )));
+            return Err(
+                AppError::Fetch(format!("HTTP {status} when fetching {current_url}")).into(),
+            );
         }
 
         // M9: check Content-Length before buffering the body — a lying
         // or huge response must be rejected without downloading it first.
-        if let Ok(Some(len_str)) = resp.headers().get("Content-Length") {
-            if let Ok(len) = len_str.parse::<usize>() {
-                if len > MAX_HTML_BYTES {
-                    return Err(Error::RustError(format!(
-                        "HTML response too large (Content-Length {} bytes) for {}",
-                        len, current_url
-                    )));
-                }
-            }
+        if let Ok(Some(len_str)) = resp.headers().get("Content-Length")
+            && let Ok(len) = len_str.parse::<usize>()
+            && len > MAX_HTML_BYTES
+        {
+            return Err(AppError::Fetch(format!(
+                "HTML response too large (Content-Length {len} bytes) for {current_url}"
+            ))
+            .into());
         }
 
         // M9: the 15s timeout must cover the body read too, not just
         // `send()`. A stalled body stream previously hung the run past
         // the timeout (and the 2 MB cap only fired after full buffering).
+        // The deadline is the same one started above, so send + body
+        // share 15s.
         let text_fut = resp.text();
-        let timeout_fut = Delay::from(Duration::from_millis(HTTP_TIMEOUT_MS));
-        let text = match select(pin!(text_fut), pin!(timeout_fut)).await {
+        let text = match select(pin!(text_fut), timeout_fut).await {
             Either::Left((res, _)) => res?,
             Either::Right(((), _)) => {
                 controller.abort();
-                return Err(Error::RustError(format!(
-                    "HTTP timeout after {}ms reading body of {}",
-                    HTTP_TIMEOUT_MS, current_url
-                )));
+                return Err(AppError::Fetch(format!(
+                    "HTTP timeout after {HTTP_TIMEOUT_MS}ms reading body of {current_url}"
+                ))
+                .into());
             }
         };
         if text.len() > MAX_HTML_BYTES {
-            return Err(Error::RustError(format!(
-                "HTML response too large ({} bytes) for {}",
-                text.len(),
-                current_url
-            )));
+            return Err(AppError::Fetch(format!(
+                "HTML response too large ({} bytes) for {current_url}",
+                text.len()
+            ))
+            .into());
         }
         return Ok(text);
     }
 
-    Err(Error::RustError(format!(
-        "Too many redirects fetching {}",
-        target_url
-    )))
+    Err(AppError::Fetch(format!("Too many redirects fetching {target_url}")).into())
 }
 
 /// Parses the AIUB notice listing page matching `main.py` (`div.notification`, `h2.title`,
 /// `a.info-link`, `p.desc`, and `div.date-custom`).
+#[must_use]
 pub fn parse_listing_html(html: &str) -> Vec<Notice> {
     let Ok(dom) = tl::parse(html, ParserOptions::default()) else {
         return Vec::new();
@@ -282,17 +288,17 @@ fn extract_listing_fields(
     if let Some(raw_custom) = &state.date_custom {
         published_date = parse_date_to_iso(raw_custom);
     }
-    if published_date.is_none() {
-        if let (Some(d), Some(m), Some(y)) = (&state.day, &state.month, &state.year) {
-            let combined = clean_whitespace(&format!("{d} {m} {y}"));
-            published_date = parse_date_to_iso(&combined);
-        }
+    if published_date.is_none()
+        && let (Some(d), Some(m), Some(y)) = (&state.day, &state.month, &state.year)
+    {
+        let combined = clean_whitespace(&format!("{d} {m} {y}"));
+        published_date = parse_date_to_iso(&combined);
     }
-    if published_date.is_none() {
-        if let Some(dt_attr) = &state.time_datetime {
-            let prefix: String = dt_attr.chars().take(10).collect();
-            published_date = parse_date_to_iso(&prefix).or_else(|| parse_date_to_iso(dt_attr));
-        }
+    if published_date.is_none()
+        && let Some(dt_attr) = &state.time_datetime
+    {
+        let prefix: String = dt_attr.chars().take(10).collect();
+        published_date = parse_date_to_iso(&prefix).or_else(|| parse_date_to_iso(dt_attr));
     }
     if published_date.is_none() {
         let raw_time = state.time_text.as_ref().or(state.date_text.as_ref());
@@ -399,11 +405,12 @@ fn visit_card_node(
         // M16: inside a `.card` fallback item, a generic `a[href]`
         // never counts — that is how unrelated links inside a card
         // were harvested as notice URLs.
-        if prio < state.href_priority && !(from_card_fallback && prio == 2) {
-            if let Some(href) = get_attr_str(el, "href") {
-                state.href_priority = prio;
-                state.raw_href = href;
-            }
+        if prio < state.href_priority
+            && !(from_card_fallback && prio == 2)
+            && let Some(href) = get_attr_str(el, "href")
+        {
+            state.href_priority = prio;
+            state.raw_href = href;
         }
     }
 
@@ -470,10 +477,10 @@ fn visit_card_node(
         }
     }
     if name.eq_ignore_ascii_case("time") {
-        if state.time_datetime.is_none() {
-            if let Some(dt) = get_attr_str(el, "datetime") {
-                state.time_datetime = Some(dt);
-            }
+        if state.time_datetime.is_none()
+            && let Some(dt) = get_attr_str(el, "datetime")
+        {
+            state.time_datetime = Some(dt);
         }
         if state.time_text.is_none() {
             let text = extract_spaced_inline_text(el, parser);
@@ -499,12 +506,11 @@ fn find_listing_li_handles(dom: &VDom, parser: &Parser) -> Vec<tl::NodeHandle> {
     let mut out = Vec::new();
     if let Some(lists) = dom.query_selector("ul.event-list") {
         for ul_handle in lists {
-            if let Some(ul_node) = ul_handle.get(parser) {
-                if let Some(ul_tag) = ul_node.as_tag() {
-                    if let Some(items) = ul_tag.query_selector(parser, "li") {
-                        out.extend(items);
-                    }
-                }
+            if let Some(ul_node) = ul_handle.get(parser)
+                && let Some(ul_tag) = ul_node.as_tag()
+                && let Some(items) = ul_tag.query_selector(parser, "li")
+            {
+                out.extend(items);
             }
         }
     }
@@ -515,6 +521,7 @@ fn find_listing_li_handles(dom: &VDom, parser: &Parser) -> Vec<tl::NodeHandle> {
 /// - Full title from `h1#dynamicHeading`
 /// - Body text and attachments (`a[href]`, `img[src]`, `img[data-src]`) from all
 ///   `div.question-column` inside `div.notice-page` that do NOT have class `notice-sticky-header`.
+#[must_use]
 pub fn parse_detail_html(html: &str, page_url: &str) -> Option<ParsedDetail> {
     parse_detail_with_reason(html, page_url).ok()
 }
@@ -579,22 +586,22 @@ pub fn parse_detail_with_reason(html: &str, page_url: &str) -> Result<ParsedDeta
         }
     }
 
-    if body_handles.is_empty() {
-        if let Some(cols) = dom.query_selector("div.question-column") {
-            for col_handle in cols {
-                let Some(col_node) = col_handle.get(parser) else {
-                    continue;
-                };
-                let Some(col_tag) = col_node.as_tag() else {
-                    continue;
-                };
-                if has_class(col_tag, "notice-sticky-header") {
-                    if sticky_handle.is_none() {
-                        sticky_handle = Some(col_handle);
-                    }
-                } else {
-                    body_handles.push(col_handle);
+    if body_handles.is_empty()
+        && let Some(cols) = dom.query_selector("div.question-column")
+    {
+        for col_handle in cols {
+            let Some(col_node) = col_handle.get(parser) else {
+                continue;
+            };
+            let Some(col_tag) = col_node.as_tag() else {
+                continue;
+            };
+            if has_class(col_tag, "notice-sticky-header") {
+                if sticky_handle.is_none() {
+                    sticky_handle = Some(col_handle);
                 }
+            } else {
+                body_handles.push(col_handle);
             }
         }
     }
@@ -636,13 +643,12 @@ pub fn parse_detail_with_reason(html: &str, page_url: &str) -> Result<ParsedDeta
 
     let mut detail_date = None;
     let mut legacy_sticky_body = String::new();
-    if let Some(sh) = sticky_handle {
-        if let Some(sn) = sh.get(parser) {
-            if let Some(st) = sn.as_tag() {
-                detail_date = extract_iso_date_from_card(st, parser);
-                legacy_sticky_body = extract_legacy_multiline_text(st, parser);
-            }
-        }
+    if let Some(sh) = sticky_handle
+        && let Some(sn) = sh.get(parser)
+        && let Some(st) = sn.as_tag()
+    {
+        detail_date = extract_iso_date_from_card(st, parser);
+        legacy_sticky_body = extract_legacy_multiline_text(st, parser);
     }
 
     Ok(ParsedDetail {
@@ -690,30 +696,29 @@ fn extract_legacy_multiline_text(tag: &HTMLTag, parser: &Parser) -> String {
     let mut text_start = 0;
 
     while i < bytes.len() {
-        if bytes[i] == b'<' {
-            if let Some(close_rel) = bytes[i..].iter().position(|&b| b == b'>') {
-                if text_start < i {
-                    spaced.push_str(&raw_html[text_start..i]);
-                }
-                let tag_slice = &bytes[i..=i + close_rel];
-                if let Some(closing_tag) = matching_ignored_closing_tag(tag_slice) {
-                    if let Some(end_rel) =
-                        find_closing_tag_case_insensitive(&bytes[i + close_rel + 1..], closing_tag)
-                    {
-                        i = i + close_rel + 1 + end_rel;
-                        text_start = i;
-                        continue;
-                    }
-                }
-                if is_block_tag(tag_slice) {
-                    spaced.push('\n');
-                } else {
-                    spaced.push(' ');
-                }
-                i += close_rel + 1;
+        if bytes[i] == b'<'
+            && let Some(close_rel) = bytes[i..].iter().position(|&b| b == b'>')
+        {
+            if text_start < i {
+                spaced.push_str(&raw_html[text_start..i]);
+            }
+            let tag_slice = &bytes[i..=i + close_rel];
+            if let Some(closing_tag) = matching_ignored_closing_tag(tag_slice)
+                && let Some(end_rel) =
+                    find_closing_tag_case_insensitive(&bytes[i + close_rel + 1..], closing_tag)
+            {
+                i = i + close_rel + 1 + end_rel;
                 text_start = i;
                 continue;
             }
+            if is_block_tag(tag_slice) {
+                spaced.push('\n');
+            } else {
+                spaced.push(' ');
+            }
+            i += close_rel + 1;
+            text_start = i;
+            continue;
         }
         i += 1;
     }
@@ -746,29 +751,26 @@ fn strip_tags_with_spaces(raw_html: &str, skip_ignored_blocks: bool) -> String {
     let mut text_start = 0;
 
     while i < bytes.len() {
-        if bytes[i] == b'<' {
-            if let Some(close_rel) = bytes[i..].iter().position(|&b| b == b'>') {
-                if text_start < i {
-                    out.push_str(&raw_html[text_start..i]);
-                }
-                let tag_slice = &bytes[i..=i + close_rel];
-                if skip_ignored_blocks {
-                    if let Some(closing_tag) = matching_ignored_closing_tag(tag_slice) {
-                        if let Some(end_rel) = find_closing_tag_case_insensitive(
-                            &bytes[i + close_rel + 1..],
-                            closing_tag,
-                        ) {
-                            i = i + close_rel + 1 + end_rel;
-                            text_start = i;
-                            continue;
-                        }
-                    }
-                }
-                out.push(' ');
-                i += close_rel + 1;
+        if bytes[i] == b'<'
+            && let Some(close_rel) = bytes[i..].iter().position(|&b| b == b'>')
+        {
+            if text_start < i {
+                out.push_str(&raw_html[text_start..i]);
+            }
+            let tag_slice = &bytes[i..=i + close_rel];
+            if skip_ignored_blocks
+                && let Some(closing_tag) = matching_ignored_closing_tag(tag_slice)
+                && let Some(end_rel) =
+                    find_closing_tag_case_insensitive(&bytes[i + close_rel + 1..], closing_tag)
+            {
+                i = i + close_rel + 1 + end_rel;
                 text_start = i;
                 continue;
             }
+            out.push(' ');
+            i += close_rel + 1;
+            text_start = i;
+            continue;
         }
         i += 1;
     }
@@ -909,10 +911,9 @@ fn extract_iso_date_from_card(tag: &HTMLTag, parser: &Parser) -> Option<String> 
     // 1. Primary AIUB date selector from `main.py`: `div.date-custom` (`.date-custom`)
     if let Some(raw_custom) = find_first_text_in_tag(tag, parser, ".date-custom")
         .or_else(|| find_first_text_in_tag(tag, parser, "div.date-custom"))
+        && let Some(iso) = parse_date_to_iso(&raw_custom)
     {
-        if let Some(iso) = parse_date_to_iso(&raw_custom) {
-            return Some(iso);
-        }
+        return Some(iso);
     }
 
     // 2. Fallback: `.day`, `.month`, `.year`
@@ -936,10 +937,9 @@ fn extract_iso_date_from_card(tag: &HTMLTag, parser: &Parser) -> Option<String> 
 
     if let Some(raw_time) = find_first_text_in_tag(tag, parser, "time")
         .or_else(|| find_first_text_in_tag(tag, parser, ".date"))
+        && let Some(iso) = parse_date_to_iso(&raw_time)
     {
-        if let Some(iso) = parse_date_to_iso(&raw_time) {
-            return Some(iso);
-        }
+        return Some(iso);
     }
 
     None
@@ -957,19 +957,19 @@ fn parse_date_to_iso(raw: &str) -> Option<String> {
             let day_opt1 = strip_ordinal(window[0]).parse::<u32>();
             let month_opt1 = month_number(window[1]);
             let year_opt1 = window[2].parse::<i32>();
-            if let (Ok(day), Some(month), Ok(year)) = (day_opt1, month_opt1, year_opt1) {
-                if let Some(d) = NaiveDate::from_ymd_opt(year, month, day) {
-                    return Some(d.format("%Y-%m-%d").to_string());
-                }
+            if let (Ok(day), Some(month), Ok(year)) = (day_opt1, month_opt1, year_opt1)
+                && let Some(d) = NaiveDate::from_ymd_opt(year, month, day)
+            {
+                return Some(d.format("%Y-%m-%d").to_string());
             }
 
             let month_opt2 = month_number(window[0]);
             let day_opt2 = strip_ordinal(window[1]).parse::<u32>();
             let year_opt2 = window[2].parse::<i32>();
-            if let (Some(month), Ok(day), Ok(year)) = (month_opt2, day_opt2, year_opt2) {
-                if let Some(d) = NaiveDate::from_ymd_opt(year, month, day) {
-                    return Some(d.format("%Y-%m-%d").to_string());
-                }
+            if let (Some(month), Ok(day), Ok(year)) = (month_opt2, day_opt2, year_opt2)
+                && let Some(d) = NaiveDate::from_ymd_opt(year, month, day)
+            {
+                return Some(d.format("%Y-%m-%d").to_string());
             }
         }
     }
@@ -988,10 +988,11 @@ fn parse_date_to_iso(raw: &str) -> Option<String> {
 
 fn strip_ordinal(s: &str) -> &str {
     for suffix in ["st", "nd", "rd", "th", "ST", "ND", "RD", "TH"] {
-        if let Some(stripped) = s.strip_suffix(suffix) {
-            if !stripped.is_empty() && stripped.chars().all(|c| c.is_ascii_digit()) {
-                return stripped;
-            }
+        if let Some(stripped) = s.strip_suffix(suffix)
+            && !stripped.is_empty()
+            && stripped.chars().all(|c| c.is_ascii_digit())
+        {
+            return stripped;
         }
     }
     s
@@ -1016,11 +1017,13 @@ fn month_number(s: &str) -> Option<u32> {
     }
 }
 
+#[must_use]
 pub fn normalize_notice_url(raw_href: &str) -> String {
     let base_with_slash = format!("{BASE_URL}/");
     normalize_aiub_url(raw_href, &base_with_slash, false)
 }
 
+#[must_use]
 pub fn normalize_aiub_url(raw_href: &str, base_url: &str, allow_external: bool) -> String {
     // O10: only allocate a cleaned copy when a backslash is actually
     // present — the old `replace()` allocated on every href.
@@ -1061,7 +1064,14 @@ pub fn normalize_aiub_url(raw_href: &str, base_url: &str, allow_external: bool) 
 
     if host == BASE_HOST {
         if scheme == "http" {
-            let _ = parsed.set_scheme("https");
+            // Medium #4: `set_scheme("https")` on an already-parsed
+            // http URL cannot realistically fail, but a failure must
+            // be visible — the old `let _ =` hid it. The URL is still
+            // returned (http AIUB URLs are usable); only the upgrade
+            // is skipped.
+            if let Err(err) = parsed.set_scheme("https") {
+                console_warn!("Failed to upgrade AIUB URL scheme to https ({parsed}): {err:?}");
+            }
         }
     } else if !allow_external {
         return String::new();

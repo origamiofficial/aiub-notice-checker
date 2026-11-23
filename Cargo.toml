@@ -1,7 +1,23 @@
 [package]
 name = "aiub-notice-checker"
 version = "6.2.4"
-edition = "2021"
+edition = "2024"
+rust-version = "1.100"
+description = "Cloudflare Worker that checks AIUB notices and posts them to Telegram and Facebook"
+license = "MIT"
+repository = "https://github.com/origamiofficial/aiub-notice-checker"
+
+[lints.clippy]
+# priority = -1 on the group so the member lint below (must_use_candidate,
+# which lives in the `correctness` group) can override it at priority 0.
+# Without this, Clippy 1.100 errors with `clippy::lint_groups_priority`:
+# "lint group `correctness` has the same priority (0) as a lint".
+correctness = { level = "deny", priority = -1 }
+suspicious = "warn"
+style = "warn"
+complexity = "warn"
+perf = "warn"
+must_use_candidate = "warn"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

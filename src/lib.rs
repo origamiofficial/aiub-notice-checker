@@ -1,17 +1,20 @@
 use chrono::{DateTime, Duration, Utc};
+use futures_util::future::{Either, select};
 use futures_util::stream::{self, StreamExt};
 use std::collections::{HashMap, HashSet};
+use std::pin::pin;
 use worker::{
-    console_error, console_log, console_warn,
+    Delay, Env, ScheduleContext, ScheduledEvent, console_error, console_log, console_warn,
     d1::{D1Database, D1DatabaseSession, D1PreparedStatement},
     event,
-    observability::{enter_span, enter_span_async, SpanStatus},
+    observability::{SpanStatus, enter_span, enter_span_async},
     signal::is_near_cpu_limit,
-    Env, ScheduleContext, ScheduledEvent,
 };
 
 pub mod config;
 mod db;
+mod dispatch;
+pub mod errors;
 pub mod facebook;
 pub mod models;
 pub mod scraper;
@@ -21,19 +24,21 @@ mod tests;
 pub mod version;
 
 use config::{
-    Secrets, AIUB_OUTAGE_ALERTED_KEY, AIUB_OUTAGE_ALERT_THRESHOLD_MINS, AIUB_OUTAGE_DOWN_SINCE_KEY,
+    AIUB_OUTAGE_ALERT_THRESHOLD_MINS, AIUB_OUTAGE_ALERTED_KEY, AIUB_OUTAGE_DOWN_SINCE_KEY,
     DETAIL_FAILURE_ALERT_DEBOUNCE_HOURS, DETAIL_FAILURE_LAST_ALERT_KEY, DETAIL_FAILURE_MIN_SAMPLE,
     DETAIL_FAILURE_RATIO, DETAIL_RETRY_COOLDOWN_MINUTES, EMPTY_LISTING_ALERT_DEBOUNCE_HOURS,
-    EMPTY_LISTING_ALERT_KEY, FACEBOOK_AUTH_PAUSED_KEY, FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS,
-    MAX_DETAIL_FETCHES_PER_RUN, MAX_FACEBOOK_SENDS_PER_RUN, MAX_TELEGRAM_SENDS_PER_RUN,
-    MIN_LISTING_DATE_COVERAGE, MIN_LISTING_DESC_COVERAGE,
+    EMPTY_LISTING_ALERT_KEY, MAX_DETAIL_FETCHES_PER_RUN, MIN_LISTING_DATE_COVERAGE,
+    MIN_LISTING_DESC_COVERAGE, RUN_DEADLINE_SECS, Secrets, TELEGRAM_AUTH_ALERT_DEBOUNCE_HOURS,
+    TELEGRAM_AUTH_LAST_ALERT_KEY,
 };
-use models::{format_notice_message, titles_equivalent, D1Metrics, Notice, NoticeRow};
+use errors::AppError;
+use models::{D1Metrics, Notice, NoticeRow, format_notice_message, titles_equivalent};
 use scraper::{DetailFetchOutcome, ParsedDetail};
 
 const DETAIL_CONCURRENCY: usize = 3;
 
 /// Formats an actionable admin alert distinguishing DOM parser failures from upstream AIUB/network errors.
+#[must_use]
 pub fn format_detail_failure_alert(
     attempted_count: usize,
     http_error_count: usize,
@@ -94,11 +99,13 @@ pub fn format_detail_failure_alert(
     }
 }
 
+#[must_use]
 pub fn format_listing_skip_message(err: &str) -> String {
     format!("[Listing Fetch Skipped] AIUB listing page unreachable: {err}. Skipping this run.")
 }
 
 /// Formats a human-readable duration (e.g., "1 hour 15 minutes", "2 days 3 hours", "< 1 minute").
+#[must_use]
 pub fn format_duration_human(duration: Duration) -> String {
     let total_secs = duration.num_seconds().max(0);
     if total_secs < 60 {
@@ -135,12 +142,14 @@ pub fn format_duration_human(duration: Duration) -> String {
     }
 }
 
+#[must_use]
 pub fn format_outage_alert_message(duration_str: &str) -> String {
     format!(
         "⚠️ AIUB Notice Checker: AIUB website has been unreachable for {duration_str}. Notice checks are paused until the site recovers."
     )
 }
 
+#[must_use]
 pub fn format_recovery_alert_message(duration_str: &str) -> String {
     format!(
         "✅ AIUB Notice Checker: AIUB website is back online after a total outage of {duration_str}. Notice checking has resumed."
@@ -184,7 +193,8 @@ async fn handle_upstream_outage(
             // `let _ =`), so the caller logs it and the next run retries
             // instead of the alert silently never firing.
             let now_str = now.to_rfc3339();
-            db::set_app_state(db, session, AIUB_OUTAGE_DOWN_SINCE_KEY, &now_str).await?;
+            let m = db::set_app_state(db, session, AIUB_OUTAGE_DOWN_SINCE_KEY, &now_str).await?;
+            warn_if_app_state_partial(m, "outage down-since");
             now
         }
     };
@@ -201,7 +211,8 @@ async fn handle_upstream_outage(
                 .await
                 .unwrap_or(false);
             if alert_sent || secrets.telegram_admin_chat_id.is_none() {
-                db::set_app_state(db, session, AIUB_OUTAGE_ALERTED_KEY, "true").await?;
+                let m = db::set_app_state(db, session, AIUB_OUTAGE_ALERTED_KEY, "true").await?;
+                warn_if_app_state_partial(m, "outage alerted flag");
             }
         }
     }
@@ -239,12 +250,13 @@ async fn handle_upstream_recovery(
     if !already_alerted {
         // The outage never reached the alert threshold, so no recovery
         // message is owed — just clear the (short) outage state.
-        db::delete_app_state_keys(
+        let m = db::delete_app_state_keys(
             db,
             session,
             &[AIUB_OUTAGE_DOWN_SINCE_KEY, AIUB_OUTAGE_ALERTED_KEY],
         )
         .await?;
+        warn_if_app_state_partial(m, "outage state clear (short outage)");
         return Ok(());
     }
 
@@ -263,12 +275,13 @@ async fn handle_upstream_recovery(
             AIUB_OUTAGE_DOWN_SINCE_KEY,
             down_since_str
         );
-        db::delete_app_state_keys(
+        let m = db::delete_app_state_keys(
             db,
             session,
             &[AIUB_OUTAGE_DOWN_SINCE_KEY, AIUB_OUTAGE_ALERTED_KEY],
         )
         .await?;
+        warn_if_app_state_partial(m, "outage state clear (corrupt down-since)");
         return Ok(());
     };
 
@@ -291,12 +304,13 @@ async fn handle_upstream_recovery(
     };
 
     if alert_sent {
-        db::delete_app_state_keys(
+        let m = db::delete_app_state_keys(
             db,
             session,
             &[AIUB_OUTAGE_DOWN_SINCE_KEY, AIUB_OUTAGE_ALERTED_KEY],
         )
         .await?;
+        warn_if_app_state_partial(m, "outage state clear (recovery)");
     } else {
         console_warn!(
             "[Recovery Alert Deferred] Recovery alert was not delivered; outage state kept for retry."
@@ -310,6 +324,20 @@ async fn handle_upstream_recovery(
 /// timing in the Run Summary.
 fn elapsed_ms_since(start: DateTime<Utc>) -> i64 {
     Utc::now().signed_duration_since(start).num_milliseconds()
+}
+
+/// Medium #8: `D1Metrics` is `#[must_use]` — a batch can return `Ok`
+/// with `failed_statements > 0` (partial application). Single-key
+/// `app_state` writes use this helper so a partially-applied write is
+/// visible in the logs instead of silently dropped; the next run
+/// re-evaluates the same state.
+fn warn_if_app_state_partial(metrics: D1Metrics, what: &str) {
+    if metrics.failed_statements > 0 {
+        console_warn!(
+            "[App State Partial Failure] {what}: write partially applied (failed_statements={}); the next run will re-evaluate.",
+            metrics.failed_statements
+        );
+    }
 }
 
 /// Pure debounce check (M2): returns true when an alert with the given
@@ -340,18 +368,18 @@ async fn send_debounced_empty_listing_alert(
     secrets: &Secrets,
 ) -> worker::Result<()> {
     let now = Utc::now();
-    if let Some(last_alert_str) = db::get_app_state(session, EMPTY_LISTING_ALERT_KEY).await? {
-        if !is_debounce_expired(
+    if let Some(last_alert_str) = db::get_app_state(session, EMPTY_LISTING_ALERT_KEY).await?
+        && !is_debounce_expired(
             Some(&last_alert_str),
             now,
             EMPTY_LISTING_ALERT_DEBOUNCE_HOURS,
-        ) {
-            console_log!(
-                "Suppressing duplicate empty-listing alert (last sent at {})",
-                last_alert_str
-            );
-            return Ok(());
-        }
+        )
+    {
+        console_log!(
+            "Suppressing duplicate empty-listing alert (last sent at {})",
+            last_alert_str
+        );
+        return Ok(());
     }
 
     let alert_sent = match telegram::send_admin_alert(
@@ -372,7 +400,8 @@ async fn send_debounced_empty_listing_alert(
 
     if alert_sent {
         let now_str = now.to_rfc3339();
-        db::set_app_state(db, session, EMPTY_LISTING_ALERT_KEY, &now_str).await?;
+        let m = db::set_app_state(db, session, EMPTY_LISTING_ALERT_KEY, &now_str).await?;
+        warn_if_app_state_partial(m, "empty-listing alert timestamp");
     }
     Ok(())
 }
@@ -380,70 +409,68 @@ async fn send_debounced_empty_listing_alert(
 #[event(scheduled)]
 pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     enter_span_async("scheduled_notice_check", |span| async move {
-        if let Err(err) = run(&env).await {
-            console_error!("Scheduled run failed: {}", err);
-            span.set_status(SpanStatus::Error(Some(err.to_string())));
-        } else {
-            span.set_status(SpanStatus::Ok);
+        match run(&env).await {
+            Err(err) => {
+                console_error!("Scheduled run failed: {}", err);
+                span.set_status(SpanStatus::Error(Some(err.to_string())));
+            }
+            _ => {
+                span.set_status(SpanStatus::Ok);
+            }
         }
     })
     .await;
 }
 
-/// O1/O3: the outcome of one dispatch phase. Sends are complete when
-/// this is returned; the D1 marks are only collected statements, to be
-/// flushed sequentially by the caller after both phases finish (O3),
-/// so no two D1 batches ever run concurrently on the same session.
-#[derive(Default)]
-struct DispatchOutcome {
-    sent_count: usize,
-    deferred_count: usize,
-    failed_count: usize,
-    attempt_stmts: Vec<D1PreparedStatement>,
-    notified_stmts: Vec<D1PreparedStatement>,
-    duplicate_stmts: Vec<D1PreparedStatement>,
+/// Outcome of racing a run future against its deadline.
+pub(crate) enum DeadlineOutcome {
+    /// The run finished before the deadline; carries its result.
+    Finished(worker::Result<()>),
+    /// The deadline fired first; the run future was dropped.
+    Expired,
 }
 
-/// O1: flushes accumulated dispatch marks in one batch per mark kind
-/// (attempt, notified, duplicate), instead of one round-trip per send.
-/// A batch that fails entirely is logged and its statement count added
-/// to `failed_statements` — those marks did not apply, so the affected
-/// notices may re-send on the next run (safe direction, same as M4).
-async fn flush_dispatch_marks(
-    session: &D1DatabaseSession,
-    label: &str,
-    attempt_stmts: Vec<D1PreparedStatement>,
-    notified_stmts: Vec<D1PreparedStatement>,
-    duplicate_stmts: Vec<D1PreparedStatement>,
-) -> D1Metrics {
-    let mut metrics = D1Metrics::default();
-    for (kind, stmts) in [
-        ("attempt", attempt_stmts),
-        ("notified", notified_stmts),
-        ("duplicate", duplicate_stmts),
-    ] {
-        if stmts.is_empty() {
-            continue;
-        }
-        let count = stmts.len();
-        match db::execute_batch(session, stmts).await {
-            Ok(m) => {
-                metrics.rows_read += m.rows_read;
-                metrics.rows_written += m.rows_written;
-                metrics.failed_statements += m.failed_statements;
-            }
-            Err(err) => {
-                console_error!(
-                    "[Dispatch Mark Flush Failed] {label} {kind} batch ({count} marks) failed entirely: {err}; affected notices may re-send on the next run."
-                );
-                metrics.failed_statements += count;
-            }
-        }
+/// Races a run future against a deadline future (Phase C, Medium #10):
+/// the `select` that used to be inline in `run()`, extracted so the
+/// expiry decision is natively testable — production passes a
+/// `worker::Delay`, tests pass `ready`/`pending` futures. On expiry the
+/// run future is dropped, exactly as before. This function never logs:
+/// `run()` logs the expiry, and the `console_*` macros abort on
+/// non-wasm targets, so logging here would make the native tests
+/// un-runnable.
+async fn run_with_deadline<Fut, Tout>(run_fut: Fut, timeout_fut: Tout) -> DeadlineOutcome
+where
+    Fut: std::future::Future<Output = worker::Result<()>>,
+    Tout: std::future::Future<Output = ()>,
+{
+    match select(pin!(run_fut), pin!(timeout_fut)).await {
+        Either::Left((res, _)) => DeadlineOutcome::Finished(res),
+        Either::Right(((), _)) => DeadlineOutcome::Expired,
     }
-    metrics
 }
 
 async fn run(env: &Env) -> worker::Result<()> {
+    // Medium #5: run-level deadline. The per-fetch 15s caps do not
+    // bound a whole run — slow D1, dispatch pacing and retries can
+    // still push a run past the Worker's budget. Select the whole run
+    // against a 240s deadline; on expiry the run future is dropped
+    // (any in-flight send is abandoned, and marks are never partially
+    // flushed — they only flush after the dispatch join) and the error
+    // is logged by `scheduled()`, exactly like any other `run()` error.
+    let run_fut = run_inner(env);
+    let timeout_fut = Delay::from(std::time::Duration::from_secs(RUN_DEADLINE_SECS));
+    match run_with_deadline(run_fut, timeout_fut).await {
+        DeadlineOutcome::Finished(res) => res,
+        DeadlineOutcome::Expired => {
+            console_error!(
+                "[Run Deadline] Scheduled run exceeded the {RUN_DEADLINE_SECS}s run-level deadline; aborting. Any in-flight dispatch marks were not flushed, so affected notices may re-send on the next run."
+            );
+            Err(AppError::Fetch(format!("run exceeded the {RUN_DEADLINE_SECS}s deadline")).into())
+        }
+    }
+}
+
+async fn run_inner(env: &Env) -> worker::Result<()> {
     let secrets = Secrets::from_env(env)?;
     let database = env.d1("DB")?;
 
@@ -458,31 +485,7 @@ async fn run(env: &Env) -> worker::Result<()> {
     let mut phase_started = run_started;
 
     // 1. Fetch the latest notices on listing page 1.
-    let listing_notices: Option<Vec<Notice>> =
-        enter_span_async("fetch_listing", |span| async move {
-            let listing_url = scraper::listing_page_url(1);
-            span.set_attribute("url", listing_url.as_str());
-            let html = match scraper::fetch_html(&listing_url).await {
-                Ok(h) => h,
-                Err(err) => {
-                    let err_msg = err.to_string();
-                    console_warn!("{}", format_listing_skip_message(&err_msg));
-                    span.set_attribute("upstream_available", "false");
-                    span.set_attribute("skip_reason", err_msg.as_str());
-                    span.set_status(SpanStatus::Ok);
-                    return Ok::<Option<Vec<Notice>>, worker::Error>(None);
-                }
-            };
-            span.set_attribute("upstream_available", "true");
-            let parsed = scraper::parse_listing_html(&html);
-            span.set_attribute("notices_found", parsed.len() as i64);
-            span.set_attribute("html_bytes", html.len() as i64);
-            span.set_status(SpanStatus::Ok);
-            Ok::<Option<Vec<Notice>>, worker::Error>(Some(parsed))
-        })
-        .await?;
-
-    let Some(listing_notices) = listing_notices else {
+    let Some(listing_notices) = fetch_listing_phase().await? else {
         if let Err(err) = handle_upstream_outage(&database, &session, &secrets, Utc::now()).await {
             console_warn!("[Outage State Warning] Failed to update outage state: {err}");
         }
@@ -507,40 +510,14 @@ async fn run(env: &Env) -> worker::Result<()> {
     }
 
     if listing_notices.is_empty() {
-        console_warn!(
-            "[Listing Parse Failed] 0 notices parsed from listing page 1. DOM layout may have changed."
-        );
-        // M2: debounced — at most one alert per EMPTY_LISTING_ALERT_DEBOUNCE_HOURS.
-        if let Err(err) = send_debounced_empty_listing_alert(&database, &session, &secrets).await {
-            console_warn!(
-                "[Empty Listing Alert Warning] Failed to handle empty-listing alert: {err}"
-            );
-        }
+        handle_empty_listing(&database, &session, &secrets).await;
         return Ok(());
     }
 
-    // Deduplicate listing links while preserving top-to-bottom order.
-    let mut seen_links = HashSet::with_capacity(listing_notices.len());
-    let mut unique_listing: Vec<Notice> = Vec::with_capacity(listing_notices.len());
-    for item in listing_notices {
-        if seen_links.insert(item.url.clone()) {
-            unique_listing.push(item);
-        }
-    }
+    let unique_listing = deduplicate_listing_notices(listing_notices);
 
     // Listing coverage sanity check.
-    let total_listed = unique_listing.len() as f64;
-    let date_coverage = unique_listing
-        .iter()
-        .filter(|n| n.published_date.is_some())
-        .count() as f64
-        / total_listed;
-    let desc_coverage = unique_listing
-        .iter()
-        .filter(|n| !n.description.is_empty())
-        .count() as f64
-        / total_listed;
-
+    let (date_coverage, desc_coverage) = listing_coverage(&unique_listing);
     if date_coverage < MIN_LISTING_DATE_COVERAGE || desc_coverage < MIN_LISTING_DESC_COVERAGE {
         console_warn!(
             "Listing selector coverage degraded: date_coverage={:.2}, desc_coverage={:.2}",
@@ -552,30 +529,7 @@ async fn run(env: &Env) -> worker::Result<()> {
     let links: Vec<String> = unique_listing.iter().map(|n| n.url.clone()).collect();
 
     // 2. Load existing D1 rows strictly for the current page 1 notices.
-    let session_ref = &session;
-    let links_ref = &links;
-    let (existing_map, read_metrics) =
-        enter_span_async("load_existing_from_d1", |span| async move {
-            span.set_attribute("queried_links", links_ref.len() as i64);
-            match db::get_notices_by_links(session_ref, links_ref).await {
-                Ok((map, m)) => {
-                    span.set_attribute("matched_rows", map.len() as i64);
-                    span.set_attribute("rows_read", m.rows_read as i64);
-                    span.set_status(SpanStatus::Ok);
-                    Ok::<(HashMap<String, NoticeRow>, D1Metrics), worker::Error>((map, m))
-                }
-                Err(err) => {
-                    console_error!(
-                        "[D1 Query Failed] Failed to query existing notices: {}",
-                        err
-                    );
-                    span.set_status(SpanStatus::Error(Some(err.to_string())));
-                    Err(err)
-                }
-            }
-        })
-        .await?;
-
+    let (existing_map, read_metrics) = load_existing_phase(&session, &links).await?;
     total_d1.rows_read += read_metrics.rows_read;
     total_d1.rows_written += read_metrics.rows_written;
 
@@ -587,23 +541,174 @@ async fn run(env: &Env) -> worker::Result<()> {
     let retry_cutoff_iso =
         (Utc::now() - Duration::minutes(DETAIL_RETRY_COOLDOWN_MINUTES)).to_rfc3339();
 
-    let detail_targets = enter_span("select_detail_targets", |span| {
-        let selection = select_detail_targets(&unique_listing, &existing_map, &retry_cutoff_iso);
-        span.set_attribute("new_targets", selection.new_count as i64);
-        span.set_attribute("backfill_targets", selection.backfill_count as i64);
-        span.set_attribute("rotation_targets", selection.rotation_count as i64);
-        span.set_attribute("total_targets", selection.targets.len() as i64);
-        span.set_status(SpanStatus::Ok);
-        selection.targets
-    });
+    let detail_targets =
+        select_detail_targets_traced(&unique_listing, &existing_map, &retry_cutoff_iso);
 
     // 4. Fetch the selected detail pages with bounded concurrency and CPU budget awareness.
-    let targets_ref = &detail_targets;
-    let detail_results = enter_span_async("fetch_detail_pages", |span| async move {
-        span.set_attribute("requested", targets_ref.len() as i64);
+    let detail_results = fetch_detail_pages_phase(&detail_targets).await;
+
+    let detail_fetch_ms = elapsed_ms_since(phase_started);
+    phase_started = Utc::now();
+    let analysis = analyze_detail_results(detail_results);
+    maybe_alert_detail_failures(&database, &session, &secrets, &analysis).await;
+
+    let detail_map = analysis.detail_map;
+
+    // 5. Reconcile state, compute hashes, build D1 batch upserts, and queue notifications.
+    // Cold-start guard: if D1 is completely empty and we scraped a full page of notices,
+    // this is a fresh database seed — write all rows silently and populate tracking columns
+    // so neither Telegram nor Facebook are flooded.
+    let is_empty_db_seed =
+        detect_cold_start(&session, existing_map.is_empty(), unique_listing.len()).await;
+    if is_empty_db_seed {
+        console_log!(
+            "Empty-database cold-start detected ({} notices). Seeding silently without Telegram or Facebook notifications.",
+            unique_listing.len()
+        );
+    }
+
+    let ReconcileOutcome {
+        statements,
+        tg_notifications,
+        fb_notifications,
+        silent_sync_links,
+    } = reconcile_notices(
+        &database,
+        unique_listing,
+        &existing_map,
+        &detail_map,
+        is_empty_db_seed,
+    )?;
+    let silent_backfills = silent_sync_links.len();
+
+    // 6. Execute D1 batch upserts on the session, then the cold-start
+    // seed and silent hash-sync writes.
+    let (upsert_failed, write_metrics) = apply_reconcile_writes(
+        &database,
+        &session,
+        statements,
+        silent_sync_links,
+        &links,
+        is_empty_db_seed,
+    )
+    .await?;
+    total_d1.rows_read += write_metrics.rows_read;
+    total_d1.rows_written += write_metrics.rows_written;
+    total_d1.failed_statements += write_metrics.failed_statements;
+
+    let upsert_ms = elapsed_ms_since(phase_started);
+    phase_started = Utc::now();
+
+    // 7+8. Dispatch queued notifications.
+    // O3: the Telegram and Facebook phases overlap. Their wall time was
+    // 10x1.0s + 5x1.5s = 17.5s of sequential pacing; overlapped it is the
+    // longer of the two, with per-platform pacing unchanged.
+    // O1: each phase only *collects* D1 mark statements while sending;
+    // the marks are flushed sequentially after both phases finish, so no
+    // two D1 batches ever run concurrently on the same session.
+    // M8: both phases are skipped entirely when the upsert batch
+    // partially failed.
+    if !upsert_failed {
+        let dispatch_metrics = dispatch::dispatch_both_phases(
+            &database,
+            &session,
+            &secrets,
+            tg_notifications,
+            fb_notifications,
+        )
+        .await?;
+        total_d1.rows_read += dispatch_metrics.rows_read;
+        total_d1.rows_written += dispatch_metrics.rows_written;
+        total_d1.failed_statements += dispatch_metrics.failed_statements;
+    }
+
+    let dispatch_ms = elapsed_ms_since(phase_started);
+
+    console_log!(
+        "[Run Summary] rows_read={}, rows_written={}, failed_statements={}, silent_backfills={}, detail_succeeded={}, detail_http_errors={}, detail_parse_errors={}, fetch_ms={}, load_ms={}, detail_ms={}, upsert_ms={}, dispatch_ms={}, total_ms={}",
+        total_d1.rows_read,
+        total_d1.rows_written,
+        total_d1.failed_statements,
+        silent_backfills,
+        analysis.succeeded,
+        analysis.http_errors,
+        analysis.parse_errors,
+        fetch_listing_ms,
+        load_existing_ms,
+        detail_fetch_ms,
+        upsert_ms,
+        dispatch_ms,
+        elapsed_ms_since(run_started)
+    );
+
+    Ok(())
+}
+
+/// Step 1 of `run_inner()`: fetches and parses listing page 1.
+/// Returns `None` when the listing page is unreachable — the caller
+/// treats that as an upstream outage, not a parse failure.
+async fn fetch_listing_phase() -> worker::Result<Option<Vec<Notice>>> {
+    enter_span_async("fetch_listing", |span| async move {
+        let listing_url = scraper::listing_page_url(1);
+        span.set_attribute("url", listing_url.as_str());
+        let html = match scraper::fetch_html(&listing_url).await {
+            Ok(h) => h,
+            Err(err) => {
+                let err_msg = err.to_string();
+                console_warn!("{}", format_listing_skip_message(&err_msg));
+                span.set_attribute("upstream_available", "false");
+                span.set_attribute("skip_reason", err_msg.as_str());
+                span.set_status(SpanStatus::Ok);
+                return Ok::<Option<Vec<Notice>>, worker::Error>(None);
+            }
+        };
+        span.set_attribute("upstream_available", "true");
+        let parsed = scraper::parse_listing_html(&html);
+        span.set_attribute("notices_found", parsed.len() as i64);
+        span.set_attribute("html_bytes", html.len() as i64);
+        span.set_status(SpanStatus::Ok);
+        Ok::<Option<Vec<Notice>>, worker::Error>(Some(parsed))
+    })
+    .await
+}
+
+/// Step 2 of `run_inner()`: loads the existing D1 rows strictly for
+/// the current page 1 notices.
+async fn load_existing_phase(
+    session: &D1DatabaseSession,
+    links: &[String],
+) -> worker::Result<(HashMap<String, NoticeRow>, D1Metrics)> {
+    enter_span_async("load_existing_from_d1", |span| async move {
+        span.set_attribute("queried_links", links.len() as i64);
+        match db::get_notices_by_links(session, links).await {
+            Ok((map, m)) => {
+                span.set_attribute("matched_rows", map.len() as i64);
+                span.set_attribute("rows_read", m.rows_read as i64);
+                span.set_status(SpanStatus::Ok);
+                Ok::<(HashMap<String, NoticeRow>, D1Metrics), worker::Error>((map, m))
+            }
+            Err(err) => {
+                console_error!(
+                    "[D1 Query Failed] Failed to query existing notices: {}",
+                    err
+                );
+                span.set_status(SpanStatus::Error(Some(err.to_string())));
+                Err(err)
+            }
+        }
+    })
+    .await
+}
+
+/// Step 4 of `run_inner()`: fetches the selected detail pages with
+/// bounded concurrency and CPU budget awareness, and counts the
+/// outcomes for the span and the `[Detail Fetch Summary]` log line.
+async fn fetch_detail_pages_phase(targets: &[String]) -> Vec<(String, DetailFetchOutcome)> {
+    enter_span_async("fetch_detail_pages", |span| async move {
+        span.set_attribute("requested", targets.len() as i64);
 
         let fetched: Vec<(String, DetailFetchOutcome)> =
-            stream::iter(targets_ref.iter().cloned())
+            stream::iter(targets.iter().cloned())
                 .map(|link| async move {
                     if is_near_cpu_limit() {
                         console_warn!(
@@ -665,7 +770,7 @@ async fn run(env: &Env) -> worker::Result<()> {
             span.set_status(SpanStatus::Error(Some(format!(
                 "{}/{} succeeded (http_errors={}, parse_errors={}, cpu_skipped={})",
                 succeeded,
-                targets_ref.len(),
+                targets.len(),
                 http_errs,
                 parse_errs,
                 cpu_skips
@@ -676,7 +781,7 @@ async fn run(env: &Env) -> worker::Result<()> {
 
         console_log!(
             "[Detail Fetch Summary] requested={}, succeeded={}, http_errors={}, parse_errors={}, cpu_skipped={}",
-            targets_ref.len(),
+            targets.len(),
             succeeded,
             http_errs,
             parse_errs,
@@ -685,71 +790,56 @@ async fn run(env: &Env) -> worker::Result<()> {
 
         fetched
     })
-    .await;
+    .await
+}
 
-    let attempted_count = detail_results.len();
-    let detail_fetch_ms = elapsed_ms_since(phase_started);
-    phase_started = Utc::now();
-    let mut detail_succeeded_count = 0usize;
-    let mut detail_http_error_count = 0usize;
-    let mut detail_parse_error_count = 0usize;
-    let mut detail_cpu_skipped_count = 0usize;
-    let mut failure_diagnostics: Vec<String> = Vec::new();
+/// Result of [`analyze_detail_results`]: the per-outcome counts, the
+/// failure diagnostics for the debounced admin alert, and the
+/// link -> parsed-detail map the reconcile step consumes.
+pub(crate) struct DetailAnalysis {
+    pub attempted: usize,
+    pub succeeded: usize,
+    pub http_errors: usize,
+    pub parse_errors: usize,
+    pub cpu_skipped: usize,
+    pub diagnostics: Vec<String>,
+    pub detail_map: HashMap<String, Option<ParsedDetail>>,
+}
+
+/// Pure analysis of the detail-fetch outcomes (Phase C, High #2):
+/// counts each outcome kind, builds the failure diagnostics, and
+/// folds the results into the link -> detail map. No I/O, no logging.
+#[must_use]
+pub(crate) fn analyze_detail_results(
+    detail_results: Vec<(String, DetailFetchOutcome)>,
+) -> DetailAnalysis {
+    let mut succeeded = 0usize;
+    let mut http_errors = 0usize;
+    let mut parse_errors = 0usize;
+    let mut cpu_skipped = 0usize;
+    let mut diagnostics: Vec<String> = Vec::new();
 
     for (link, outcome) in &detail_results {
         match outcome {
             DetailFetchOutcome::Success(_) => {
-                detail_succeeded_count += 1;
+                succeeded += 1;
             }
             DetailFetchOutcome::HttpError(err) => {
-                detail_http_error_count += 1;
-                failure_diagnostics.push(format!("{link} (HTTP: {err})"));
+                http_errors += 1;
+                diagnostics.push(format!("{link} (HTTP: {err})"));
             }
             DetailFetchOutcome::ParseError { reason, html_len } => {
-                detail_parse_error_count += 1;
-                failure_diagnostics.push(format!("{link} (DOM: {reason}, len={html_len})"));
+                parse_errors += 1;
+                diagnostics.push(format!("{link} (DOM: {reason}, len={html_len})"));
             }
             DetailFetchOutcome::CpuSkipped => {
-                detail_cpu_skipped_count += 1;
-                failure_diagnostics.push(format!("{link} (CPU: limit approached, deferred)"));
+                cpu_skipped += 1;
+                diagnostics.push(format!("{link} (CPU: limit approached, deferred)"));
             }
         }
     }
 
-    let total_failed =
-        detail_http_error_count + detail_parse_error_count + detail_cpu_skipped_count;
-    if attempted_count >= DETAIL_FAILURE_MIN_SAMPLE
-        && (total_failed as f64 / attempted_count as f64) >= DETAIL_FAILURE_RATIO
-    {
-        console_warn!(
-            "High detail page failure rate: {}/{} failed (http_errors={}, parse_errors={}, cpu_skipped={})",
-            total_failed,
-            attempted_count,
-            detail_http_error_count,
-            detail_parse_error_count,
-            detail_cpu_skipped_count
-        );
-
-        let alert_message = format_detail_failure_alert(
-            attempted_count,
-            detail_http_error_count,
-            detail_parse_error_count,
-            detail_succeeded_count,
-            detail_cpu_skipped_count,
-            &failure_diagnostics,
-        );
-
-        // M5: debounced — a sustained AIUB outage previously alerted on
-        // every 5-minute run.
-        if let Err(err) =
-            send_debounced_detail_failure_alert(&database, &session, &secrets, &alert_message).await
-        {
-            console_warn!(
-                "[Detail Failure Alert Warning] Failed to handle detail-failure alert: {err}"
-            );
-        }
-    }
-
+    let attempted = detail_results.len();
     let mut detail_map: HashMap<String, Option<ParsedDetail>> =
         HashMap::with_capacity(detail_results.len());
     for (link, outcome) in detail_results {
@@ -760,48 +850,175 @@ async fn run(env: &Env) -> worker::Result<()> {
         detail_map.insert(link, opt);
     }
 
-    // 5. Reconcile state, compute hashes, build D1 batch upserts, and queue notifications.
-    struct PendingNotification {
-        notice: Notice,
-        content_hash: String,
-        // O5: the formatted message, computed once at queue time. The
-        // Telegram and Facebook formats are identical, so formatting
-        // twice per notice (once per phase) was pure waste. The
-        // is_edited flag used to live here too, but dispatch no longer
-        // reads it — it only exists while formatting the message.
-        message: String,
+    DetailAnalysis {
+        attempted,
+        succeeded,
+        http_errors,
+        parse_errors,
+        cpu_skipped,
+        diagnostics,
+        detail_map,
     }
+}
 
-    let mut statements = Vec::new();
-    let mut tg_notifications: Vec<PendingNotification> = Vec::new();
-    let mut fb_notifications: Vec<PendingNotification> = Vec::new();
-    // (url, new_hash, tg_needs_sync, fb_needs_sync) — see H1.
-    let mut silent_sync_links: Vec<(String, String, bool, bool)> = Vec::new();
-
-    // Cold-start guard: if D1 is completely empty and we scraped a full page of notices,
-    // this is a fresh database seed — write all rows silently and populate tracking columns
-    // so neither Telegram nor Facebook are flooded.
-    // M3: emptiness is measured with COUNT(*) over the whole table, not
-    // inferred from page-1 matches — a DB holding only older rows is not
-    // empty. On a COUNT failure, fall back to the page-1 heuristic
-    // rather than failing the run.
-    let db_is_empty = match db::count_notices(&session).await {
+/// Cold-start guard (M3): emptiness is measured with COUNT(*) over the
+/// whole table, not inferred from page-1 matches — a DB holding only
+/// older rows is not empty. On a COUNT failure, fall back to the page-1
+/// heuristic rather than failing the run. Returns true when this run
+/// should seed silently (empty DB and a full page of notices).
+async fn detect_cold_start(
+    session: &D1DatabaseSession,
+    page1_empty: bool,
+    listing_len: usize,
+) -> bool {
+    let db_is_empty = match db::count_notices(session).await {
         Ok(n) => n == 0,
         Err(err) => {
             console_warn!(
                 "[Cold-Start Check Failed] COUNT(*) failed ({}); falling back to page-1 emptiness heuristic.",
                 err
             );
-            existing_map.is_empty()
+            page1_empty
         }
     };
-    let is_empty_db_seed = db_is_empty && unique_listing.len() >= 10;
-    if is_empty_db_seed {
-        console_log!(
-            "Empty-database cold-start detected ({} notices). Seeding silently without Telegram or Facebook notifications.",
-            unique_listing.len()
+    db_is_empty && listing_len >= 10
+}
+
+/// Handles a listing fetch that parsed 0 notices: logs the DOM-layout
+/// warning and sends the debounced admin alert (M2 — at most one alert
+/// per `EMPTY_LISTING_ALERT_DEBOUNCE_HOURS`).
+async fn handle_empty_listing(db: &D1Database, session: &D1DatabaseSession, secrets: &Secrets) {
+    console_warn!(
+        "[Listing Parse Failed] 0 notices parsed from listing page 1. DOM layout may have changed."
+    );
+    if let Err(err) = send_debounced_empty_listing_alert(db, session, secrets).await {
+        console_warn!("[Empty Listing Alert Warning] Failed to handle empty-listing alert: {err}");
+    }
+}
+
+/// Deduplicates listing links while preserving top-to-bottom order.
+#[must_use]
+pub(crate) fn deduplicate_listing_notices(listing_notices: Vec<Notice>) -> Vec<Notice> {
+    let mut seen_links = HashSet::with_capacity(listing_notices.len());
+    let mut unique_listing: Vec<Notice> = Vec::with_capacity(listing_notices.len());
+    for item in listing_notices {
+        if seen_links.insert(item.url.clone()) {
+            unique_listing.push(item);
+        }
+    }
+    unique_listing
+}
+
+/// Listing coverage sanity check: the fraction of notices with a
+/// parsed date and with a non-empty description.
+#[must_use]
+pub(crate) fn listing_coverage(unique_listing: &[Notice]) -> (f64, f64) {
+    let total_listed = unique_listing.len() as f64;
+    let date_coverage = unique_listing
+        .iter()
+        .filter(|n| n.published_date.is_some())
+        .count() as f64
+        / total_listed;
+    let desc_coverage = unique_listing
+        .iter()
+        .filter(|n| !n.description.is_empty())
+        .count() as f64
+        / total_listed;
+    (date_coverage, desc_coverage)
+}
+
+/// Step 3 of `run_inner()`: the M15 Priority A/B/C detail-target
+/// selection, wrapped in its observability span.
+fn select_detail_targets_traced(
+    unique_listing: &[Notice],
+    existing_map: &HashMap<String, NoticeRow>,
+    retry_cutoff_iso: &str,
+) -> Vec<String> {
+    enter_span("select_detail_targets", |span| {
+        let selection = select_detail_targets(unique_listing, existing_map, retry_cutoff_iso);
+        span.set_attribute("new_targets", selection.new_count as i64);
+        span.set_attribute("backfill_targets", selection.backfill_count as i64);
+        span.set_attribute("rotation_targets", selection.rotation_count as i64);
+        span.set_attribute("total_targets", selection.targets.len() as i64);
+        span.set_status(SpanStatus::Ok);
+        selection.targets
+    })
+}
+
+/// Sends the debounced detail-failure admin alert (M5) when the
+/// failure rate over the sampled detail pages is high enough.
+async fn maybe_alert_detail_failures(
+    db: &D1Database,
+    session: &D1DatabaseSession,
+    secrets: &Secrets,
+    analysis: &DetailAnalysis,
+) {
+    let total_failed = analysis.http_errors + analysis.parse_errors + analysis.cpu_skipped;
+    if analysis.attempted < DETAIL_FAILURE_MIN_SAMPLE
+        || (total_failed as f64 / analysis.attempted as f64) < DETAIL_FAILURE_RATIO
+    {
+        return;
+    }
+    console_warn!(
+        "High detail page failure rate: {}/{} failed (http_errors={}, parse_errors={}, cpu_skipped={})",
+        total_failed,
+        analysis.attempted,
+        analysis.http_errors,
+        analysis.parse_errors,
+        analysis.cpu_skipped
+    );
+
+    let alert_message = format_detail_failure_alert(
+        analysis.attempted,
+        analysis.http_errors,
+        analysis.parse_errors,
+        analysis.succeeded,
+        analysis.cpu_skipped,
+        &analysis.diagnostics,
+    );
+
+    // M5: debounced — a sustained AIUB outage previously alerted on
+    // every 5-minute run.
+    if let Err(err) =
+        send_debounced_detail_failure_alert(db, session, secrets, &alert_message).await
+    {
+        console_warn!(
+            "[Detail Failure Alert Warning] Failed to handle detail-failure alert: {err}"
         );
     }
+}
+
+/// Outcome of [`reconcile_notices`]: the D1 upsert statements, the
+/// per-platform notification queues, and the silent hash-sync list.
+pub(crate) struct ReconcileOutcome {
+    pub statements: Vec<D1PreparedStatement>,
+    pub tg_notifications: Vec<dispatch::PendingNotification>,
+    pub fb_notifications: Vec<dispatch::PendingNotification>,
+    pub silent_sync_links: Vec<(String, String, bool, bool)>,
+}
+
+/// Step 5 of `run_inner()`: reconcile state, compute hashes, build D1
+/// batch upserts, and queue notifications — extracted from `run()`
+/// (Phase C, High #2). For each listing notice: heal the title/date
+/// from the cached row or the detail fetch, compute the new content
+/// hash, decide whether the row needs a full upsert or a lightweight
+/// timestamp update, work out the silent-sync flags (M15), and queue
+/// Telegram/Facebook notifications for new or edited notices. Pure
+/// except for building the D1 statements (no D1 `.await`); the
+/// eligibility decisions themselves live in the M15 pure functions
+/// (`platform_notification`, `silent_sync_flags`).
+fn reconcile_notices(
+    db: &D1Database,
+    unique_listing: Vec<Notice>,
+    existing_map: &HashMap<String, NoticeRow>,
+    detail_map: &HashMap<String, Option<ParsedDetail>>,
+    is_empty_db_seed: bool,
+) -> worker::Result<ReconcileOutcome> {
+    let mut statements = Vec::new();
+    let mut tg_notifications: Vec<dispatch::PendingNotification> = Vec::new();
+    let mut fb_notifications: Vec<dispatch::PendingNotification> = Vec::new();
+    // (url, new_hash, tg_needs_sync, fb_needs_sync) — see H1.
+    let mut silent_sync_links: Vec<(String, String, bool, bool)> = Vec::new();
 
     for mut item in unique_listing {
         let existing = existing_map.get(&item.url);
@@ -831,12 +1048,11 @@ async fn run(env: &Env) -> worker::Result<()> {
                 if item.published_date.is_none() && detail.published_date.is_some() {
                     item.published_date = detail.published_date.clone();
                 }
-                if let Some(row) = existing {
-                    if !detail.legacy_sticky_body.is_empty()
-                        && clean_mojibake_eq(row.body_text.trim(), detail.legacy_sticky_body.trim())
-                    {
-                        matched_legacy_sticky = true;
-                    }
+                if let Some(row) = existing
+                    && !detail.legacy_sticky_body.is_empty()
+                    && clean_mojibake_eq(row.body_text.trim(), detail.legacy_sticky_body.trim())
+                {
+                    matched_legacy_sticky = true;
                 }
                 item.body_text = detail.body_text.clone();
                 item.attachments = detail.attachments.clone();
@@ -901,12 +1117,11 @@ async fn run(env: &Env) -> worker::Result<()> {
 
         if needs_db_write {
             if use_lightweight_update {
-                let stmt =
-                    db::build_lightweight_detail_update(&database, &item.url, item.detail_fetched)?;
+                let stmt = db::build_lightweight_detail_update(db, &item.url, item.detail_fetched)?;
                 statements.push(stmt);
             } else {
                 let stmt = db::build_upsert_statement(
-                    &database,
+                    db,
                     &item,
                     &new_hash,
                     &attachments_json,
@@ -935,12 +1150,12 @@ async fn run(env: &Env) -> worker::Result<()> {
                     // both), so the second push clones the string
                     // instead of re-running the formatter.
                     let message = format_notice_message(&item, false);
-                    tg_notifications.push(PendingNotification {
+                    tg_notifications.push(dispatch::PendingNotification {
                         notice: item.clone(),
                         content_hash: new_hash.clone(),
                         message: message.clone(),
                     });
-                    fb_notifications.push(PendingNotification {
+                    fb_notifications.push(dispatch::PendingNotification {
                         notice: item,
                         content_hash: new_hash,
                         message,
@@ -965,7 +1180,7 @@ async fn run(env: &Env) -> worker::Result<()> {
                     // reuses this message when its is_edited matches.
                     let message = format_notice_message(&item, is_edited);
                     tg_message = Some((is_edited, message.clone()));
-                    tg_notifications.push(PendingNotification {
+                    tg_notifications.push(dispatch::PendingNotification {
                         notice: item.clone(),
                         content_hash: new_hash.clone(),
                         message,
@@ -984,7 +1199,7 @@ async fn run(env: &Env) -> worker::Result<()> {
                         Some((tg_edited, m)) if *tg_edited == is_edited => m.clone(),
                         _ => format_notice_message(&item, is_edited),
                     };
-                    fb_notifications.push(PendingNotification {
+                    fb_notifications.push(dispatch::PendingNotification {
                         notice: item,
                         content_hash: new_hash,
                         message,
@@ -994,18 +1209,35 @@ async fn run(env: &Env) -> worker::Result<()> {
         }
     }
 
-    let silent_backfills = silent_sync_links.len();
+    Ok(ReconcileOutcome {
+        statements,
+        tg_notifications,
+        fb_notifications,
+        silent_sync_links,
+    })
+}
 
-    // 6. Execute D1 batch upserts on the session.
-    // M8: if any upsert failed, D1 state is uncertain — dispatch is
-    // deferred to the next run instead of notifying for rows that may
-    // not have been written.
+/// Step 6 of `run_inner()`: executes the D1 batch upserts from
+/// [`reconcile_notices`], then the cold-start seed and silent
+/// hash-sync writes. Returns `(upsert_failed, metrics)` — M8: if any
+/// upsert failed, D1 state is uncertain, so the caller defers dispatch
+/// to the next run instead of notifying for rows that may not have
+/// been written.
+async fn apply_reconcile_writes(
+    db: &D1Database,
+    session: &D1DatabaseSession,
+    statements: Vec<D1PreparedStatement>,
+    silent_sync_links: Vec<(String, String, bool, bool)>,
+    links: &[String],
+    is_empty_db_seed: bool,
+) -> worker::Result<(bool, D1Metrics)> {
+    let mut metrics = D1Metrics::default();
     let mut upsert_failed = false;
     if !statements.is_empty() {
         let stmt_count = statements.len();
         let batch_metrics = enter_span_async("d1_batch_upsert", |span| async move {
             span.set_attribute("statements", stmt_count as i64);
-            match db::execute_batch(session_ref, statements).await {
+            match db::execute_batch(session, statements).await {
                 Ok(m) => {
                     span.set_attribute("rows_read", m.rows_read as i64);
                     span.set_attribute("rows_written", m.rows_written as i64);
@@ -1035,9 +1267,9 @@ async fn run(env: &Env) -> worker::Result<()> {
             );
         }
 
-        total_d1.rows_read += batch_metrics.rows_read;
-        total_d1.rows_written += batch_metrics.rows_written;
-        total_d1.failed_statements += batch_metrics.failed_statements;
+        metrics.rows_read += batch_metrics.rows_read;
+        metrics.rows_written += batch_metrics.rows_written;
+        metrics.failed_statements += batch_metrics.failed_statements;
     }
 
     // Cold-start seed: populate tracking fields for both platforms so subsequent runs
@@ -1045,9 +1277,9 @@ async fn run(env: &Env) -> worker::Result<()> {
     if is_empty_db_seed {
         let now = Utc::now().to_rfc3339();
         let mut seed_stmts = Vec::with_capacity(links.len());
-        for link in &links {
+        for link in links {
             let stmt = worker::query!(
-                &database,
+                db,
                 "UPDATE notices SET tg_sent_at = ?1, tg_last_notified_hash = content_hash, \
                  fb_sent_at = ?1, fb_last_notified_hash = content_hash WHERE link = ?2",
                 &now,
@@ -1055,9 +1287,9 @@ async fn run(env: &Env) -> worker::Result<()> {
             )?;
             seed_stmts.push(stmt);
         }
-        let seed_metrics = db::execute_batch(&session, seed_stmts).await?;
-        total_d1.rows_read += seed_metrics.rows_read;
-        total_d1.rows_written += seed_metrics.rows_written;
+        let seed_metrics = db::execute_batch(session, seed_stmts).await?;
+        metrics.rows_read += seed_metrics.rows_read;
+        metrics.rows_written += seed_metrics.rows_written;
     }
 
     // Apply silent hash updates after the batch upsert completes in a single batch.
@@ -1069,14 +1301,14 @@ async fn run(env: &Env) -> worker::Result<()> {
         let mut sync_stmts = Vec::with_capacity(silent_sync_links.len() * 2);
         for (url, hash, tg_needs_sync, fb_needs_sync) in &silent_sync_links {
             if *tg_needs_sync {
-                sync_stmts.push(db::build_tg_hash_sync_statement(&database, url, hash)?);
+                sync_stmts.push(db::build_tg_hash_sync_statement(db, url, hash)?);
             }
             if *fb_needs_sync {
-                sync_stmts.push(db::build_fb_hash_sync_statement(&database, url, hash)?);
+                sync_stmts.push(db::build_fb_hash_sync_statement(db, url, hash)?);
             }
         }
         let sync_stmt_count = sync_stmts.len();
-        let sync_metrics = db::execute_batch(&session, sync_stmts).await?;
+        let sync_metrics = db::execute_batch(session, sync_stmts).await?;
         if sync_metrics.failed_statements > 0 {
             // M8: a failed silent sync is not fatal — the next run
             // re-evaluates — but it must be visible, not swallowed.
@@ -1086,460 +1318,58 @@ async fn run(env: &Env) -> worker::Result<()> {
                 sync_stmt_count
             );
         }
-        total_d1.rows_read += sync_metrics.rows_read;
-        total_d1.rows_written += sync_metrics.rows_written;
-        total_d1.failed_statements += sync_metrics.failed_statements;
+        metrics.rows_read += sync_metrics.rows_read;
+        metrics.rows_written += sync_metrics.rows_written;
+        metrics.failed_statements += sync_metrics.failed_statements;
     }
 
-    let upsert_ms = elapsed_ms_since(phase_started);
-    phase_started = Utc::now();
+    Ok((upsert_failed, metrics))
+}
+/// High #1: sends the Telegram auth-failure admin alert at most once
+/// per `TELEGRAM_AUTH_ALERT_DEBOUNCE_HOURS`, following the same pattern
+/// as `send_debounced_detail_failure_alert` (and the Facebook debounced
+/// alerts). The timestamp is only recorded when the alert was actually
+/// delivered (or no admin chat is configured).
+///
+/// `pub(crate)` because `dispatch::flush_dispatch_side_effects` calls
+/// it after the dispatch join.
+pub(crate) async fn send_debounced_tg_auth_alert(
+    db: &D1Database,
+    session: &D1DatabaseSession,
+    secrets: &Secrets,
+    message: &str,
+) -> worker::Result<()> {
+    let now = Utc::now();
+    if let Some(last_alert_str) = db::get_app_state(session, TELEGRAM_AUTH_LAST_ALERT_KEY).await?
+        && !is_debounce_expired(
+            Some(&last_alert_str),
+            now,
+            TELEGRAM_AUTH_ALERT_DEBOUNCE_HOURS,
+        )
+    {
+        console_log!(
+            "Suppressing duplicate Telegram auth alert (last sent at {})",
+            last_alert_str
+        );
+        return Ok(());
+    }
 
-    // 7+8. Dispatch queued notifications.
-    // O3: the Telegram and Facebook phases overlap. Their wall time was
-    // 10x1.0s + 5x1.5s = 17.5s of sequential pacing; overlapped it is the
-    // longer of the two, with per-platform pacing unchanged.
-    // O1: each phase only *collects* D1 mark statements while sending;
-    // the marks are flushed sequentially after both phases finish, so no
-    // two D1 batches ever run concurrently on the same session.
-    // M8: both phases are skipped entirely when the upsert batch
-    // partially failed.
-    if !upsert_failed {
-        // Sequential D1 read before the overlap: the Facebook phase must
-        // not do D1 reads while Telegram is sending.
-        let fb_paused = if !fb_notifications.is_empty() && secrets.facebook.is_some() {
-            facebook::is_facebook_paused(&database, &session).await?
-        } else {
-            (false, None)
-        };
-        if fb_paused.0 {
-            console_log!(
-                "[Facebook Dispatch Skipped] {}",
-                fb_paused.1.as_deref().unwrap_or("paused")
+    let alert_sent = match telegram::send_admin_alert(secrets, message).await {
+        Ok(true) => true,
+        Ok(false) => secrets.telegram_admin_chat_id.is_none(),
+        Err(err) => {
+            console_warn!(
+                "[Telegram Auth Alert Failed] Failed to send Telegram auth alert: {err}; will retry on the next run."
             );
+            false
         }
+    };
 
-        tg_notifications.reverse();
-        fb_notifications.reverse();
-        let db_ref = &database;
-        let secrets_ref = &secrets;
-        let session_ref = &session;
-        let fb_secrets_ref = secrets.facebook.as_ref();
-        let fb_paused_flag = fb_paused.0;
-
-        // O3: both phases run concurrently; each only collects D1 marks.
-        let tg_future = async move {
-            if tg_notifications.is_empty() {
-                return Ok::<DispatchOutcome, worker::Error>(DispatchOutcome::default());
-            }
-            enter_span_async("dispatch_telegram_notifications", |span| async move {
-                span.set_attribute("queued", tg_notifications.len() as i64);
-                let mut outcome = DispatchOutcome::default();
-
-                for item in tg_notifications.into_iter().take(MAX_TELEGRAM_SENDS_PER_RUN) {
-                    if is_near_cpu_limit() {
-                        console_warn!(
-                            "[Telegram Deferred] Near CPU limit during Telegram dispatch; deferring remaining."
-                        );
-                        outcome.deferred_count += 1;
-                        break;
-                    }
-
-                    // O1: accumulate the attempt mark; flushed after the
-                    // phase instead of one round-trip per send.
-                    let attempt_now = Utc::now().to_rfc3339();
-                    match db::build_tg_attempt_statement(db_ref, &item.notice.url, &attempt_now)
-                    {
-                        Ok(stmt) => outcome.attempt_stmts.push(stmt),
-                        Err(err) => {
-                            console_warn!(
-                                "[Telegram Attempt Mark Failed] Could not build attempt mark for {}: {}; send continues.",
-                                item.notice.url, err
-                            );
-                        }
-                    }
-
-                    match telegram::send_notice_alert(secrets_ref, &item.message).await {
-                        Ok(true) => {
-                            // O1: accumulate the notified mark. M4: a
-                            // failed mark must not abort the rest of
-                            // dispatch — the send already happened, so
-                            // log it and continue; the notice may
-                            // re-send on the next run, which is safer
-                            // than dropping the remaining queue.
-                            let now = Utc::now().to_rfc3339();
-                            match db::build_tg_notified_statement(
-                                db_ref,
-                                &item.notice.url,
-                                &item.content_hash,
-                                &now,
-                            ) {
-                                Ok(stmt) => {
-                                    outcome.notified_stmts.push(stmt);
-                                    outcome.sent_count += 1;
-                                }
-                                Err(err) => {
-                                    console_error!(
-                                        "[Telegram Mark Failed] Send succeeded for {} but building its notified mark failed: {}; it may re-send on the next run.",
-                                        item.notice.url,
-                                        err
-                                    );
-                                    outcome.failed_count += 1;
-                                }
-                            }
-                        }
-                        Ok(false) => {
-                            console_warn!(
-                                "[Telegram Deferred] Rate limit hit for notice {}; deferring to next run.",
-                                item.notice.url
-                            );
-                            outcome.deferred_count += 1;
-                            break;
-                        }
-                        Err(err) => {
-                            console_error!(
-                                "[Telegram Send Failed] Telegram send failed for {}: {}",
-                                item.notice.url,
-                                err
-                            );
-                            outcome.failed_count += 1;
-                        }
-                    }
-                }
-
-                span.set_attribute("sent", outcome.sent_count as i64);
-                span.set_attribute("deferred", outcome.deferred_count as i64);
-                span.set_attribute("failed", outcome.failed_count as i64);
-                if outcome.failed_count > 0 {
-                    span.set_status(SpanStatus::Error(Some(format!(
-                        "{} sends failed",
-                        outcome.failed_count
-                    ))));
-                } else {
-                    span.set_status(SpanStatus::Ok);
-                }
-                Ok::<DispatchOutcome, worker::Error>(outcome)
-            })
-            .await
-        };
-
-        let fb_future = async move {
-            if fb_notifications.is_empty() || fb_secrets_ref.is_none() || fb_paused_flag {
-                return Ok::<DispatchOutcome, worker::Error>(DispatchOutcome::default());
-            }
-            let fb_secrets = fb_secrets_ref.expect("Facebook secrets present (checked above)");
-            enter_span_async("dispatch_facebook_notifications", |span| async move {
-                span.set_attribute("queued", fb_notifications.len() as i64);
-                let mut outcome = DispatchOutcome::default();
-
-                for item in fb_notifications.into_iter().take(MAX_FACEBOOK_SENDS_PER_RUN) {
-                    if is_near_cpu_limit() {
-                        console_warn!(
-                            "[Facebook Deferred] Near CPU limit during Facebook dispatch; deferring remaining."
-                        );
-                        outcome.deferred_count += 1;
-                        break;
-                    }
-
-                    // O1: accumulate the attempt mark; flushed after the
-                    // phase instead of one round-trip per send.
-                    let attempt_now = Utc::now().to_rfc3339();
-                    match db::build_fb_attempt_statement(db_ref, &item.notice.url, &attempt_now)
-                    {
-                        Ok(stmt) => outcome.attempt_stmts.push(stmt),
-                        Err(err) => {
-                            console_warn!(
-                                "[Facebook Attempt Mark Failed] Could not build attempt mark for {}: {}; send continues.",
-                                item.notice.url, err
-                            );
-                        }
-                    }
-
-                    // O5: the message was formatted once at queue time;
-                    // the Facebook phase no longer re-formats it.
-                    let message = &item.message;
-                    let post_outcome = facebook::publish_post(fb_secrets, message).await;
-
-                    match post_outcome {
-                        Ok(facebook::FacebookPostResult::Success { post_id, usage }) => {
-                            // O1: accumulate the notified mark. M4: same
-                            // log-and-continue rule as the Telegram
-                            // mark — a failed mark must not abort the
-                            // remaining dispatch.
-                            let now = Utc::now().to_rfc3339();
-                            match db::build_fb_notified_statement(
-                                db_ref,
-                                &item.notice.url,
-                                &item.content_hash,
-                                &post_id,
-                                &now,
-                            ) {
-                                Ok(stmt) => {
-                                    outcome.notified_stmts.push(stmt);
-                                    outcome.sent_count += 1;
-                                }
-                                Err(err) => {
-                                    console_error!(
-                                        "[Facebook Mark Failed] Post {} published for {} but building its notified mark failed: {}; it may re-send (and hit a 506 duplicate) on the next run.",
-                                        post_id,
-                                        item.notice.url,
-                                        err
-                                    );
-                                    outcome.failed_count += 1;
-                                }
-                            }
-
-                            if let Some(u) = usage {
-                                if u.is_approaching_limit() {
-                                    let until =
-                                        (Utc::now() + Duration::minutes(15)).to_rfc3339();
-                                    let _ = db::set_app_state(
-                                        db_ref,
-                                        session_ref,
-                                        "fb_cooldown_until",
-                                        &until,
-                                    )
-                                    .await;
-                                    console_warn!(
-                                        "[Facebook BUC High] Usage reached {}%; cooling down until {}.",
-                                        u.max_usage(),
-                                        until
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(facebook::FacebookPostResult::RateLimited { cooldown_minutes }) => {
-                            let until =
-                                (Utc::now() + Duration::minutes(cooldown_minutes)).to_rfc3339();
-                            let _ = db::set_app_state(
-                                db_ref,
-                                session_ref,
-                                "fb_cooldown_until",
-                                &until,
-                            )
-                            .await;
-                            console_warn!(
-                                "[Facebook Rate Limited] Setting cooldown until {} ({} mins).",
-                                until,
-                                cooldown_minutes
-                            );
-                            let _ = facebook::send_debounced_fb_admin_alert(
-                                db_ref,
-                                session_ref,
-                                secrets_ref,
-                                "rate_limit",
-                                &format!(
-                                    "⚠️ AIUB Notice Facebook: Rate limit reached. Dispatch paused until {until}."
-                                ),
-                            )
-                            .await;
-                            outcome.deferred_count += 1;
-                            break;
-                        }
-                        Ok(facebook::FacebookPostResult::SpamBlocked) => {
-                            let until = (Utc::now()
-                                + Duration::hours(FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS))
-                            .to_rfc3339();
-                            let _ = db::set_app_state(
-                                db_ref,
-                                session_ref,
-                                "fb_cooldown_until",
-                                &until,
-                            )
-                            .await;
-                            console_error!(
-                                "[Facebook Spam Block] Meta error 368: policy/spam block. Pausing until {}.",
-                                until
-                            );
-                            let _ = facebook::send_debounced_fb_admin_alert(
-                                db_ref,
-                                session_ref,
-                                secrets_ref,
-                                "spam_block",
-                                &format!(
-                                    "🚨 AIUB Notice Facebook: Meta blocked post for policy/spam (error 368). Dispatch paused until {until}. Please inspect Facebook Page!"
-                                ),
-                            )
-                            .await;
-                            outcome.failed_count += 1;
-                            break;
-                        }
-                        Ok(facebook::FacebookPostResult::Duplicate) => {
-                            console_warn!(
-                                "[Facebook Duplicate] Error 506 duplicate post for {}; marking handled.",
-                                item.notice.url
-                            );
-                            // O1: accumulate the duplicate-handled mark.
-                            // M4: log-and-continue — a failed mark must
-                            // not abort the remaining dispatch.
-                            let now = Utc::now().to_rfc3339();
-                            match db::build_fb_duplicate_handled_statement(
-                                db_ref,
-                                &item.notice.url,
-                                &item.content_hash,
-                                &now,
-                            ) {
-                                Ok(stmt) => outcome.duplicate_stmts.push(stmt),
-                                Err(err) => {
-                                    console_error!(
-                                        "[Facebook Duplicate Mark Failed] Could not build duplicate-handled mark for {}: {}; it will be retried on the next run.",
-                                        item.notice.url,
-                                        err
-                                    );
-                                    outcome.failed_count += 1;
-                                }
-                            }
-                            let _ = facebook::send_debounced_fb_admin_alert(
-                                db_ref,
-                                session_ref,
-                                secrets_ref,
-                                "duplicate_post",
-                                &format!(
-                                    "⚠️ AIUB Notice Facebook: Consecutive duplicate rejected by Meta (error 506): {}",
-                                    item.notice.url
-                                ),
-                            )
-                            .await;
-                        }
-                        Ok(facebook::FacebookPostResult::AuthError { message }) => {
-                            console_error!("[Facebook Auth Error] {}", message);
-                            // H2: store the pause with a timestamp so
-                            // is_facebook_paused() can expire it after
-                            // FACEBOOK_AUTH_PAUSE_TTL_HOURS.
-                            let pause_value = facebook::format_auth_pause_value(&message);
-                            let _ = db::set_app_state(
-                                db_ref,
-                                session_ref,
-                                FACEBOOK_AUTH_PAUSED_KEY,
-                                &pause_value,
-                            )
-                            .await;
-                            let _ = telegram::send_admin_alert(
-                                secrets_ref,
-                                &format!("🚨 AIUB Notice Facebook: Authentication paused: {message}"),
-                            )
-                            .await;
-                            outcome.failed_count += 1;
-                            break;
-                        }
-                        Ok(facebook::FacebookPostResult::TransientFailure { message }) => {
-                            console_warn!(
-                                "[Facebook Transient] Error: {}; will retry at next cron.",
-                                message
-                            );
-                            outcome.deferred_count += 1;
-                            break;
-                        }
-                        Ok(facebook::FacebookPostResult::UnknownError { message }) => {
-                            console_error!("[Facebook Unknown Error] {}", message);
-                            // M10: an unclassified Meta error previously
-                            // got no admin alert, no pause and no
-                            // cooldown — it failed silently every run
-                            // until someone noticed the logs. Route it
-                            // through the existing debounced FB admin
-                            // alert (6h, category "unknown_error") so
-                            // it is seen once without spamming. No
-                            // cooldown/pause is set: the error is
-                            // unclassified, so pausing could suppress
-                            // good posts for a transient Meta glitch.
-                            let _ = facebook::send_debounced_fb_admin_alert(
-                                db_ref,
-                                session_ref,
-                                secrets_ref,
-                                "unknown_error",
-                                &format!(
-                                    "⚠️ AIUB Notice Facebook: Unclassified Meta error, dispatch paused for this run (no cooldown set): {message}"
-                                ),
-                            )
-                            .await;
-                            outcome.failed_count += 1;
-                            break;
-                        }
-                        Err(err) => {
-                            console_error!(
-                                "[Facebook Worker Error] Failed to publish notice {}: {}",
-                                item.notice.url,
-                                err
-                            );
-                            outcome.failed_count += 1;
-                            break;
-                        }
-                    }
-                }
-
-                span.set_attribute("sent", outcome.sent_count as i64);
-                span.set_attribute("deferred", outcome.deferred_count as i64);
-                span.set_attribute("failed", outcome.failed_count as i64);
-                if outcome.failed_count > 0 {
-                    span.set_status(SpanStatus::Error(Some(format!(
-                        "{} sends failed",
-                        outcome.failed_count
-                    ))));
-                } else {
-                    span.set_status(SpanStatus::Ok);
-                }
-                Ok::<DispatchOutcome, worker::Error>(outcome)
-            })
-            .await
-        };
-
-        // O3: run both phases concurrently, then flush the collected
-        // marks sequentially (O1) — Telegram first, then Facebook.
-        let (tg_result, fb_result) = futures_util::future::join(tg_future, fb_future).await;
-        let tg_outcome = match tg_result {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                console_error!("[Telegram Dispatch Failed] {err}");
-                DispatchOutcome::default()
-            }
-        };
-        let fb_outcome = match fb_result {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                console_error!("[Facebook Dispatch Failed] {err}");
-                DispatchOutcome::default()
-            }
-        };
-        let tg_flush = flush_dispatch_marks(
-            &session,
-            "Telegram",
-            tg_outcome.attempt_stmts,
-            tg_outcome.notified_stmts,
-            tg_outcome.duplicate_stmts,
-        )
-        .await;
-        let fb_flush = flush_dispatch_marks(
-            &session,
-            "Facebook",
-            fb_outcome.attempt_stmts,
-            fb_outcome.notified_stmts,
-            fb_outcome.duplicate_stmts,
-        )
-        .await;
-        total_d1.rows_read += tg_flush.rows_read + fb_flush.rows_read;
-        total_d1.rows_written += tg_flush.rows_written + fb_flush.rows_written;
-        total_d1.failed_statements += tg_flush.failed_statements + fb_flush.failed_statements;
+    if alert_sent {
+        let now_str = now.to_rfc3339();
+        let m = db::set_app_state(db, session, TELEGRAM_AUTH_LAST_ALERT_KEY, &now_str).await?;
+        warn_if_app_state_partial(m, "Telegram auth alert timestamp");
     }
-
-    let dispatch_ms = elapsed_ms_since(phase_started);
-
-    console_log!(
-        "[Run Summary] rows_read={}, rows_written={}, failed_statements={}, silent_backfills={}, detail_succeeded={}, detail_http_errors={}, detail_parse_errors={}, fetch_ms={}, load_ms={}, detail_ms={}, upsert_ms={}, dispatch_ms={}, total_ms={}",
-        total_d1.rows_read,
-        total_d1.rows_written,
-        total_d1.failed_statements,
-        silent_backfills,
-        detail_succeeded_count,
-        detail_http_error_count,
-        detail_parse_error_count,
-        fetch_listing_ms,
-        load_existing_ms,
-        detail_fetch_ms,
-        upsert_ms,
-        dispatch_ms,
-        elapsed_ms_since(run_started)
-    );
-
     Ok(())
 }
 
@@ -1554,18 +1384,18 @@ async fn send_debounced_detail_failure_alert(
     message: &str,
 ) -> worker::Result<()> {
     let now = Utc::now();
-    if let Some(last_alert_str) = db::get_app_state(session, DETAIL_FAILURE_LAST_ALERT_KEY).await? {
-        if !is_debounce_expired(
+    if let Some(last_alert_str) = db::get_app_state(session, DETAIL_FAILURE_LAST_ALERT_KEY).await?
+        && !is_debounce_expired(
             Some(&last_alert_str),
             now,
             DETAIL_FAILURE_ALERT_DEBOUNCE_HOURS,
-        ) {
-            console_log!(
-                "Suppressing duplicate detail-failure alert (last sent at {})",
-                last_alert_str
-            );
-            return Ok(());
-        }
+        )
+    {
+        console_log!(
+            "Suppressing duplicate detail-failure alert (last sent at {})",
+            last_alert_str
+        );
+        return Ok(());
     }
 
     let alert_sent = match telegram::send_admin_alert(secrets, message).await {
@@ -1581,7 +1411,8 @@ async fn send_debounced_detail_failure_alert(
 
     if alert_sent {
         let now_str = now.to_rfc3339();
-        db::set_app_state(db, session, DETAIL_FAILURE_LAST_ALERT_KEY, &now_str).await?;
+        let m = db::set_app_state(db, session, DETAIL_FAILURE_LAST_ALERT_KEY, &now_str).await?;
+        warn_if_app_state_partial(m, "detail-failure alert timestamp");
     }
     Ok(())
 }
@@ -1787,14 +1618,13 @@ fn clean_mojibake(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c == '\u{00e2}' {
-            if let Some(&next_c) = chars.peek() {
-                if next_c == '\u{0080}' || next_c == '\u{0086}' {
-                    let _ = chars.next();
-                    let _ = chars.next();
-                    continue;
-                }
-            }
+        if c == '\u{00e2}'
+            && let Some(&next_c) = chars.peek()
+            && (next_c == '\u{0080}' || next_c == '\u{0086}')
+        {
+            let _ = chars.next();
+            let _ = chars.next();
+            continue;
         }
         if c.is_alphanumeric() {
             out.extend(c.to_lowercase());

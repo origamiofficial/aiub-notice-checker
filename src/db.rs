@@ -2,8 +2,9 @@ use chrono::Utc;
 use serde::Deserialize;
 use std::collections::HashMap;
 use worker::{
+    Result,
     d1::{D1Database, D1DatabaseSession, D1PreparedArgument, D1PreparedStatement, D1Type},
-    query, Result,
+    query,
 };
 
 use crate::config::D1_BIND_CHUNK_SIZE;

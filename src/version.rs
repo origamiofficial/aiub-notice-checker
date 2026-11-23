@@ -14,6 +14,7 @@ pub struct ReleaseVersion {
 }
 
 impl ReleaseVersion {
+    #[must_use]
     pub fn new(major: u64, minor: u8, patch: u8) -> Option<Self> {
         if minor > 9 || patch > 9 {
             return None;
@@ -26,6 +27,7 @@ impl ReleaseVersion {
     }
 
     /// Parses a version string like "5.9", "5.9.0", "v6.0.0".
+    #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         let trimmed = s.trim().trim_start_matches('v');
         let parts: Vec<&str> = trimmed.split('.').collect();
@@ -46,6 +48,7 @@ impl ReleaseVersion {
     }
 
     /// Computes the next version according to the single-digit rollover scheme.
+    #[must_use]
     pub fn next(&self, within_24h: bool) -> Self {
         let mut maj = self.major;
         let mut min = self.minor;
