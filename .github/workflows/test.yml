@@ -39,11 +39,8 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Setup Rust stable toolchain
+      - name: Setup Rust toolchain (from rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v6
