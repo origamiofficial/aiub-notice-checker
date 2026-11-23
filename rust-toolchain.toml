@@ -1,0 +1,14 @@
+# Pinned toolchain for reproducible local and CI builds.
+# Stable 1.100.0 matches Cargo.toml `rust-version = "1.100"` and edition 2024.
+# NOTE: nightly is still needed by `worker-build --panic-unwind` (see
+# wrangler.toml `[build] command`), so CI must keep a separate nightly
+# install step (rust-src component, wasm32-unknown-unknown target) until
+# that is revisited. This file pins stable only; it does not install
+# nightly, and no nightly toolchain is required locally to run
+# `cargo fmt`, `cargo test`, `cargo clippy`, or `cargo check --target
+# wasm32-unknown-unknown`.
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
+profile = "default"

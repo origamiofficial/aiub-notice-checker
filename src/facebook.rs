@@ -1,21 +1,22 @@
 use chrono::{Duration, Utc};
-use futures_util::future::{select, Either};
+use futures_util::future::{Either, select};
 use serde::Deserialize;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::time::Duration as StdDuration;
 use worker::{
-    console_log,
+    AbortController, Delay, Fetch, Headers, Method, Request, RequestInit, Result, console_log,
+    console_warn,
     d1::{D1Database, D1DatabaseSession},
-    AbortController, Delay, Fetch, Headers, Method, Request, RequestInit, Result,
 };
 
 use crate::config::{
-    FacebookSecrets, Secrets, FACEBOOK_ADMIN_ALERT_DEBOUNCE_HOURS, FACEBOOK_AUTH_PAUSED_KEY,
-    FACEBOOK_AUTH_PAUSE_TTL_HOURS, FACEBOOK_BUC_USAGE_THRESHOLD_PCT, FACEBOOK_COOLDOWN_UNTIL_KEY,
+    FACEBOOK_ADMIN_ALERT_DEBOUNCE_HOURS, FACEBOOK_AUTH_PAUSE_TTL_HOURS, FACEBOOK_AUTH_PAUSED_KEY,
+    FACEBOOK_BUC_MAX_COOLDOWN_MINS, FACEBOOK_BUC_USAGE_THRESHOLD_PCT, FACEBOOK_COOLDOWN_UNTIL_KEY,
     FACEBOOK_GRAPH_API_VERSION, FACEBOOK_PACE_MS, FACEBOOK_RATE_LIMIT_COOLDOWN_FALLBACK_MINS,
-    HTTP_TIMEOUT_MS,
+    FacebookSecrets, HTTP_TIMEOUT_MS, Secrets,
 };
 use crate::db;
+use crate::errors::AppError;
 use crate::telegram;
 
 /// Parsed Business Use Case (BUC) rate-limit usage from Meta's response headers.
@@ -29,6 +30,7 @@ pub struct BucUsage {
 
 impl BucUsage {
     /// Returns true if any rate-limit percentage reaches or exceeds the safe threshold.
+    #[must_use]
     pub fn is_approaching_limit(&self) -> bool {
         self.call_count >= FACEBOOK_BUC_USAGE_THRESHOLD_PCT
             || self.total_cputime >= FACEBOOK_BUC_USAGE_THRESHOLD_PCT
@@ -36,6 +38,7 @@ impl BucUsage {
     }
 
     /// Returns the highest single usage percentage across call count, cputime, and total time.
+    #[must_use]
     pub fn max_usage(&self) -> u8 {
         self.call_count.max(self.total_cputime).max(self.total_time)
     }
@@ -45,6 +48,7 @@ impl BucUsage {
 ///
 /// Example `X-Business-Use-Case-Usage` structure:
 /// `{"1234567890":[{"type":"pages","call_count":45,"total_cputime":30,"total_time":20,"estimated_time_to_regain_access":0}]}`
+#[must_use]
 pub fn parse_buc_usage_header(header_value: &str) -> Option<BucUsage> {
     let parsed: serde_json::Value = serde_json::from_str(header_value).ok()?;
 
@@ -72,7 +76,13 @@ pub fn parse_buc_usage_header(header_value: &str) -> Option<BucUsage> {
                         let estimated_time_to_regain_access = obj
                             .get("estimated_time_to_regain_access")
                             .and_then(|v| v.as_i64())
-                            .unwrap_or(0);
+                            .unwrap_or(0)
+                            // Medium #6: cap at the parse boundary —
+                            // the header value is untrusted input, and
+                            // an unbounded value would push the
+                            // cooldown Duration::minutes() in lib.rs
+                            // arbitrarily far into the future.
+                            .min(FACEBOOK_BUC_MAX_COOLDOWN_MINS);
 
                         return Some(BucUsage {
                             call_count,
@@ -87,31 +97,31 @@ pub fn parse_buc_usage_header(header_value: &str) -> Option<BucUsage> {
     }
 
     // Case 2: X-App-Usage (flat object: {"call_count": 45, "total_cputime": 30, "total_time": 20})
-    if let Some(obj) = parsed.as_object() {
-        if obj.contains_key("call_count") {
-            let call_count = obj
-                .get("call_count")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0)
-                .min(100) as u8;
-            let total_cputime = obj
-                .get("total_cputime")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0)
-                .min(100) as u8;
-            let total_time = obj
-                .get("total_time")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0)
-                .min(100) as u8;
+    if let Some(obj) = parsed.as_object()
+        && obj.contains_key("call_count")
+    {
+        let call_count = obj
+            .get("call_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .min(100) as u8;
+        let total_cputime = obj
+            .get("total_cputime")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .min(100) as u8;
+        let total_time = obj
+            .get("total_time")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            .min(100) as u8;
 
-            return Some(BucUsage {
-                call_count,
-                total_cputime,
-                total_time,
-                estimated_time_to_regain_access: 0,
-            });
-        }
+        return Some(BucUsage {
+            call_count,
+            total_cputime,
+            total_time,
+            estimated_time_to_regain_access: 0,
+        });
     }
 
     None
@@ -137,6 +147,7 @@ pub enum MetaErrorAction {
 }
 
 /// Classifies a Meta error code and optional subcode into a deterministic action.
+#[must_use]
 pub fn classify_meta_error(code: i64, subcode: Option<i64>) -> MetaErrorAction {
     match code {
         80001 | 32 | 4 | 17 | 341 | 613 => MetaErrorAction::RateLimitCooldown {
@@ -153,6 +164,7 @@ pub fn classify_meta_error(code: i64, subcode: Option<i64>) -> MetaErrorAction {
 
 /// Serialises an auth-pause value for `app_state.fb_auth_paused` as
 /// `<RFC3339 timestamp>|<message>`, so the pause can expire (H2).
+#[must_use]
 pub fn format_auth_pause_value(message: &str) -> String {
     format!("{}|{}", Utc::now().to_rfc3339(), message)
 }
@@ -160,6 +172,7 @@ pub fn format_auth_pause_value(message: &str) -> String {
 /// Parses a value produced by [`format_auth_pause_value`].
 /// Returns `(paused_at, message)`, or `None` for a legacy value that was
 /// stored before timestamps were added (a bare message with no `|`).
+#[must_use]
 pub fn parse_auth_pause_value(value: &str) -> Option<(chrono::DateTime<Utc>, String)> {
     let (ts, message) = value.split_once('|')?;
     let parsed = chrono::DateTime::parse_from_rfc3339(ts)
@@ -245,14 +258,30 @@ pub async fn publish_post(
 
     let fetch = Fetch::Request(req);
     let send_fut = fetch.send_with_signal(&signal);
-    let timeout_fut = Delay::from(StdDuration::from_millis(HTTP_TIMEOUT_MS));
+    // Medium #5: ONE shared 15s deadline covers `send()` AND the body
+    // read — a fresh Delay per phase previously allowed one post to
+    // take up to 30s. `select` returns the losing future, so the same
+    // Delay is reused for the body read below.
+    // `timeout` is a named local (not `pin!(...)` inline): the Pin
+    // borrowing it is returned by `select` and reused for the body read
+    // below, so it must outlive this statement.
+    let mut timeout = Delay::from(StdDuration::from_millis(HTTP_TIMEOUT_MS));
 
-    let mut resp = match select(pin!(send_fut), pin!(timeout_fut)).await {
-        Either::Left((res, _)) => res?,
+    let (mut resp, timeout_fut) = match select(pin!(send_fut), Pin::new(&mut timeout)).await {
+        Either::Left((res, timeout_fut)) => match res {
+            Ok(r) => (r, timeout_fut),
+            Err(e) => {
+                return Err(AppError::Fetch(telegram::redact_token(
+                    &e.to_string(),
+                    &fb_secrets.page_access_token,
+                ))
+                .into());
+            }
+        },
         Either::Right(((), _)) => {
             controller.abort();
             return Ok(FacebookPostResult::TransientFailure {
-                message: format!("Facebook API timeout after {}ms", HTTP_TIMEOUT_MS),
+                message: format!("Facebook API timeout after {HTTP_TIMEOUT_MS}ms"),
             });
         }
     };
@@ -261,16 +290,16 @@ pub async fn publish_post(
     // M9: the 15s timeout must cover the body read too, not just
     // `send()` — a stalled body stream previously hung the send past
     // the timeout. On timeout, treat it as transient (retry next run).
+    // The deadline is the same one started above, so send + body share
+    // 15s.
     let text_fut = resp.text();
-    let timeout_fut = Delay::from(StdDuration::from_millis(HTTP_TIMEOUT_MS));
-    let raw_body = match select(pin!(text_fut), pin!(timeout_fut)).await {
+    let raw_body = match select(pin!(text_fut), timeout_fut).await {
         Either::Left((res, _)) => res.unwrap_or_default(),
         Either::Right(((), _)) => {
             controller.abort();
             return Ok(FacebookPostResult::TransientFailure {
                 message: format!(
-                    "Facebook API timeout after {}ms reading response body",
-                    HTTP_TIMEOUT_MS
+                    "Facebook API timeout after {HTTP_TIMEOUT_MS}ms reading response body"
                 ),
             });
         }
@@ -476,7 +505,17 @@ pub async fn is_facebook_paused(
                         paused_at.to_rfc3339(),
                         age.num_hours()
                     );
-                    let _ = db::delete_app_state(db, session, FACEBOOK_AUTH_PAUSED_KEY).await;
+                    // Medium #4: a failed clear must be visible, not
+                    // swallowed — otherwise an expired pause that
+                    // failed to delete is silently re-checked every
+                    // run with no trace of why.
+                    if let Err(err) =
+                        db::delete_app_state(db, session, FACEBOOK_AUTH_PAUSED_KEY).await
+                    {
+                        console_warn!(
+                            "Failed to clear expired Facebook auth pause: {err}; the pause will be re-checked on the next run."
+                        );
+                    }
                 } else {
                     return Ok((true, Some(format!("Authentication paused: {message}"))));
                 }
@@ -486,7 +525,12 @@ pub async fn is_facebook_paused(
                 // it must not be allowed to pause posting forever. Clear it;
                 // a real auth failure will re-pause on the next attempt.
                 console_log!("Facebook auth pause has no timestamp (legacy value); clearing it.");
-                let _ = db::delete_app_state(db, session, FACEBOOK_AUTH_PAUSED_KEY).await;
+                if let Err(err) = db::delete_app_state(db, session, FACEBOOK_AUTH_PAUSED_KEY).await
+                {
+                    console_warn!(
+                        "Failed to clear legacy Facebook auth pause: {err}; the pause will be re-checked on the next run."
+                    );
+                }
             }
         }
     }
@@ -505,7 +549,13 @@ pub async fn is_facebook_paused(
                 ));
             }
             Some(false) => {
-                let _ = db::delete_app_state(db, session, FACEBOOK_COOLDOWN_UNTIL_KEY).await;
+                if let Err(err) =
+                    db::delete_app_state(db, session, FACEBOOK_COOLDOWN_UNTIL_KEY).await
+                {
+                    console_warn!(
+                        "Failed to clear expired Facebook cooldown: {err}; the cooldown will be re-checked on the next run."
+                    );
+                }
             }
             None => {
                 console_log!(
@@ -513,7 +563,13 @@ pub async fn is_facebook_paused(
                     FACEBOOK_COOLDOWN_UNTIL_KEY,
                     cooldown_until
                 );
-                let _ = db::delete_app_state(db, session, FACEBOOK_COOLDOWN_UNTIL_KEY).await;
+                if let Err(err) =
+                    db::delete_app_state(db, session, FACEBOOK_COOLDOWN_UNTIL_KEY).await
+                {
+                    console_warn!(
+                        "Failed to clear corrupt Facebook cooldown value: {err}; the cooldown will be re-checked on the next run."
+                    );
+                }
             }
         }
     }
@@ -555,7 +611,11 @@ pub async fn send_debounced_fb_admin_alert(
                     alert_key,
                     last_alert_str
                 );
-                let _ = db::delete_app_state(db, session, &alert_key).await;
+                if let Err(err) = db::delete_app_state(db, session, &alert_key).await {
+                    console_warn!(
+                        "Failed to clear corrupt FB alert timestamp {alert_key}: {err}; the alert debounce will be re-checked on the next run."
+                    );
+                }
             }
         }
     }
@@ -565,8 +625,14 @@ pub async fn send_debounced_fb_admin_alert(
         .unwrap_or(false);
     if alert_sent || secrets.telegram_admin_chat_id.is_none() {
         let now_str = now.to_rfc3339();
-        let _ = db::set_app_state(db, session, &alert_key, &now_str).await;
-        let _ = db::set_app_state(db, session, "fb_last_alert_at", &now_str).await;
+        // Medium #4: a failed timestamp write must be visible — a
+        // silently dropped write re-alerts on every run.
+        if let Err(err) = db::set_app_state(db, session, &alert_key, &now_str).await {
+            console_warn!("Failed to record FB alert timestamp {alert_key}: {err}");
+        }
+        if let Err(err) = db::set_app_state(db, session, "fb_last_alert_at", &now_str).await {
+            console_warn!("Failed to record FB alert timestamp fb_last_alert_at: {err}");
+        }
     }
     Ok(())
 }

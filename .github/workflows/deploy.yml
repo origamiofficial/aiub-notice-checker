@@ -34,19 +34,18 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
-      - name: Setup Rust stable & wasm32 target
+      - name: Setup Rust toolchain (from rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup pinned nightly for worker-build --panic-unwind
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
-
-      - name: Setup Rust nightly for worker-build --panic-unwind
-        uses: dtolnay/rust-toolchain@nightly
-        with:
+          toolchain: nightly-2026-11-23
           components: rust-src
           targets: wasm32-unknown-unknown
 
-      - name: Set stable as default toolchain
-        run: rustup default stable
+      - name: Set pinned stable as default toolchain
+        run: rustup default 1.100.0
 
       - name: Cache Cargo dependencies
         uses: actions/cache@v6

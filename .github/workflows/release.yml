@@ -149,23 +149,21 @@ jobs:
           echo "Tag at HEAD: $(git describe --tags --exact-match HEAD || echo '<none>')"
 
       # ── Setup toolchains ─────────────────────────────────────────
-      - name: Setup Rust stable toolchain
+      - name: Setup Rust toolchain (from rust-toolchain.toml)
+        if: steps.check_changes.outputs.has_worker_changes == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup pinned nightly for worker-build --panic-unwind
         if: steps.check_changes.outputs.has_worker_changes == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
-
-      - name: Setup Rust nightly for worker-build --panic-unwind
-        if: steps.check_changes.outputs.has_worker_changes == 'true'
-        uses: dtolnay/rust-toolchain@nightly
-        with:
+          toolchain: nightly-2026-11-23
           components: rust-src
           targets: wasm32-unknown-unknown
 
-      - name: Set stable as default toolchain
+      - name: Set pinned stable as default toolchain
         if: steps.check_changes.outputs.has_worker_changes == 'true'
-        run: rustup default stable
+        run: rustup default 1.100.0
 
       - name: Cache Cargo dependencies
         if: steps.check_changes.outputs.has_worker_changes == 'true'

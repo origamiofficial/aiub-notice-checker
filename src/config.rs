@@ -1,4 +1,7 @@
-use worker::{console_log, Env, Error, Result};
+use std::fmt;
+use worker::{Env, Error, Result, console_log};
+
+use crate::errors::AppError;
 
 pub const BASE_URL: &str = "https://www.aiub.edu";
 pub const BASE_HOST: &str = "www.aiub.edu";
@@ -36,6 +39,21 @@ pub const TELEGRAM_MAX_MESSAGE_LEN: usize = UNIFIED_MAX_MESSAGE_LEN;
 pub const TELEGRAM_PACE_MS: u64 = 1_000;
 pub const TELEGRAM_MAX_RETRIES: usize = 2;
 pub const TELEGRAM_MAX_RETRY_WAIT_SECS: u64 = 10;
+// Auth pause (tg_auth_paused): mirrors the Facebook fb_auth_paused
+// pattern — a 401/403 from the Bot API pauses Telegram dispatch for at
+// most 24h, so a revoked token cannot burn retries on every run, and a
+// transient blip cannot pause posting forever.
+pub const TELEGRAM_AUTH_PAUSE_TTL_HOURS: i64 = 24;
+pub const TELEGRAM_AUTH_PAUSED_KEY: &str = "tg_auth_paused";
+// Debounce for the Telegram auth-failure admin alert.
+pub const TELEGRAM_AUTH_LAST_ALERT_KEY: &str = "tg_auth_last_alert_at";
+pub const TELEGRAM_AUTH_ALERT_DEBOUNCE_HOURS: i64 = 6;
+
+// Run-level deadline (Medium #5): a single scheduled run must never run
+// unboundedly — per-fetch 15s caps alone still allow a pathological run
+// (50 detail fetches x retries, slow D1, dispatch pacing) to exceed the
+// Worker's CPU/time budget. `run()` selects against this deadline.
+pub const RUN_DEADLINE_SECS: u64 = 240;
 
 // Facebook Graph API configuration
 pub const FACEBOOK_GRAPH_API_VERSION: &str = "v27.0";
@@ -54,14 +72,33 @@ pub const FACEBOOK_TRANSIENT_RETRY_WAIT_MS: u64 = 2_000;
 pub const FACEBOOK_AUTH_PAUSE_TTL_HOURS: i64 = 24;
 pub const FACEBOOK_AUTH_PAUSED_KEY: &str = "fb_auth_paused";
 pub const FACEBOOK_COOLDOWN_UNTIL_KEY: &str = "fb_cooldown_until";
+// Cap on Meta's estimated_time_to_regain_access (Medium #6): the header
+// value is untrusted input, and an unbounded value would push the
+// cooldown `Duration::minutes()` in lib.rs arbitrarily far into the
+// future. 7 days is the longest a rate-limit cooldown may last.
+pub const FACEBOOK_BUC_MAX_COOLDOWN_MINS: i64 = 60 * 24 * 7;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+// Medium #9: no derived `Debug` — a derived impl would print the page
+// access token into logs/panics. `Secrets` already omits `Debug` for
+// the same reason. A hand-written impl redacts the token (the tests
+// need `Debug` for `assert_eq!` on `Option<FacebookSecrets>`).
+#[derive(Clone, PartialEq, Eq)]
 pub struct FacebookSecrets {
     pub page_id: String,
     pub page_access_token: String,
 }
 
+impl fmt::Debug for FacebookSecrets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FacebookSecrets")
+            .field("page_id", &self.page_id)
+            .field("page_access_token", &"[REDACTED]")
+            .finish()
+    }
+}
+
 impl FacebookSecrets {
+    #[must_use]
     pub fn from_raw(page_id: Option<&str>, page_access_token: Option<&str>) -> Option<Self> {
         let pid = page_id?.trim();
         let tok = page_access_token?.trim();
@@ -85,14 +122,17 @@ pub struct Secrets {
 
 impl Secrets {
     pub fn from_env(env: &Env) -> Result<Self> {
+        // Medium #3: keep the source error — the old code discarded it
+        // with `|_|`, so a missing secret and a failing secret store
+        // were indistinguishable in the logs.
         let telegram_bot_api_key = env
             .secret("TELEGRAM_BOT_API_KEY")
-            .map_err(|_| Error::RustError("Missing TELEGRAM_BOT_API_KEY secret".into()))?
+            .map_err(|e| AppError::Config(format!("missing TELEGRAM_BOT_API_KEY secret: {e}")))?
             .to_string();
 
         let telegram_chat_id = env
             .secret("TELEGRAM_CHAT_ID")
-            .map_err(|_| Error::RustError("Missing TELEGRAM_CHAT_ID secret".into()))?
+            .map_err(|e| AppError::Config(format!("missing TELEGRAM_CHAT_ID secret: {e}")))?
             .to_string();
 
         if telegram_bot_api_key.trim().is_empty() || telegram_chat_id.trim().is_empty() {
@@ -115,7 +155,9 @@ impl Secrets {
 
         let facebook = FacebookSecrets::from_raw(fb_page_id.as_deref(), fb_token.as_deref());
         if facebook.is_none() {
-            console_log!("Facebook secrets (FACEBOOK_PAGE_ID / FACEBOOK_PAGE_ACCESS_TOKEN) not configured; skipping Facebook dispatch.");
+            console_log!(
+                "Facebook secrets (FACEBOOK_PAGE_ID / FACEBOOK_PAGE_ACCESS_TOKEN) not configured; skipping Facebook dispatch."
+            );
         }
 
         Ok(Self {
