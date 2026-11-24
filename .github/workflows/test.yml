@@ -41,6 +41,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      - name: Check no secrets files are tracked
+        run: sh scripts/check-no-secrets.sh
+
       - name: Setup Rust toolchain (from rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
 
