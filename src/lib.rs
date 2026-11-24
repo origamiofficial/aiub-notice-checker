@@ -16,20 +16,21 @@ mod db;
 mod dispatch;
 pub mod errors;
 pub mod facebook;
+pub mod fetch;
 pub mod models;
 pub mod scraper;
 mod telegram;
 #[cfg(test)]
 mod tests;
-pub mod version;
 
 use config::{
     AIUB_OUTAGE_ALERT_THRESHOLD_MINS, AIUB_OUTAGE_ALERTED_KEY, AIUB_OUTAGE_DOWN_SINCE_KEY,
-    DETAIL_FAILURE_ALERT_DEBOUNCE_HOURS, DETAIL_FAILURE_LAST_ALERT_KEY, DETAIL_FAILURE_MIN_SAMPLE,
-    DETAIL_FAILURE_RATIO, DETAIL_RETRY_COOLDOWN_MINUTES, EMPTY_LISTING_ALERT_DEBOUNCE_HOURS,
-    EMPTY_LISTING_ALERT_KEY, MAX_DETAIL_FETCHES_PER_RUN, MIN_LISTING_DATE_COVERAGE,
-    MIN_LISTING_DESC_COVERAGE, RUN_DEADLINE_SECS, Secrets, TELEGRAM_AUTH_ALERT_DEBOUNCE_HOURS,
-    TELEGRAM_AUTH_LAST_ALERT_KEY,
+    COLD_START_SEED_INCOMPLETE_KEY, DETAIL_FAILURE_ALERT_DEBOUNCE_HOURS,
+    DETAIL_FAILURE_LAST_ALERT_KEY, DETAIL_FAILURE_MIN_SAMPLE, DETAIL_FAILURE_RATIO,
+    DETAIL_RETRY_COOLDOWN_MINUTES, DISPATCH_DEADLINE_BUFFER_SECS,
+    EMPTY_LISTING_ALERT_DEBOUNCE_HOURS, EMPTY_LISTING_ALERT_KEY, MAX_DETAIL_FETCHES_PER_RUN,
+    MIN_LISTING_DATE_COVERAGE, MIN_LISTING_DESC_COVERAGE, RUN_DEADLINE_SECS, Secrets,
+    TELEGRAM_AUTH_ALERT_DEBOUNCE_HOURS, TELEGRAM_AUTH_LAST_ALERT_KEY,
 };
 use errors::AppError;
 use models::{D1Metrics, Notice, NoticeRow, format_notice_message, titles_equivalent};
@@ -449,21 +450,34 @@ where
     }
 }
 
+/// Pure dispatch-deadline check (audit #2): dispatch must only start
+/// when at least `DISPATCH_DEADLINE_BUFFER_SECS` remain before the
+/// run-level deadline. The deadline drops `run_inner` wherever it is,
+/// including mid-flush, so entering the flush window without enough
+/// time left risks half-applied marks (duplicate sends, lost pauses).
+#[must_use]
+pub(crate) fn dispatch_deadline_exceeded(elapsed_ms: i64) -> bool {
+    elapsed_ms >= ((RUN_DEADLINE_SECS.saturating_sub(DISPATCH_DEADLINE_BUFFER_SECS)) * 1000) as i64
+}
+
 async fn run(env: &Env) -> worker::Result<()> {
     // Medium #5: run-level deadline. The per-fetch 15s caps do not
     // bound a whole run — slow D1, dispatch pacing and retries can
     // still push a run past the Worker's budget. Select the whole run
     // against a 240s deadline; on expiry the run future is dropped
-    // (any in-flight send is abandoned, and marks are never partially
-    // flushed — they only flush after the dispatch join) and the error
-    // is logged by `scheduled()`, exactly like any other `run()` error.
+    // wherever it is — including mid-flush, so a mark batch can be
+    // partially applied (audit #2 corrected the old "marks are never
+    // partially flushed" claim). Dispatch is only started when at
+    // least 30s remain (see `run_inner`), which bounds that window,
+    // and the error is logged by `scheduled()`, exactly like any
+    // other `run()` error.
     let run_fut = run_inner(env);
     let timeout_fut = Delay::from(std::time::Duration::from_secs(RUN_DEADLINE_SECS));
     match run_with_deadline(run_fut, timeout_fut).await {
         DeadlineOutcome::Finished(res) => res,
         DeadlineOutcome::Expired => {
             console_error!(
-                "[Run Deadline] Scheduled run exceeded the {RUN_DEADLINE_SECS}s run-level deadline; aborting. Any in-flight dispatch marks were not flushed, so affected notices may re-send on the next run."
+                "[Run Deadline] Scheduled run exceeded the {RUN_DEADLINE_SECS}s run-level deadline; aborting. The run may have been dropped mid-flush, so affected notices may re-send on the next run."
             );
             Err(AppError::Fetch(format!("run exceeded the {RUN_DEADLINE_SECS}s deadline")).into())
         }
@@ -608,8 +622,22 @@ async fn run_inner(env: &Env) -> worker::Result<()> {
     // two D1 batches ever run concurrently on the same session.
     // M8: both phases are skipped entirely when the upsert batch
     // partially failed.
-    if !upsert_failed {
-        let dispatch_metrics = dispatch::dispatch_both_phases(
+    // Audit #2: also skip dispatch when the run-level deadline is too
+    // close — the deadline drops the run wherever it is, including
+    // mid-flush, so starting dispatch without enough time left risks
+    // half-applied marks. The queued notices are simply re-queued on
+    // the next run.
+    let elapsed_ms = elapsed_ms_since(run_started);
+    let dispatch_deferred = dispatch_deadline_exceeded(elapsed_ms);
+    if dispatch_deferred {
+        console_warn!(
+            "[Dispatch Deferred] Run has used {elapsed_ms}ms of the {RUN_DEADLINE_SECS}s budget; deferring Telegram/Facebook dispatch to the next run so the deadline cannot drop the run mid-flush."
+        );
+    }
+    // Audit #13: the per-platform counts feed the Run Summary below.
+    let mut dispatch_counts = dispatch::DispatchCounts::default();
+    if !upsert_failed && !dispatch_deferred {
+        let (dispatch_metrics, counts) = dispatch::dispatch_both_phases(
             &database,
             &session,
             &secrets,
@@ -620,12 +648,13 @@ async fn run_inner(env: &Env) -> worker::Result<()> {
         total_d1.rows_read += dispatch_metrics.rows_read;
         total_d1.rows_written += dispatch_metrics.rows_written;
         total_d1.failed_statements += dispatch_metrics.failed_statements;
+        dispatch_counts = counts;
     }
 
     let dispatch_ms = elapsed_ms_since(phase_started);
 
     console_log!(
-        "[Run Summary] rows_read={}, rows_written={}, failed_statements={}, silent_backfills={}, detail_succeeded={}, detail_http_errors={}, detail_parse_errors={}, fetch_ms={}, load_ms={}, detail_ms={}, upsert_ms={}, dispatch_ms={}, total_ms={}",
+        "[Run Summary] rows_read={}, rows_written={}, failed_statements={}, silent_backfills={}, detail_succeeded={}, detail_http_errors={}, detail_parse_errors={}, tg_sent={}, tg_deferred={}, tg_failed={}, fb_sent={}, fb_deferred={}, fb_failed={}, fb_duplicates={}, fetch_ms={}, load_ms={}, detail_ms={}, upsert_ms={}, dispatch_ms={}, total_ms={}",
         total_d1.rows_read,
         total_d1.rows_written,
         total_d1.failed_statements,
@@ -633,6 +662,13 @@ async fn run_inner(env: &Env) -> worker::Result<()> {
         analysis.succeeded,
         analysis.http_errors,
         analysis.parse_errors,
+        dispatch_counts.tg_sent,
+        dispatch_counts.tg_deferred,
+        dispatch_counts.tg_failed,
+        dispatch_counts.fb_sent,
+        dispatch_counts.fb_deferred,
+        dispatch_counts.fb_failed,
+        dispatch_counts.fb_duplicates,
         fetch_listing_ms,
         load_existing_ms,
         detail_fetch_ms,
@@ -865,12 +901,18 @@ pub(crate) fn analyze_detail_results(
 /// whole table, not inferred from page-1 matches — a DB holding only
 /// older rows is not empty. On a COUNT failure, fall back to the page-1
 /// heuristic rather than failing the run. Returns true when this run
-/// should seed silently (empty DB and a full page of notices).
+/// should seed silently (empty DB and a full page of notices), or when
+/// a previous seed was incomplete (audit #1) — the flag is cleared only
+/// once a seed fully succeeds, so a partial seed is retried silently
+/// instead of flooding the unseeded rows as new notices.
 async fn detect_cold_start(
     session: &D1DatabaseSession,
     page1_empty: bool,
     listing_len: usize,
 ) -> bool {
+    if let Ok(Some(_)) = db::get_app_state(session, COLD_START_SEED_INCOMPLETE_KEY).await {
+        return true;
+    }
     let db_is_empty = match db::count_notices(session).await {
         Ok(n) => n == 0,
         Err(err) => {
@@ -1217,6 +1259,28 @@ fn reconcile_notices(
     })
 }
 
+/// Builds the cold-start seed statements (audit #1): one idempotent
+/// UPDATE per listing link, marking the row sent on both platforms.
+/// Extracted so the seed batch can be rebuilt for its one retry — the
+/// statements are consumed by `execute_batch`.
+fn build_seed_statements(
+    db: &D1Database,
+    links: &[String],
+    now: &str,
+) -> worker::Result<Vec<D1PreparedStatement>> {
+    let mut stmts = Vec::with_capacity(links.len());
+    for link in links {
+        stmts.push(worker::query!(
+            db,
+            "UPDATE notices SET tg_sent_at = ?1, tg_last_notified_hash = content_hash, \
+             fb_sent_at = ?1, fb_last_notified_hash = content_hash WHERE link = ?2",
+            now,
+            link,
+        )?);
+    }
+    Ok(stmts)
+}
+
 /// Step 6 of `run_inner()`: executes the D1 batch upserts from
 /// [`reconcile_notices`], then the cold-start seed and silent
 /// hash-sync writes. Returns `(upsert_failed, metrics)` — M8: if any
@@ -1274,22 +1338,61 @@ async fn apply_reconcile_writes(
 
     // Cold-start seed: populate tracking fields for both platforms so subsequent runs
     // never flood historical notices onto Telegram or Facebook.
+    // Audit #1: the seed batch used to swallow partial failures — a
+    // failed statement left its row unseeded and the next run posted it
+    // as new, with no metric or log line. The batch is retried once
+    // (the UPDATEs are idempotent), its failures are counted and
+    // warned about like the silent sync below, and a still-incomplete
+    // seed persists a flag so the next run re-seeds silently.
     if is_empty_db_seed {
         let now = Utc::now().to_rfc3339();
-        let mut seed_stmts = Vec::with_capacity(links.len());
-        for link in links {
-            let stmt = worker::query!(
-                db,
-                "UPDATE notices SET tg_sent_at = ?1, tg_last_notified_hash = content_hash, \
-                 fb_sent_at = ?1, fb_last_notified_hash = content_hash WHERE link = ?2",
-                &now,
-                link,
-            )?;
-            seed_stmts.push(stmt);
+        let seed_stmt_count = links.len();
+        let mut seed_metrics =
+            db::execute_batch(session, build_seed_statements(db, links, &now)?).await;
+        if matches!(&seed_metrics, Ok(m) if m.failed_statements > 0) || seed_metrics.is_err() {
+            console_warn!(
+                "[Cold-Start Seed Retry] Seed batch failed or partially failed; retrying once."
+            );
+            seed_metrics =
+                db::execute_batch(session, build_seed_statements(db, links, &now)?).await;
         }
-        let seed_metrics = db::execute_batch(session, seed_stmts).await?;
+        let seed_metrics = match seed_metrics {
+            Ok(m) => m,
+            Err(err) => {
+                // The run aborts, but the flag makes the next run
+                // re-seed instead of flooding the unseeded rows.
+                if let Err(flag_err) =
+                    db::set_app_state(db, session, COLD_START_SEED_INCOMPLETE_KEY, &now).await
+                {
+                    console_warn!(
+                        "[Cold-Start Seed Flag Failed] Could not persist seed-incomplete flag: {flag_err}"
+                    );
+                }
+                return Err(err);
+            }
+        };
+        if seed_metrics.failed_statements > 0 {
+            console_warn!(
+                "[Cold-Start Seed Partial Failure] {}/{} seed statements failed after one retry; affected rows will be re-seeded on the next run.",
+                seed_metrics.failed_statements,
+                seed_stmt_count
+            );
+            match db::set_app_state(db, session, COLD_START_SEED_INCOMPLETE_KEY, &now).await {
+                Ok(m) => warn_if_app_state_partial(m, "cold-start seed-incomplete flag"),
+                Err(err) => console_warn!(
+                    "[Cold-Start Seed Flag Failed] Could not persist seed-incomplete flag: {err}"
+                ),
+            }
+        } else if let Err(err) =
+            db::delete_app_state(db, session, COLD_START_SEED_INCOMPLETE_KEY).await
+        {
+            console_warn!(
+                "[Cold-Start Seed Flag Failed] Could not clear seed-incomplete flag: {err}; the next run will re-seed silently."
+            );
+        }
         metrics.rows_read += seed_metrics.rows_read;
         metrics.rows_written += seed_metrics.rows_written;
+        metrics.failed_statements += seed_metrics.failed_statements;
     }
 
     // Apply silent hash updates after the batch upsert completes in a single batch.
@@ -1358,8 +1461,12 @@ pub(crate) async fn send_debounced_tg_auth_alert(
         Ok(true) => true,
         Ok(false) => secrets.telegram_admin_chat_id.is_none(),
         Err(err) => {
+            // Audit #10: this retry happens on the next run while the
+            // Telegram pause is set (see dispatch_both_phases) — the
+            // old claim of a retry was false while dispatch was
+            // skipped entirely during the pause.
             console_warn!(
-                "[Telegram Auth Alert Failed] Failed to send Telegram auth alert: {err}; will retry on the next run."
+                "[Telegram Auth Alert Failed] Failed to send Telegram auth alert: {err}; will retry on the next run while Telegram is paused."
             );
             false
         }

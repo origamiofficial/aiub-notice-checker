@@ -29,13 +29,16 @@ pub const DETAIL_FAILURE_ALERT_DEBOUNCE_HOURS: i64 = 6;
 pub const AIUB_OUTAGE_ALERT_THRESHOLD_MINS: i64 = 60;
 pub const AIUB_OUTAGE_DOWN_SINCE_KEY: &str = "aiub_down_since";
 pub const AIUB_OUTAGE_ALERTED_KEY: &str = "aiub_outage_alerted";
+// Cold-start seed guard (audit #1): set when a seed batch partially
+// failed, so the next run re-seeds silently instead of flooding the
+// unseeded rows as new notices. Cleared once a seed fully succeeds.
+pub const COLD_START_SEED_INCOMPLETE_KEY: &str = "cold_start_seed_incomplete";
 // Debounce for the "0 notices parsed" admin alert (M2): a DOM break must not
 // alert on every 5-minute run.
 pub const EMPTY_LISTING_ALERT_KEY: &str = "empty_listing_last_alert_at";
 pub const EMPTY_LISTING_ALERT_DEBOUNCE_HOURS: i64 = 6;
 
 pub const UNIFIED_MAX_MESSAGE_LEN: usize = 4096;
-pub const TELEGRAM_MAX_MESSAGE_LEN: usize = UNIFIED_MAX_MESSAGE_LEN;
 pub const TELEGRAM_PACE_MS: u64 = 1_000;
 pub const TELEGRAM_MAX_RETRIES: usize = 2;
 pub const TELEGRAM_MAX_RETRY_WAIT_SECS: u64 = 10;
@@ -54,17 +57,20 @@ pub const TELEGRAM_AUTH_ALERT_DEBOUNCE_HOURS: i64 = 6;
 // (50 detail fetches x retries, slow D1, dispatch pacing) to exceed the
 // Worker's CPU/time budget. `run()` selects against this deadline.
 pub const RUN_DEADLINE_SECS: u64 = 240;
+// Audit #2: dispatch must only start when at least this much time
+// remains before the run-level deadline — the deadline drops the run
+// wherever it is, including mid-flush, so entering the flush window
+// without enough time left risks half-applied marks.
+pub const DISPATCH_DEADLINE_BUFFER_SECS: u64 = 30;
 
 // Facebook Graph API configuration
 pub const FACEBOOK_GRAPH_API_VERSION: &str = "v27.0";
 pub const MAX_FACEBOOK_SENDS_PER_RUN: usize = 5;
 pub const FACEBOOK_PACE_MS: u64 = 1_500;
-pub const FACEBOOK_MAX_MESSAGE_LEN: usize = UNIFIED_MAX_MESSAGE_LEN;
 pub const FACEBOOK_BUC_USAGE_THRESHOLD_PCT: u8 = 80;
 pub const FACEBOOK_RATE_LIMIT_COOLDOWN_FALLBACK_MINS: i64 = 60;
 pub const FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS: i64 = 12;
 pub const FACEBOOK_ADMIN_ALERT_DEBOUNCE_HOURS: i64 = 6;
-pub const FACEBOOK_TRANSIENT_RETRY_WAIT_MS: u64 = 2_000;
 // Auth pause (fb_auth_paused) must never last forever (H2): a pause older
 // than this is treated as expired and cleared, so a transient auth blip
 // cannot permanently kill Facebook posting. A genuine auth failure will

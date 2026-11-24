@@ -80,6 +80,30 @@ mod scraper_tests {
         );
     }
 
+    // ── Audit #6: an unparsable <time> must not block the .date fallback ──
+
+    #[test]
+    fn parse_listing_time_holding_clock_time_falls_back_to_date() {
+        let html = r#"
+        <html><body>
+        <div class="notification">
+            <a class="info-link" href="/notice/clock-time-date">Link</a>
+            <h2 class="title">Clock Time Notice</h2>
+            <p class="desc">Short description.</p>
+            <time>10:30 AM</time>
+            <div class="date">24 November 2026</div>
+        </div>
+        </body></html>
+        "#;
+        let notices = parse_listing_html(html);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            notices[0].published_date,
+            Some("2026-11-24".to_string()),
+            "a <time> holding a clock time must fall through to .date"
+        );
+    }
+
     #[test]
     fn parse_listing_multiple_notifications() {
         let html = r#"
@@ -353,6 +377,33 @@ mod scraper_tests {
         );
     }
 
+    // ── Audit #6: an unparsable <time> must not block the .date fallback ──
+
+    #[test]
+    fn parse_detail_time_holding_clock_time_falls_back_to_date() {
+        let html = r#"
+        <html><body>
+        <h1 id="dynamicHeading">Clock Time Detail</h1>
+        <div class="notice-page">
+            <div class="question-column notice-sticky-header">
+                <time>10:30 AM</time>
+                <div class="date">24 November 2026</div>
+            </div>
+            <div class="question-column">
+                <p>This is the body text of the notice.</p>
+            </div>
+        </div>
+        </body></html>
+        "#;
+        let detail =
+            parse_detail_html(html, "https://www.aiub.edu/notice/test").expect("should parse");
+        assert_eq!(
+            detail.published_date,
+            Some("2026-11-24".to_string()),
+            "a <time> holding a clock time must fall through to .date"
+        );
+    }
+
     #[test]
     fn parse_detail_extracts_attachments() {
         let html = r#"
@@ -601,6 +652,27 @@ mod scraper_tests {
     fn normalize_notice_url_strips_trailing_slash() {
         let url = normalize_notice_url("https://www.aiub.edu/notice/test/");
         assert_eq!(url, "https://www.aiub.edu/notice/test");
+    }
+
+    // ── Audit #5: scheme-less host hrefs and slash-before-query ──────
+
+    #[test]
+    fn normalize_notice_url_scheme_less_bare_host() {
+        // "www.aiub.edu/notice/x" must not become
+        // https://www.aiub.edu/www.aiub.edu/notice/x.
+        let url = normalize_notice_url("www.aiub.edu/notice/bare-domain");
+        assert_eq!(url, "https://www.aiub.edu/notice/bare-domain");
+    }
+
+    #[test]
+    fn normalize_notice_url_slash_before_query_matches_plain_query() {
+        let with_slash = normalize_notice_url("https://www.aiub.edu/notice/test/?a=1");
+        let plain = normalize_notice_url("https://www.aiub.edu/notice/test?a=1");
+        assert_eq!(with_slash, "https://www.aiub.edu/notice/test?a=1");
+        assert_eq!(
+            with_slash, plain,
+            "one notice must not split into two links"
+        );
     }
 
     #[test]
@@ -1150,8 +1222,35 @@ mod notice_row_tests {
     #[test]
     fn detail_due_already_fetched() {
         let row = make_row(Some("2026-01-01T00:00:00Z"), Some("2026-01-01T00:00:00Z"));
-        // When checked == fetched, the third match arm (`_ => true`) applies
+        // Checked == fetched an hour before the cutoff: due.
         assert!(row.detail_due("2026-01-01T01:00:00Z"));
+    }
+
+    // ── Audit #8: checked == fetched must respect the cooldown ───────
+
+    #[test]
+    fn detail_due_just_fetched_is_not_due() {
+        // Cutoff 01:00 (= now 01:30 minus the 30-minute cooldown).
+        // Checked == fetched at 01:25 — fetched 5 minutes ago, inside
+        // the cooldown — must NOT be due. Before the fix the catch-all
+        // arm returned true here unconditionally.
+        let row = make_row(Some("2026-01-01T01:25:00Z"), Some("2026-01-01T01:25:00Z"));
+        assert!(
+            !row.detail_due("2026-01-01T01:00:00Z"),
+            "row fetched 5 minutes ago must not be due"
+        );
+        // Same, with only the fetched timestamp present.
+        let row = make_row(None, Some("2026-01-01T01:25:00Z"));
+        assert!(
+            !row.detail_due("2026-01-01T01:00:00Z"),
+            "fetched-only row inside the cooldown must not be due"
+        );
+        // But once the last check is older than the cutoff, it is due.
+        let row = make_row(Some("2026-01-01T00:30:00Z"), Some("2026-01-01T00:30:00Z"));
+        assert!(
+            row.detail_due("2026-01-01T01:00:00Z"),
+            "row last checked before the cutoff is due"
+        );
     }
 
     #[test]
@@ -1393,7 +1492,9 @@ mod lib_tests {
 #[cfg(test)]
 mod run_decision_tests {
     use crate::models::{Notice, NoticeRow};
-    use crate::{platform_notification, select_detail_targets, silent_sync_flags};
+    use crate::{
+        dispatch_deadline_exceeded, platform_notification, select_detail_targets, silent_sync_flags,
+    };
     use std::collections::HashMap;
 
     fn notice(url: &str, title: &str) -> Notice {
@@ -1430,6 +1531,17 @@ mod run_decision_tests {
         let mut n = notice(url, title);
         n.detail_fetched = true;
         n
+    }
+
+    // ── Audit #2: dispatch-deadline buffer ───────────────────────────
+
+    #[test]
+    fn dispatch_deadline_exceeded_only_when_buffer_gone() {
+        // 240s deadline, 30s buffer: dispatch may start up to 210s in.
+        assert!(!dispatch_deadline_exceeded(0));
+        assert!(!dispatch_deadline_exceeded(209_999));
+        assert!(dispatch_deadline_exceeded(210_000));
+        assert!(dispatch_deadline_exceeded(300_000));
     }
 
     // ── Priority A: brand-new notices ────────────────────────────────
@@ -1713,13 +1825,11 @@ mod config_tests {
         assert!((0.0..=1.0).contains(&MIN_LISTING_DATE_COVERAGE));
         assert!((0.0..=1.0).contains(&MIN_LISTING_DESC_COVERAGE));
         assert!((0.0..=1.0).contains(&DETAIL_FAILURE_RATIO));
-        assert!(TELEGRAM_MAX_MESSAGE_LEN > 100);
 
         // Facebook configuration checks
         assert_eq!(FACEBOOK_GRAPH_API_VERSION, "v27.0");
         assert!(MAX_FACEBOOK_SENDS_PER_RUN > 0 && MAX_FACEBOOK_SENDS_PER_RUN <= 10);
         assert!(FACEBOOK_PACE_MS >= 1000);
-        assert!(FACEBOOK_MAX_MESSAGE_LEN >= 1000);
         assert!(FACEBOOK_BUC_USAGE_THRESHOLD_PCT >= 50 && FACEBOOK_BUC_USAGE_THRESHOLD_PCT <= 100);
         assert!(FACEBOOK_RATE_LIMIT_COOLDOWN_FALLBACK_MINS > 0);
         assert!(FACEBOOK_SPAM_BLOCK_COOLDOWN_HOURS > 0);
@@ -1728,94 +1838,11 @@ mod config_tests {
 }
 
 #[cfg(test)]
-mod version_tests {
-    use crate::version::ReleaseVersion;
-
-    #[test]
-    fn parse_legacy_xy_format() {
-        let v = ReleaseVersion::parse("5.9").expect("valid version");
-        assert_eq!(
-            v,
-            ReleaseVersion {
-                major: 5,
-                minor: 9,
-                patch: 0
-            }
-        );
-    }
-
-    #[test]
-    fn parse_semver_xyz_format() {
-        let v = ReleaseVersion::parse("6.1.2").expect("valid version");
-        assert_eq!(
-            v,
-            ReleaseVersion {
-                major: 6,
-                minor: 1,
-                patch: 2
-            }
-        );
-    }
-
-    #[test]
-    fn parse_with_v_prefix() {
-        let v = ReleaseVersion::parse("v7.8.9").expect("valid version");
-        assert_eq!(
-            v,
-            ReleaseVersion {
-                major: 7,
-                minor: 8,
-                patch: 9
-            }
-        );
-    }
-
-    #[test]
-    fn parse_rejects_dual_digits_for_minor_and_patch() {
-        assert!(ReleaseVersion::parse("6.10.0").is_none());
-        assert!(ReleaseVersion::parse("6.1.10").is_none());
-    }
-
-    #[test]
-    fn single_digit_rollover_on_same_day_release() {
-        // 7.8.9 same day -> 7.9.0 (Z rolls over to 0, Y increments)
-        let v = ReleaseVersion::new(7, 8, 9).unwrap().next(true);
-        assert_eq!(v.to_string(), "7.9.0");
-
-        // 7.9.9 same day -> 8.0.0 (both Z and Y roll over)
-        let v = ReleaseVersion::new(7, 9, 9).unwrap().next(true);
-        assert_eq!(v.to_string(), "8.0.0");
-
-        // 6.0.0 same day -> 6.0.1 (normal hotfix)
-        let v = ReleaseVersion::new(6, 0, 0).unwrap().next(true);
-        assert_eq!(v.to_string(), "6.0.1");
-    }
-
-    #[test]
-    fn single_digit_rollover_on_new_day_release() {
-        // 5.9.0 after >= 24h -> 6.0.0 (Y rolls over to 0, X increments)
-        let v = ReleaseVersion::new(5, 9, 0).unwrap().next(false);
-        assert_eq!(v.to_string(), "6.0.0");
-
-        // 6.0.1 after >= 24h -> 6.1.0 (Y increments, Z resets to 0)
-        let v = ReleaseVersion::new(6, 0, 1).unwrap().next(false);
-        assert_eq!(v.to_string(), "6.1.0");
-
-        // 6.9.5 after >= 24h -> 7.0.0 (Y rolls over to 0, X increments)
-        let v = ReleaseVersion::new(6, 9, 5).unwrap().next(false);
-        assert_eq!(v.to_string(), "7.0.0");
-
-        // Large major version: 12.9.0 -> 13.0.0
-        let v = ReleaseVersion::new(12, 9, 0).unwrap().next(false);
-        assert_eq!(v.to_string(), "13.0.0");
-    }
-}
-
-#[cfg(test)]
 mod facebook_tests {
-    use crate::config::{FACEBOOK_MAX_MESSAGE_LEN, FacebookSecrets};
+    use crate::config::{FacebookSecrets, UNIFIED_MAX_MESSAGE_LEN};
     use crate::facebook::{
-        MetaErrorAction, classify_meta_error, parse_buc_usage_header, stored_time_is_after,
+        MetaErrorAction, classify_meta_error, parse_buc_usage_header, parse_post_id,
+        stored_time_is_after,
     };
     use crate::models::{Notice, format_facebook_message};
 
@@ -1935,10 +1962,10 @@ mod facebook_tests {
 
         let msg = format_facebook_message(&notice, false);
         assert!(
-            msg.chars().count() <= FACEBOOK_MAX_MESSAGE_LEN,
+            msg.chars().count() <= UNIFIED_MAX_MESSAGE_LEN,
             "Message length {} exceeds max {}",
             msg.chars().count(),
-            FACEBOOK_MAX_MESSAGE_LEN
+            UNIFIED_MAX_MESSAGE_LEN
         );
         // Ellipsis appended to truncated body
         assert!(msg.contains("..."));
@@ -1994,6 +2021,41 @@ mod facebook_tests {
         assert_eq!(usage.call_count, 85);
         assert!(usage.is_approaching_limit());
         assert_eq!(usage.max_usage(), 85);
+    }
+
+    // ── Audit #14: aggregate across all BUC entries ──────────────────
+
+    #[test]
+    fn parse_buc_usage_header_aggregates_multiple_entries() {
+        // Two buckets: the first is cool, the second is hot with a
+        // 120-minute regain estimate. The max of each field wins —
+        // the first entry must not mask the hot bucket.
+        let header = r#"{"111":[{"type":"pages","call_count":45,"total_cputime":30,"total_time":20,"estimated_time_to_regain_access":0}],"222":[{"type":"pages","call_count":95,"total_cputime":10,"total_time":10,"estimated_time_to_regain_access":120}]}"#;
+        let usage = parse_buc_usage_header(header).expect("valid BUC header");
+        assert_eq!(usage.call_count, 95);
+        assert_eq!(usage.total_cputime, 30);
+        assert_eq!(usage.total_time, 20);
+        assert_eq!(usage.estimated_time_to_regain_access, 120);
+        assert!(usage.is_approaching_limit());
+        assert_eq!(usage.max_usage(), 95);
+    }
+
+    // ── Audit #3: a 2xx without a post id is not proof of posting ────
+
+    #[test]
+    fn parse_post_id_requires_non_empty_id() {
+        assert_eq!(
+            parse_post_id(r#"{"id":"123_456"}"#).as_deref(),
+            Some("123_456")
+        );
+        assert_eq!(parse_post_id("{}"), None, "missing id");
+        assert_eq!(parse_post_id(r#"{"id":""}"#), None, "empty id");
+        assert_eq!(parse_post_id(r#"{"id":null}"#), None, "null id");
+        assert_eq!(
+            parse_post_id("<html>error page</html>"),
+            None,
+            "unparsable body"
+        );
     }
 
     #[test]
@@ -2326,6 +2388,188 @@ mod db_tests {
         assert_eq!(m.failed_statements, 0);
         assert_eq!(m.rows_read, 0);
         assert_eq!(m.rows_written, 0);
+    }
+
+    // ── Audit #15: the three upsert branches, behaviourally ─────────
+    //
+    // One SQLite test per branch of build_upsert_statement() (via
+    // upsert_statement_sql()), executing the mirror SQL against a real
+    // in-memory SQLite database — a one-placeholder slip in a
+    // 12-column upsert used to compile fine and only fail live.
+
+    fn upsert_test_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory SQLite");
+        conn.execute_batch(
+            "CREATE TABLE notices (
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                link TEXT PRIMARY KEY,
+                published_date TEXT,
+                body_text TEXT NOT NULL DEFAULT '',
+                attachments_json TEXT NOT NULL DEFAULT '[]',
+                content_hash TEXT NOT NULL DEFAULT '',
+                first_seen_at TEXT NOT NULL DEFAULT '',
+                last_seen_at TEXT NOT NULL DEFAULT '',
+                detail_checked_at TEXT,
+                detail_fetched_at TEXT,
+                content_changed_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .expect("create notices table");
+        conn
+    }
+
+    struct UpsertRow {
+        title: String,
+        body_text: String,
+        attachments_json: String,
+        content_hash: String,
+        published_date: Option<String>,
+        last_seen_at: String,
+        detail_checked_at: Option<String>,
+        detail_fetched_at: Option<String>,
+        content_changed_at: String,
+    }
+
+    fn read_upsert_row(conn: &rusqlite::Connection, link: &str) -> UpsertRow {
+        conn.query_row(
+            "SELECT title, body_text, attachments_json, content_hash, published_date, \
+             last_seen_at, detail_checked_at, detail_fetched_at, content_changed_at \
+             FROM notices WHERE link = ?1",
+            rusqlite::params![link],
+            |row| {
+                Ok(UpsertRow {
+                    title: row.get(0)?,
+                    body_text: row.get(1)?,
+                    attachments_json: row.get(2)?,
+                    content_hash: row.get(3)?,
+                    published_date: row.get(4)?,
+                    last_seen_at: row.get(5)?,
+                    detail_checked_at: row.get(6)?,
+                    detail_fetched_at: row.get(7)?,
+                    content_changed_at: row.get(8)?,
+                })
+            },
+        )
+        .expect("read upsert row")
+    }
+
+    #[test]
+    fn upsert_detail_fetched_stores_body_and_fetched_at() {
+        use rusqlite::params;
+        let conn = upsert_test_conn();
+        let link = "https://www.aiub.edu/notice/1";
+        let now = "2026-11-21T12:00:00Z";
+        conn.execute(
+            crate::db::upsert_statement_sql(true, true),
+            params![
+                "Title",
+                "Desc",
+                link,
+                "2026-11-15",
+                "Body text",
+                "[\"a.pdf\"]",
+                "hash1",
+                now
+            ],
+        )
+        .expect("insert fetched row");
+        let row = read_upsert_row(&conn, link);
+        assert_eq!(row.body_text, "Body text");
+        assert_eq!(row.attachments_json, "[\"a.pdf\"]");
+        assert_eq!(row.detail_fetched_at.as_deref(), Some(now));
+        assert_eq!(row.detail_checked_at.as_deref(), Some(now));
+
+        // Conflict update with a new hash: body/hash update, the empty
+        // date keeps the stored date (COALESCE), and content_changed_at
+        // moves because the hash changed.
+        let now2 = "2026-11-21T12:05:00Z";
+        conn.execute(
+            crate::db::upsert_statement_sql(true, true),
+            params!["Title v2", "Desc", link, "", "Body v2", "[]", "hash2", now2],
+        )
+        .expect("update fetched row");
+        let row = read_upsert_row(&conn, link);
+        assert_eq!(row.title, "Title v2");
+        assert_eq!(row.body_text, "Body v2");
+        assert_eq!(row.content_hash, "hash2");
+        assert_eq!(
+            row.published_date.as_deref(),
+            Some("2026-11-15"),
+            "an empty date on update must keep the stored date"
+        );
+        assert_eq!(
+            row.content_changed_at, now2,
+            "a hash change must move content_changed_at"
+        );
+    }
+
+    #[test]
+    fn upsert_detail_attempted_unfetched_stores_empty_body_and_null_fetched_at() {
+        use rusqlite::params;
+        let conn = upsert_test_conn();
+        let link = "https://www.aiub.edu/notice/2";
+        let now = "2026-11-21T12:00:00Z";
+        conn.execute(
+            crate::db::upsert_statement_sql(true, false),
+            params!["Title", "Desc", link, "2026-11-15", "hash1", now],
+        )
+        .expect("insert attempted row");
+        let row = read_upsert_row(&conn, link);
+        assert_eq!(row.body_text, "", "unfetched detail stores no body");
+        assert_eq!(row.attachments_json, "[]");
+        assert_eq!(row.detail_fetched_at, None, "detail_fetched_at stays NULL");
+        assert_eq!(row.detail_checked_at.as_deref(), Some(now));
+
+        // Conflict update with the same hash: the title updates but
+        // content_changed_at stays — only a hash change moves it.
+        let now2 = "2026-11-21T12:05:00Z";
+        conn.execute(
+            crate::db::upsert_statement_sql(true, false),
+            params!["Title v2", "Desc", link, "", "hash1", now2],
+        )
+        .expect("update attempted row");
+        let row = read_upsert_row(&conn, link);
+        assert_eq!(row.title, "Title v2");
+        assert_eq!(row.detail_fetched_at, None);
+        assert_eq!(row.detail_checked_at.as_deref(), Some(now2));
+        assert_eq!(
+            row.content_changed_at, now,
+            "an unchanged hash must not move content_changed_at"
+        );
+    }
+
+    #[test]
+    fn upsert_detail_not_attempted_leaves_detail_timestamps_null() {
+        use rusqlite::params;
+        let conn = upsert_test_conn();
+        let link = "https://www.aiub.edu/notice/3";
+        let now = "2026-11-21T12:00:00Z";
+        conn.execute(
+            crate::db::upsert_statement_sql(false, false),
+            params!["Title", "Desc", link, "2026-11-15", "hash1", now],
+        )
+        .expect("insert unattempted row");
+        let row = read_upsert_row(&conn, link);
+        assert_eq!(row.body_text, "", "unattempted detail stores no body");
+        assert_eq!(row.attachments_json, "[]");
+        assert_eq!(row.detail_checked_at, None, "detail_checked_at stays NULL");
+        assert_eq!(row.detail_fetched_at, None, "detail_fetched_at stays NULL");
+        assert_eq!(row.last_seen_at, now);
+
+        // Conflict update: only the listing columns move; both detail
+        // timestamps stay NULL.
+        let now2 = "2026-11-21T12:05:00Z";
+        conn.execute(
+            crate::db::upsert_statement_sql(false, false),
+            params!["Title v2", "Desc", link, "", "hash1", now2],
+        )
+        .expect("update unattempted row");
+        let row = read_upsert_row(&conn, link);
+        assert_eq!(row.title, "Title v2");
+        assert_eq!(row.detail_checked_at, None);
+        assert_eq!(row.detail_fetched_at, None);
+        assert_eq!(row.last_seen_at, now2);
     }
 
     // L2: behavioural test — the SQL from build_lightweight_detail_update()
@@ -2851,15 +3095,16 @@ mod dispatch_tests {
     };
     use crate::dispatch::{
         DispatchLog, DispatchOutcome, FacebookSendStep, FacebookSender, MarkSink,
-        PendingNotification, TelegramSendStep, TelegramSender, dispatch_facebook_phase,
-        dispatch_telegram_phase, facebook_send_step, telegram_send_step,
+        PendingNotification, SideEffectSink, TelegramSendStep, TelegramSender,
+        dispatch_facebook_phase, dispatch_telegram_phase, facebook_send_step,
+        flush_dispatch_side_effects, fold_mark_batch_result, telegram_send_step,
     };
     use crate::errors::AppError;
     use crate::facebook::{
         BucUsage, FacebookPostResult, classify_publish_error, parse_auth_pause_value,
         parse_buc_usage_header,
     };
-    use crate::models::Notice;
+    use crate::models::{D1Metrics, Notice};
     use crate::telegram::TelegramSendResult;
     use chrono::{DateTime, Utc};
     use futures_util::future::FutureExt;
@@ -3053,6 +3298,66 @@ mod dispatch_tests {
         }
     }
 
+    // ── Fake side-effect sink (audit #15) ────────────────────────────
+    //
+    // Records every side-effect call in order; `failing` makes the
+    // named kinds fail so the flush's non-fatal handling is testable.
+
+    struct FakeSideEffectSink {
+        calls: RefCell<Vec<String>>,
+        fail_on: Vec<&'static str>,
+    }
+
+    impl FakeSideEffectSink {
+        fn new() -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                fail_on: Vec::new(),
+            }
+        }
+
+        fn failing(fail_on: Vec<&'static str>) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                fail_on,
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+
+        fn record(&self, key: String) -> worker::Result<()> {
+            // Record the attempt even when it fails: the flush test
+            // asserts that later side effects still run after a
+            // failure, so failed attempts must be visible too.
+            self.calls.borrow_mut().push(key.clone());
+            if self.fail_on.iter().any(|kind| key.starts_with(kind)) {
+                return Err(AppError::D1(format!("fake side-effect failure for {key}")).into());
+            }
+            Ok(())
+        }
+    }
+
+    impl SideEffectSink for FakeSideEffectSink {
+        async fn set_app_state(&self, key: &str, value: &str) -> worker::Result<D1Metrics> {
+            self.record(format!("set_app_state:{key}={value}"))?;
+            Ok(D1Metrics::default())
+        }
+
+        async fn send_fb_alert(&self, category: &str, _message: &str) -> worker::Result<()> {
+            self.record(format!("fb_alert:{category}"))
+        }
+
+        async fn send_fb_auth_alert(&self, _message: &str) -> worker::Result<()> {
+            self.record("fb_auth_alert".to_string())
+        }
+
+        async fn send_tg_auth_alert(&self, _message: &str) -> worker::Result<()> {
+            self.record("tg_auth_alert".to_string())
+        }
+    }
+
     fn test_secrets() -> Secrets {
         Secrets {
             telegram_bot_api_key: "test-bot-key".to_string(),
@@ -3101,7 +3406,6 @@ mod dispatch_tests {
         dispatch_telegram_phase(&secrets, queue, paused, sender, marks, log)
             .now_or_never()
             .expect("Telegram phase completes synchronously with a fake sender")
-            .expect("Telegram phase returns Ok")
     }
 
     fn run_fb_phase(
@@ -3115,7 +3419,6 @@ mod dispatch_tests {
         dispatch_facebook_phase(&secrets, queue, paused, sender, marks, log)
             .now_or_never()
             .expect("Facebook phase completes synchronously with a fake sender")
-            .expect("Facebook phase returns Ok")
     }
 
     // ── (a) Telegram auth pause ──────────────────────────────────────
@@ -3411,6 +3714,20 @@ mod dispatch_tests {
         assert!(!should_retry_telegram_429(0, 60));
     }
 
+    // ── Audit #3: a 2xx with ok == false is not a delivery ───────────
+
+    #[test]
+    fn telegram_body_delivered_requires_ok_true() {
+        use crate::telegram::telegram_body_delivered;
+        assert!(telegram_body_delivered(r#"{"ok":true,"result":{}}"#));
+        assert!(
+            !telegram_body_delivered(r#"{"ok":false,"description":"Forbidden: bot was blocked"}"#),
+            "ok:false must not count as delivered"
+        );
+        assert!(!telegram_body_delivered("{}"), "missing ok");
+        assert!(!telegram_body_delivered("not json"), "unparsable body");
+    }
+
     // ── Facebook phase ───────────────────────────────────────────────
 
     #[test]
@@ -3477,6 +3794,9 @@ mod dispatch_tests {
         let outcome = run_fb_phase(queue, false, &sender, &mut marks, &mut log);
 
         assert_eq!(outcome.sent_count, 0);
+        // Audit #13: the duplicate must be counted, not invisible —
+        // a run of all duplicates used to look like an empty queue.
+        assert_eq!(outcome.duplicate_count, 1);
         assert_eq!(outcome.deferred_count, 1);
         assert_eq!(outcome.failed_count, 0);
         assert_eq!(sender.calls().len(), 2, "rate limit stops the phase");
@@ -3602,6 +3922,36 @@ mod dispatch_tests {
             log.warns()
                 .iter()
                 .any(|m| m.contains("[Facebook BUC High]") && m.contains("85%"))
+        );
+    }
+
+    // ── Audit #14: the success cooldown honours the regain estimate ──
+
+    #[test]
+    fn fb_phase_buc_high_cooldown_uses_regain_estimate() {
+        // Usage at 95% with a 120-minute regain estimate: the cooldown
+        // must be ~120 minutes, not the 15-minute floor — otherwise
+        // the next run resumes while still throttled.
+        let sender = FakeFacebookSender::new(vec![Ok(FacebookPostResult::Success {
+            post_id: "1_1".to_string(),
+            usage: Some(BucUsage {
+                call_count: 95,
+                total_cputime: 10,
+                total_time: 10,
+                estimated_time_to_regain_access: 120,
+            }),
+        })]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let queue = vec![notification("https://www.aiub.edu/notice/1")];
+        let outcome = run_fb_phase(queue, false, &sender, &mut marks, &mut log);
+
+        assert_eq!(outcome.sent_count, 1);
+        assert_eq!(outcome.app_state_sets.len(), 1);
+        assert_eq!(outcome.app_state_sets[0].0, FACEBOOK_COOLDOWN_UNTIL_KEY);
+        assert!(
+            (119..=120).contains(&minutes_until(&outcome.app_state_sets[0].1)),
+            "BUC cooldown is ~120 minutes out (the regain estimate)"
         );
     }
 
@@ -3775,7 +4125,10 @@ mod dispatch_tests {
     }
 
     #[test]
-    fn fb_phase_worker_error_stops() {
+    fn fb_phase_worker_error_continues() {
+        // Audit #4: a worker error counts as failed but must not abort
+        // the rest of the queue — only rate-limit, spam, auth and
+        // BUC-high stop the phase.
         let sender = FakeFacebookSender::new(vec![
             Err(worker::Error::RustError("fetch error: boom".into())),
             Ok(FacebookPostResult::Success {
@@ -3792,12 +4145,175 @@ mod dispatch_tests {
         let outcome = run_fb_phase(queue, false, &sender, &mut marks, &mut log);
 
         assert_eq!(outcome.failed_count, 1);
-        assert_eq!(outcome.sent_count, 0);
-        assert_eq!(sender.calls().len(), 1, "worker error stops the phase");
+        assert_eq!(outcome.sent_count, 1);
+        assert_eq!(
+            sender.calls().len(),
+            2,
+            "worker error continues to the next notice"
+        );
         assert!(
             log.errors()
                 .iter()
                 .any(|m| m.contains("[Facebook Worker Error]"))
+        );
+    }
+
+    #[test]
+    fn fb_phase_transient_and_unknown_continue() {
+        // Audit #4: a transient failure defers its own notice and an
+        // unclassified error fails its own notice, but neither stops
+        // the phase — the notice behind them still posts.
+        let sender = FakeFacebookSender::new(vec![
+            Ok(FacebookPostResult::TransientFailure {
+                message: "Meta HTTP 500: internal error".to_string(),
+            }),
+            Ok(FacebookPostResult::UnknownError {
+                message: "Meta error 99999 (subcode: None): something new".to_string(),
+            }),
+            Ok(FacebookPostResult::Success {
+                post_id: "1_3".to_string(),
+                usage: None,
+            }),
+        ]);
+        let mut marks = FakeMarkSink::new();
+        let mut log = FakeLog::new();
+        let queue = vec![
+            notification("https://www.aiub.edu/notice/1"),
+            notification("https://www.aiub.edu/notice/2"),
+            notification("https://www.aiub.edu/notice/3"),
+        ];
+        let outcome = run_fb_phase(queue, false, &sender, &mut marks, &mut log);
+
+        assert_eq!(outcome.deferred_count, 1);
+        assert_eq!(outcome.failed_count, 1);
+        assert_eq!(outcome.sent_count, 1);
+        assert_eq!(sender.calls().len(), 3, "all three notices attempted");
+        assert_eq!(
+            outcome
+                .fb_alerts
+                .iter()
+                .map(|(category, _)| category.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unknown_error"],
+            "the unknown error still collects its debounced alert"
+        );
+    }
+
+    // ── Audit #15: side-effect flush order and non-fatal failure ────
+
+    fn flush_outcome() -> DispatchOutcome {
+        DispatchOutcome {
+            app_state_sets: vec![
+                (
+                    "fb_cooldown_until".to_string(),
+                    "2026-11-24T00:00:00Z".to_string(),
+                ),
+                ("fb_auth_paused".to_string(), "paused".to_string()),
+            ],
+            fb_alerts: vec![
+                ("rate_limit".to_string(), "rate limited".to_string()),
+                ("unknown_error".to_string(), "unknown".to_string()),
+            ],
+            fb_auth_alert: Some("fb auth failed".to_string()),
+            tg_auth_failure: Some("tg auth failed".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn run_side_effect_flush(
+        sink: &FakeSideEffectSink,
+        log: &mut FakeLog,
+        outcome: DispatchOutcome,
+    ) {
+        flush_dispatch_side_effects(sink, log, "Facebook", outcome)
+            .now_or_never()
+            .expect("side-effect flush completes synchronously with a fake sink");
+    }
+
+    #[test]
+    fn flush_side_effects_runs_in_order() {
+        let sink = FakeSideEffectSink::new();
+        let mut log = FakeLog::new();
+        run_side_effect_flush(&sink, &mut log, flush_outcome());
+
+        // Causal order: app_state sets, then debounced alerts, then
+        // the auth alerts — a swapped order here is a real bug the
+        // old code could only catch on a live D1 run.
+        assert_eq!(
+            sink.calls(),
+            vec![
+                "set_app_state:fb_cooldown_until=2026-11-24T00:00:00Z",
+                "set_app_state:fb_auth_paused=paused",
+                "fb_alert:rate_limit",
+                "fb_alert:unknown_error",
+                "fb_auth_alert",
+                "tg_auth_alert",
+            ]
+        );
+        assert!(log.warns().is_empty(), "a clean flush logs nothing");
+    }
+
+    #[test]
+    fn flush_side_effects_failure_is_non_fatal() {
+        let sink = FakeSideEffectSink::failing(vec!["set_app_state", "fb_alert"]);
+        let mut log = FakeLog::new();
+        run_side_effect_flush(&sink, &mut log, flush_outcome());
+
+        // Every side effect is still attempted, in order — a failed
+        // app_state set or alert must not abort the rest of the flush.
+        assert_eq!(
+            sink.calls(),
+            vec![
+                "set_app_state:fb_cooldown_until=2026-11-24T00:00:00Z",
+                "set_app_state:fb_auth_paused=paused",
+                "fb_alert:rate_limit",
+                "fb_alert:unknown_error",
+                "fb_auth_alert",
+                "tg_auth_alert",
+            ]
+        );
+        assert_eq!(
+            log.warns().len(),
+            4,
+            "two failed sets + two failed alerts warn, the auth alerts succeed silently"
+        );
+        assert!(
+            log.warns()
+                .iter()
+                .any(|m| m.contains("[Dispatch State Flush Failed]"))
+        );
+        assert!(
+            log.warns()
+                .iter()
+                .any(|m| m.contains("[Dispatch Alert Flush Failed]"))
+        );
+    }
+
+    // ── Audit #15: mark-flush failure counting ───────────────────────
+
+    #[test]
+    fn fold_mark_batch_result_counts_failures() {
+        let mut metrics = D1Metrics::default();
+        fold_mark_batch_result(
+            &mut metrics,
+            &Ok(D1Metrics {
+                rows_read: 2,
+                rows_written: 3,
+                failed_statements: 1,
+            }),
+            5,
+        );
+        assert_eq!(metrics.rows_read, 2);
+        assert_eq!(metrics.rows_written, 3);
+        assert_eq!(metrics.failed_statements, 1);
+        fold_mark_batch_result(
+            &mut metrics,
+            &Err(worker::Error::RustError("boom".into())),
+            4,
+        );
+        assert_eq!(
+            metrics.failed_statements, 5,
+            "a failed batch contributes its whole statement count"
         );
     }
 

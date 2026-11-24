@@ -1,11 +1,8 @@
 use chrono::{Duration, Utc};
-use futures_util::future::{Either, select};
 use serde::Deserialize;
-use std::pin::{Pin, pin};
 use std::time::Duration as StdDuration;
 use worker::{
-    AbortController, Delay, Fetch, Headers, Method, Request, RequestInit, Result, console_log,
-    console_warn,
+    Delay, Headers, Method, Request, RequestInit, Result, console_log, console_warn,
     d1::{D1Database, D1DatabaseSession},
 };
 
@@ -44,6 +41,19 @@ impl BucUsage {
     }
 }
 
+/// Pure post-id extraction from a 2xx Graph response body (audit #3):
+/// a 2xx without an `id` is not proof of posting — it may be a
+/// truncated response or an HTML error page from an edge/proxy — so
+/// `None` here means the caller must treat the post as transiently
+/// failed, not as published.
+#[must_use]
+pub(crate) fn parse_post_id(raw_body: &str) -> Option<String> {
+    serde_json::from_str::<GraphPostSuccessResponse>(raw_body)
+        .ok()
+        .and_then(|r| r.id)
+        .filter(|id| !id.is_empty())
+}
+
 /// Parses Meta's `X-Business-Use-Case-Usage` (or `X-App-Usage`) JSON header value.
 ///
 /// Example `X-Business-Use-Case-Usage` structure:
@@ -53,28 +63,42 @@ pub fn parse_buc_usage_header(header_value: &str) -> Option<BucUsage> {
     let parsed: serde_json::Value = serde_json::from_str(header_value).ok()?;
 
     // Case 1: X-Business-Use-Case-Usage (map of page/app ID to array of usage entries)
+    // Audit #14: aggregate across ALL entries — take the max of each
+    // percentage and the max regain estimate. Meta allows up to 32
+    // entries, and the first one is not necessarily the hot bucket.
     if let Some(map) = parsed.as_object() {
+        let mut aggregated = BucUsage::default();
+        let mut found = false;
         for val in map.values() {
-            if let Some(arr) = val.as_array() {
-                for item in arr {
-                    if let Some(obj) = item.as_object() {
-                        let call_count = obj
-                            .get("call_count")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0)
-                            .min(100) as u8;
-                        let total_cputime = obj
-                            .get("total_cputime")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0)
-                            .min(100) as u8;
-                        let total_time = obj
-                            .get("total_time")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0)
-                            .min(100) as u8;
-                        let estimated_time_to_regain_access = obj
-                            .get("estimated_time_to_regain_access")
+            let Some(arr) = val.as_array() else {
+                continue;
+            };
+            for item in arr {
+                let Some(obj) = item.as_object() else {
+                    continue;
+                };
+                found = true;
+                aggregated.call_count = aggregated.call_count.max(
+                    obj.get("call_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .min(100) as u8,
+                );
+                aggregated.total_cputime = aggregated.total_cputime.max(
+                    obj.get("total_cputime")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .min(100) as u8,
+                );
+                aggregated.total_time = aggregated.total_time.max(
+                    obj.get("total_time")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        .min(100) as u8,
+                );
+                aggregated.estimated_time_to_regain_access =
+                    aggregated.estimated_time_to_regain_access.max(
+                        obj.get("estimated_time_to_regain_access")
                             .and_then(|v| v.as_i64())
                             .unwrap_or(0)
                             // Medium #6: cap at the parse boundary —
@@ -82,17 +106,12 @@ pub fn parse_buc_usage_header(header_value: &str) -> Option<BucUsage> {
                             // an unbounded value would push the
                             // cooldown Duration::minutes() in lib.rs
                             // arbitrarily far into the future.
-                            .min(FACEBOOK_BUC_MAX_COOLDOWN_MINS);
-
-                        return Some(BucUsage {
-                            call_count,
-                            total_cputime,
-                            total_time,
-                            estimated_time_to_regain_access,
-                        });
-                    }
-                }
+                            .min(FACEBOOK_BUC_MAX_COOLDOWN_MINS),
+                    );
             }
+        }
+        if found {
+            return Some(aggregated);
         }
     }
 
@@ -253,50 +272,36 @@ pub async fn publish_post(
         .with_body(Some(body_json.into()));
 
     let req = Request::new_with_init(&url, &init)?;
-    let controller = AbortController::default();
-    let signal = controller.signal();
-
-    let fetch = Fetch::Request(req);
-    let send_fut = fetch.send_with_signal(&signal);
-    // Medium #5: ONE shared 15s deadline covers `send()` AND the body
-    // read — a fresh Delay per phase previously allowed one post to
-    // take up to 30s. `select` returns the losing future, so the same
-    // Delay is reused for the body read below.
-    // `timeout` is a named local (not `pin!(...)` inline): the Pin
-    // borrowing it is returned by `select` and reused for the body read
-    // below, so it must outlive this statement.
-    let mut timeout = Delay::from(StdDuration::from_millis(HTTP_TIMEOUT_MS));
-
-    let (mut resp, timeout_fut) = match select(pin!(send_fut), Pin::new(&mut timeout)).await {
-        Either::Left((res, timeout_fut)) => match res {
-            Ok(r) => (r, timeout_fut),
-            Err(e) => {
-                return Err(AppError::Fetch(telegram::redact_token(
-                    &e.to_string(),
-                    &fb_secrets.page_access_token,
-                ))
-                .into());
-            }
-        },
-        Either::Right(((), _)) => {
-            controller.abort();
+    // Audit #19: the shared fetch-with-timeout skeleton — one
+    // 15s deadline for send + body read, with the caller's error
+    // mapping (send errors are token-redacted; timeouts are transient).
+    let pending = match crate::fetch::send_with_timeout(req, HTTP_TIMEOUT_MS).await {
+        crate::fetch::SendOutcome::Sent(pending) => pending,
+        crate::fetch::SendOutcome::SendFailed(e) => {
+            return Err(AppError::Fetch(telegram::redact_token(
+                &e.to_string(),
+                &fb_secrets.page_access_token,
+            ))
+            .into());
+        }
+        crate::fetch::SendOutcome::SendTimedOut => {
             return Ok(FacebookPostResult::TransientFailure {
                 message: format!("Facebook API timeout after {HTTP_TIMEOUT_MS}ms"),
             });
         }
     };
 
-    let status = resp.status_code();
+    let status = pending.response().status_code();
     // M9: the 15s timeout must cover the body read too, not just
     // `send()` — a stalled body stream previously hung the send past
     // the timeout. On timeout, treat it as transient (retry next run).
     // The deadline is the same one started above, so send + body share
     // 15s.
-    let text_fut = resp.text();
-    let raw_body = match select(pin!(text_fut), timeout_fut).await {
-        Either::Left((res, _)) => res.unwrap_or_default(),
-        Either::Right(((), _)) => {
-            controller.abort();
+    // The response escapes the match: the BUC header parse below
+    // reads `resp.headers()` after the body read.
+    let (resp, raw_body) = match pending.read_body().await {
+        crate::fetch::BodyOutcome::Read(resp, body) => (resp, body.unwrap_or_default()),
+        crate::fetch::BodyOutcome::TimedOut => {
             return Ok(FacebookPostResult::TransientFailure {
                 message: format!(
                     "Facebook API timeout after {HTTP_TIMEOUT_MS}ms reading response body"
@@ -334,10 +339,14 @@ pub async fn publish_post(
         });
 
     if (200..300).contains(&status) {
-        let post_id = serde_json::from_str::<GraphPostSuccessResponse>(&raw_body)
-            .ok()
-            .and_then(|r| r.id)
-            .unwrap_or_default();
+        // Audit #3: a 2xx with no post id is not proof of posting —
+        // treat it as a transient failure so the notice is requeued
+        // instead of silently dropped as "sent".
+        let Some(post_id) = parse_post_id(&raw_body) else {
+            return Ok(FacebookPostResult::TransientFailure {
+                message: "Facebook API returned 2xx without a post id".to_string(),
+            });
+        };
 
         Delay::from(StdDuration::from_millis(FACEBOOK_PACE_MS)).await;
 
@@ -629,9 +638,6 @@ pub async fn send_debounced_fb_admin_alert(
         // silently dropped write re-alerts on every run.
         if let Err(err) = db::set_app_state(db, session, &alert_key, &now_str).await {
             console_warn!("Failed to record FB alert timestamp {alert_key}: {err}");
-        }
-        if let Err(err) = db::set_app_state(db, session, "fb_last_alert_at", &now_str).await {
-            console_warn!("Failed to record FB alert timestamp fb_last_alert_at: {err}");
         }
     }
     Ok(())

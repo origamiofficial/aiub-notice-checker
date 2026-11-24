@@ -71,6 +71,10 @@ pub(crate) struct DispatchOutcome {
     pub sent_count: usize,
     pub deferred_count: usize,
     pub failed_count: usize,
+    /// Audit #13: Facebook 506 duplicates previously incremented no
+    /// count at all — a run where every post duplicated looked
+    /// identical to an empty queue in the Run Summary.
+    pub duplicate_count: usize,
     pub attempt_stmts: Vec<D1PreparedStatement>,
     pub notified_stmts: Vec<D1PreparedStatement>,
     pub duplicate_stmts: Vec<D1PreparedStatement>,
@@ -82,8 +86,8 @@ pub(crate) struct DispatchOutcome {
     /// (category, message) pairs.
     pub fb_alerts: Vec<(String, String)>,
     /// Facebook auth-failure message collected during the phase; the
-    /// direct (non-debounced) admin alert is sent after the join. The
-    /// pause itself is in `app_state_sets`.
+    /// debounced admin alert (category "auth") is sent after the join.
+    /// The pause itself is in `app_state_sets`.
     pub fb_auth_alert: Option<String>,
     /// Telegram auth-failure message collected during the Telegram
     /// phase (High #1); the pause is in `app_state_sets` and the
@@ -383,13 +387,17 @@ pub(crate) enum FacebookSendStep {
     /// Auth/permission error: pause + direct alert collected, count
     /// failed, stop the phase.
     AuthFailureStop { message: String },
-    /// Transient Meta error: count deferred, stop the phase.
-    TransientStop { message: String },
+    /// Transient Meta error: count deferred, continue with the next
+    /// notice (audit #4) — a flaky or malformed post must not suppress
+    /// the rest of the queue.
+    TransientContinue { message: String },
     /// Unclassified Meta error: debounced alert collected (M10), count
-    /// failed, stop the phase. No cooldown/pause is set.
-    UnknownStop { message: String },
-    /// Worker-level publish failure: count failed, stop the phase.
-    WorkerErrorStop { message: String },
+    /// failed, continue with the next notice (audit #4). No
+    /// cooldown/pause is set.
+    UnknownContinue { message: String },
+    /// Worker-level publish failure: count failed, continue with the
+    /// next notice (audit #4).
+    WorkerErrorContinue { message: String },
 }
 
 /// Pure Facebook publish-result decision (Phase C, Medium #10). See
@@ -404,7 +412,14 @@ pub(crate) fn facebook_send_step(
         Ok(FacebookPostResult::Success { post_id, usage }) => {
             let cooldown_until = match usage {
                 Some(u) if u.is_approaching_limit() => {
-                    let until = (Utc::now() + Duration::minutes(15)).to_rfc3339();
+                    // Audit #14: honour Meta's regain estimate when
+                    // it exceeds the 15-minute floor — resuming after
+                    // 15 minutes while still throttled just burns
+                    // another throttled call before the real cooldown
+                    // is set. The estimate is already capped at parse
+                    // time (FACEBOOK_BUC_MAX_COOLDOWN_MINS).
+                    let cooldown_mins = u.estimated_time_to_regain_access.max(15);
+                    let until = (Utc::now() + Duration::minutes(cooldown_mins)).to_rfc3339();
                     // Medium #7: collect the cooldown set for the
                     // post-join flush — no D1 `.await` inside the
                     // joined phase.
@@ -476,7 +491,8 @@ pub(crate) fn facebook_send_step(
             // H2: store the pause with a timestamp so
             // is_facebook_paused() can expire it after
             // FACEBOOK_AUTH_PAUSE_TTL_HOURS. Medium #7: collect the
-            // pause set and the direct admin alert for the post-join flush.
+            // pause set and the debounced admin alert for the
+            // post-join flush.
             let pause_value = facebook::format_auth_pause_value(message);
             outcome
                 .app_state_sets
@@ -491,7 +507,7 @@ pub(crate) fn facebook_send_step(
         }
         Ok(FacebookPostResult::TransientFailure { message }) => {
             outcome.deferred_count += 1;
-            FacebookSendStep::TransientStop {
+            FacebookSendStep::TransientContinue {
                 message: format!("[Facebook Transient] Error: {message}; will retry at next cron."),
             }
         }
@@ -512,13 +528,13 @@ pub(crate) fn facebook_send_step(
                 ),
             ));
             outcome.failed_count += 1;
-            FacebookSendStep::UnknownStop {
+            FacebookSendStep::UnknownContinue {
                 message: format!("[Facebook Unknown Error] {message}"),
             }
         }
         Err(err) => {
             outcome.failed_count += 1;
-            FacebookSendStep::WorkerErrorStop {
+            FacebookSendStep::WorkerErrorContinue {
                 message: format!("[Facebook Worker Error] Failed to publish notice {url}: {err}"),
             }
         }
@@ -541,7 +557,7 @@ pub(crate) async fn dispatch_telegram_phase<S, M, L>(
     sender: &S,
     marks: &mut M,
     log: &mut L,
-) -> worker::Result<DispatchOutcome>
+) -> DispatchOutcome
 where
     S: TelegramSender,
     M: MarkSink,
@@ -549,7 +565,7 @@ where
 {
     let mut outcome = DispatchOutcome::default();
     if notifications.is_empty() || paused {
-        return Ok(outcome);
+        return outcome;
     }
 
     for item in notifications.into_iter().take(MAX_TELEGRAM_SENDS_PER_RUN) {
@@ -611,7 +627,7 @@ where
         }
     }
 
-    Ok(outcome)
+    outcome
 }
 
 /// Facebook dispatch phase, extracted from `run_inner()` (Phase C,
@@ -626,7 +642,7 @@ pub(crate) async fn dispatch_facebook_phase<S, M, L>(
     sender: &S,
     marks: &mut M,
     log: &mut L,
-) -> worker::Result<DispatchOutcome>
+) -> DispatchOutcome
 where
     S: FacebookSender,
     M: MarkSink,
@@ -634,7 +650,7 @@ where
 {
     let mut outcome = DispatchOutcome::default();
     if notifications.is_empty() || paused {
-        return Ok(outcome);
+        return outcome;
     }
 
     for item in notifications.into_iter().take(MAX_FACEBOOK_SENDS_PER_RUN) {
@@ -708,7 +724,7 @@ where
                     &item.content_hash,
                     &now,
                 ) {
-                    Ok(()) => {}
+                    Ok(()) => outcome.duplicate_count += 1,
                     Err(err) => {
                         log.error(format!(
                             "[Facebook Duplicate Mark Failed] Could not build duplicate-handled mark for {}: {}; it will be retried on the next run.",
@@ -730,22 +746,133 @@ where
                 log.error(message);
                 break;
             }
-            FacebookSendStep::TransientStop { message } => {
+            FacebookSendStep::TransientContinue { message } => {
                 log.warn(message);
-                break;
             }
-            FacebookSendStep::UnknownStop { message } => {
+            FacebookSendStep::UnknownContinue { message } => {
                 log.error(message);
-                break;
             }
-            FacebookSendStep::WorkerErrorStop { message } => {
+            FacebookSendStep::WorkerErrorContinue { message } => {
                 log.error(message);
-                break;
             }
         }
     }
 
-    Ok(outcome)
+    outcome
+}
+
+/// Executes one batch of prepared statements. Production calls
+/// [`db::execute_batch`]; tests substitute a scripted fake. The seam
+/// exists so the flush ordering and failure counting in
+/// [`flush_dispatch_marks`] are testable without a live D1 (audit
+/// #15).
+pub(crate) trait BatchExecutor {
+    async fn execute_batch(&self, stmts: Vec<D1PreparedStatement>) -> worker::Result<D1Metrics>;
+}
+
+/// Production [`BatchExecutor`]: the real D1 batch call.
+pub(crate) struct LiveBatchExecutor<'a> {
+    session: &'a D1DatabaseSession,
+}
+
+impl<'a> LiveBatchExecutor<'a> {
+    pub(crate) fn new(session: &'a D1DatabaseSession) -> Self {
+        Self { session }
+    }
+}
+
+impl BatchExecutor for LiveBatchExecutor<'_> {
+    async fn execute_batch(&self, stmts: Vec<D1PreparedStatement>) -> worker::Result<D1Metrics> {
+        db::execute_batch(self.session, stmts).await
+    }
+}
+
+/// Performs one dispatch side effect: an `app_state` write or a
+/// debounced admin alert. Production calls the real D1/alert
+/// functions; tests substitute a recording fake. The seam exists so
+/// the flush ordering and non-fatal failure handling in
+/// [`flush_dispatch_side_effects`] are natively testable (audit #15)
+/// — the side-effect inputs are plain strings, unlike the mark
+/// flush, whose `D1PreparedStatement` values cannot be constructed
+/// natively.
+pub(crate) trait SideEffectSink {
+    async fn set_app_state(&self, key: &str, value: &str) -> worker::Result<D1Metrics>;
+    async fn send_fb_alert(&self, category: &str, message: &str) -> worker::Result<()>;
+    async fn send_fb_auth_alert(&self, message: &str) -> worker::Result<()>;
+    async fn send_tg_auth_alert(&self, message: &str) -> worker::Result<()>;
+}
+
+/// Production [`SideEffectSink`]: the real D1 writes and admin alerts.
+pub(crate) struct LiveSideEffectSink<'a> {
+    db: &'a D1Database,
+    session: &'a D1DatabaseSession,
+    secrets: &'a Secrets,
+}
+
+impl<'a> LiveSideEffectSink<'a> {
+    pub(crate) fn new(
+        db: &'a D1Database,
+        session: &'a D1DatabaseSession,
+        secrets: &'a Secrets,
+    ) -> Self {
+        Self {
+            db,
+            session,
+            secrets,
+        }
+    }
+}
+
+impl SideEffectSink for LiveSideEffectSink<'_> {
+    async fn set_app_state(&self, key: &str, value: &str) -> worker::Result<D1Metrics> {
+        db::set_app_state(self.db, self.session, key, value).await
+    }
+
+    async fn send_fb_alert(&self, category: &str, message: &str) -> worker::Result<()> {
+        facebook::send_debounced_fb_admin_alert(
+            self.db,
+            self.session,
+            self.secrets,
+            category,
+            message,
+        )
+        .await
+    }
+
+    async fn send_fb_auth_alert(&self, message: &str) -> worker::Result<()> {
+        facebook::send_debounced_fb_admin_alert(
+            self.db,
+            self.session,
+            self.secrets,
+            "auth",
+            message,
+        )
+        .await
+    }
+
+    async fn send_tg_auth_alert(&self, message: &str) -> worker::Result<()> {
+        crate::send_debounced_tg_auth_alert(self.db, self.session, self.secrets, message).await
+    }
+}
+
+/// Folds one mark-batch result into the flush metrics (audit #15).
+/// A failed batch contributes its whole statement count — those marks
+/// did not apply, so the affected notices may re-send. Pure, so the
+/// failure-counting rule is natively testable even though the flush
+/// itself needs real `D1PreparedStatement` values.
+pub(crate) fn fold_mark_batch_result(
+    metrics: &mut D1Metrics,
+    result: &worker::Result<D1Metrics>,
+    count: usize,
+) {
+    match result {
+        Ok(m) => {
+            metrics.rows_read += m.rows_read;
+            metrics.rows_written += m.rows_written;
+            metrics.failed_statements += m.failed_statements;
+        }
+        Err(_) => metrics.failed_statements += count,
+    }
 }
 
 /// O1: flushes accumulated dispatch marks in one batch per mark kind
@@ -755,8 +882,12 @@ where
 /// notices may re-send on the next run (safe direction, same as M4).
 /// Takes the mark vectors out of `outcome` (`mem::take`) so the caller
 /// can pass the rest of the outcome to `flush_dispatch_side_effects`.
+/// The batch execution and the logging go through the injected
+/// [`BatchExecutor`] / [`DispatchLog`] so the flush is testable
+/// without a live D1 (audit #15).
 async fn flush_dispatch_marks(
-    session: &D1DatabaseSession,
+    executor: &impl BatchExecutor,
+    log: &mut impl DispatchLog,
     label: &str,
     outcome: &mut DispatchOutcome,
 ) -> D1Metrics {
@@ -770,19 +901,13 @@ async fn flush_dispatch_marks(
             continue;
         }
         let count = stmts.len();
-        match db::execute_batch(session, stmts).await {
-            Ok(m) => {
-                metrics.rows_read += m.rows_read;
-                metrics.rows_written += m.rows_written;
-                metrics.failed_statements += m.failed_statements;
-            }
-            Err(err) => {
-                console_error!(
-                    "[Dispatch Mark Flush Failed] {label} {kind} batch ({count} marks) failed entirely: {err}; affected notices may re-send on the next run."
-                );
-                metrics.failed_statements += count;
-            }
+        let result = executor.execute_batch(stmts).await;
+        if let Err(err) = &result {
+            log.error(format!(
+                "[Dispatch Mark Flush Failed] {label} {kind} batch ({count} marks) failed entirely: {err}; affected notices may re-send on the next run."
+            ));
         }
+        fold_mark_batch_result(&mut metrics, &result, count);
     }
     metrics
 }
@@ -793,63 +918,98 @@ async fn flush_dispatch_marks(
 /// Every failure is logged and non-fatal — the next run re-evaluates
 /// (a missed cooldown set re-sets on the next rate limit; a missed
 /// alert timestamp re-alerts; a missed pause set re-pauses on the next
-/// failed send).
-async fn flush_dispatch_side_effects(
-    db: &D1Database,
-    session: &D1DatabaseSession,
-    secrets: &Secrets,
+/// failed send). The writes/alerts and the logging go through the
+/// injected [`SideEffectSink`] / [`DispatchLog`] so the flush order
+/// and non-fatal handling are natively testable (audit #15).
+pub(crate) async fn flush_dispatch_side_effects(
+    sink: &impl SideEffectSink,
+    log: &mut impl DispatchLog,
     label: &str,
     outcome: DispatchOutcome,
 ) {
     for (key, value) in outcome.app_state_sets {
-        if let Err(err) = db::set_app_state(db, session, &key, &value).await {
+        if let Err(err) = sink.set_app_state(&key, &value).await {
             // Medium #3: classify the D1 failure instead of logging a
             // bare worker error.
-            console_warn!(
+            log.warn(format!(
                 "[Dispatch State Flush Failed] {label}: {}",
                 AppError::D1(format!("failed to set app_state {key}: {err}"))
-            );
+            ));
         }
     }
     for (category, message) in outcome.fb_alerts {
-        if let Err(err) =
-            facebook::send_debounced_fb_admin_alert(db, session, secrets, &category, &message).await
-        {
-            console_warn!(
+        if let Err(err) = sink.send_fb_alert(&category, &message).await {
+            log.warn(format!(
                 "[Dispatch Alert Flush Failed] {label}: failed to send debounced FB admin alert (category: {category}): {err}"
-            );
+            ));
         }
     }
     if let Some(message) = outcome.fb_auth_alert
-        && let Err(err) = telegram::send_admin_alert(secrets, &message).await
+        && let Err(err) = sink.send_fb_auth_alert(&message).await
     {
-        console_warn!(
-            "[Dispatch Alert Flush Failed] {label}: failed to send Facebook auth admin alert: {err}"
-        );
+        // Audit #11: the auth alert used to be sent directly here and
+        // only `Err` was handled — `Ok(false)` (deferred on a Telegram
+        // 429, or no admin chat) was treated as delivered and the alert
+        // was lost for the 24h pause. Routed through the debounced
+        // alert like every other Facebook alert, so a deferral does
+        // not record its timestamp and retries on the next run.
+        log.warn(format!(
+            "[Dispatch Alert Flush Failed] {label}: failed to send debounced Facebook auth admin alert (category: auth): {err}"
+        ));
     }
     if let Some(message) = outcome.tg_auth_failure
-        && let Err(err) = crate::send_debounced_tg_auth_alert(db, session, secrets, &message).await
+        && let Err(err) = sink.send_tg_auth_alert(&message).await
     {
-        console_warn!(
+        log.warn(format!(
             "[Dispatch Alert Flush Failed] {label}: failed to send debounced Telegram auth alert: {err}"
-        );
+        ));
     }
+}
+
+/// Per-platform dispatch counts returned by [`dispatch_both_phases`]
+/// for the Run Summary (audit #13). The combined dispatch used to
+/// return only D1 metrics, so a run where every Facebook post hit a
+/// 506 duplicate looked identical to an empty queue.
+#[derive(Default)]
+pub(crate) struct DispatchCounts {
+    pub tg_sent: usize,
+    pub tg_deferred: usize,
+    pub tg_failed: usize,
+    pub fb_sent: usize,
+    pub fb_deferred: usize,
+    pub fb_failed: usize,
+    pub fb_duplicates: usize,
 }
 
 /// Runs both dispatch phases overlapped (O3) and flushes everything
 /// they collected, sequentially, after the join (O1 / Medium #7 /
 /// High #1). The pause pre-checks are sequential D1 reads before the
 /// overlap: neither phase may do D1 reads/writes while the other is
-/// sending (Medium #7). Returns the D1 metrics from the mark flushes.
+/// sending (Medium #7). Returns the D1 metrics from the mark flushes
+/// and the per-platform send counts.
 pub(crate) async fn dispatch_both_phases(
     db: &D1Database,
     session: &D1DatabaseSession,
     secrets: &Secrets,
     mut tg_notifications: Vec<PendingNotification>,
     mut fb_notifications: Vec<PendingNotification>,
-) -> worker::Result<D1Metrics> {
+) -> worker::Result<(D1Metrics, DispatchCounts)> {
+    // Audit #12: a pause-check D1 error must not abort dispatch for
+    // the other platform — each check is independent, so a failed read
+    // logs and treats that platform as not paused instead of
+    // propagating with `?` and losing the whole run (and its Run
+    // Summary). A genuinely paused platform re-pauses on the next
+    // failed send, so failing open here is the safe direction.
     let fb_paused = if !fb_notifications.is_empty() && secrets.facebook.is_some() {
-        facebook::is_facebook_paused(db, session).await?
+        match facebook::is_facebook_paused(db, session).await {
+            Ok(paused) => paused,
+            Err(err) => {
+                console_warn!(
+                    "[Facebook Pause Check Failed] Could not read fb_auth_paused: {err}; treating Facebook as not paused."
+                );
+                (false, None)
+            }
+        }
     } else {
         (false, None)
     };
@@ -863,7 +1023,15 @@ pub(crate) async fn dispatch_both_phases(
     // High #1: same pre-check for Telegram — a 401/403 pause from
     // a previous run skips Telegram dispatch before any send.
     let tg_paused = if !tg_notifications.is_empty() {
-        telegram::is_telegram_paused(db, session).await?
+        match telegram::is_telegram_paused(db, session).await {
+            Ok(paused) => paused,
+            Err(err) => {
+                console_warn!(
+                    "[Telegram Pause Check Failed] Could not read tg_auth_paused: {err}; treating Telegram as not paused."
+                );
+                (false, None)
+            }
+        }
     } else {
         (false, None)
     };
@@ -885,7 +1053,7 @@ pub(crate) async fn dispatch_both_phases(
     // O3: both phases run concurrently; each only collects D1 marks.
     let tg_future = async move {
         if tg_notifications.is_empty() || tg_paused_flag {
-            return Ok::<DispatchOutcome, worker::Error>(DispatchOutcome::default());
+            return DispatchOutcome::default();
         }
         enter_span_async("dispatch_telegram_notifications", |span| async move {
             span.set_attribute("queued", tg_notifications.len() as i64);
@@ -899,7 +1067,7 @@ pub(crate) async fn dispatch_both_phases(
                 &mut marks,
                 &mut log,
             )
-            .await?;
+            .await;
             span.set_attribute("sent", outcome.sent_count as i64);
             span.set_attribute("deferred", outcome.deferred_count as i64);
             span.set_attribute("failed", outcome.failed_count as i64);
@@ -911,14 +1079,14 @@ pub(crate) async fn dispatch_both_phases(
             } else {
                 span.set_status(SpanStatus::Ok);
             }
-            Ok::<DispatchOutcome, worker::Error>(outcome)
+            outcome
         })
         .await
     };
 
     let fb_future = async move {
         if fb_notifications.is_empty() || fb_secrets_ref.is_none() || fb_paused_flag {
-            return Ok::<DispatchOutcome, worker::Error>(DispatchOutcome::default());
+            return DispatchOutcome::default();
         }
         let fb_secrets = fb_secrets_ref.expect("Facebook secrets present (checked above)");
         enter_span_async("dispatch_facebook_notifications", |span| async move {
@@ -933,10 +1101,11 @@ pub(crate) async fn dispatch_both_phases(
                 &mut marks,
                 &mut log,
             )
-            .await?;
+            .await;
             span.set_attribute("sent", outcome.sent_count as i64);
             span.set_attribute("deferred", outcome.deferred_count as i64);
             span.set_attribute("failed", outcome.failed_count as i64);
+            span.set_attribute("duplicates", outcome.duplicate_count as i64);
             if outcome.failed_count > 0 {
                 span.set_status(SpanStatus::Error(Some(format!(
                     "{} sends failed",
@@ -945,38 +1114,62 @@ pub(crate) async fn dispatch_both_phases(
             } else {
                 span.set_status(SpanStatus::Ok);
             }
-            Ok::<DispatchOutcome, worker::Error>(outcome)
+            outcome
         })
         .await
     };
 
     // O3: run both phases concurrently, then flush the collected
     // marks sequentially (O1) — Telegram first, then Facebook.
-    let (tg_result, fb_result) = join(tg_future, fb_future).await;
-    let mut tg_outcome = match tg_result {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            console_error!("[Telegram Dispatch Failed] {err}");
-            DispatchOutcome::default()
-        }
+    // Audit #17: the phases return their outcome directly — they
+    // contain no fallible call — so there is no error arm to hit here.
+    let (mut tg_outcome, mut fb_outcome) = join(tg_future, fb_future).await;
+    // Audit #13: capture the counts before the flushes consume the
+    // outcomes — the flush takes them by value.
+    let counts = DispatchCounts {
+        tg_sent: tg_outcome.sent_count,
+        tg_deferred: tg_outcome.deferred_count,
+        tg_failed: tg_outcome.failed_count,
+        fb_sent: fb_outcome.sent_count,
+        fb_deferred: fb_outcome.deferred_count,
+        fb_failed: fb_outcome.failed_count,
+        fb_duplicates: fb_outcome.duplicate_count,
     };
-    let mut fb_outcome = match fb_result {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            console_error!("[Facebook Dispatch Failed] {err}");
-            DispatchOutcome::default()
-        }
-    };
-    let tg_flush = flush_dispatch_marks(session, "Telegram", &mut tg_outcome).await;
-    let fb_flush = flush_dispatch_marks(session, "Facebook", &mut fb_outcome).await;
+    // Audit #15: the flushes run through the injected executor/sink/
+    // log seams so they are testable without a live D1.
+    let executor = LiveBatchExecutor::new(session);
+    let sink = LiveSideEffectSink::new(db, session, secrets);
+    let mut log = ConsoleDispatchLog;
+    let tg_flush = flush_dispatch_marks(&executor, &mut log, "Telegram", &mut tg_outcome).await;
+    let fb_flush = flush_dispatch_marks(&executor, &mut log, "Facebook", &mut fb_outcome).await;
     // Medium #7 / High #1: flush the D1 writes and admin alerts
     // the phases collected while joined, sequentially — Telegram
     // first, then Facebook.
-    flush_dispatch_side_effects(db, session, secrets, "Telegram", tg_outcome).await;
-    flush_dispatch_side_effects(db, session, secrets, "Facebook", fb_outcome).await;
+    flush_dispatch_side_effects(&sink, &mut log, "Telegram", tg_outcome).await;
+    flush_dispatch_side_effects(&sink, &mut log, "Facebook", fb_outcome).await;
+    // Audit #10: while Telegram is paused, no send ever fails, so the
+    // debounced auth alert in the flush above is never attempted — yet
+    // its log line promises a retry "on the next run". Attempt it on
+    // every run while paused: with a dead token it fails (and retries
+    // next run); once the token is fixed the alert delivers promptly
+    // and the debounce timestamp is recorded.
+    if tg_paused_flag
+        && let Some(reason) = &tg_paused.1
+        && let Err(err) = crate::send_debounced_tg_auth_alert(
+            db,
+            session,
+            secrets,
+            &format!("🚨 AIUB Notice Telegram: {reason}"),
+        )
+        .await
+    {
+        console_warn!(
+            "[Dispatch Alert Flush Failed] Telegram: failed to send debounced Telegram auth alert while paused: {err}"
+        );
+    }
     let mut metrics = D1Metrics::default();
     metrics.rows_read += tg_flush.rows_read + fb_flush.rows_read;
     metrics.rows_written += tg_flush.rows_written + fb_flush.rows_written;
     metrics.failed_statements += tg_flush.failed_statements + fb_flush.failed_statements;
-    Ok(metrics)
+    Ok((metrics, counts))
 }

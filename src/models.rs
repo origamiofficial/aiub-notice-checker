@@ -86,7 +86,21 @@ impl NoticeRow {
             (Some(checked), Some(fetched)) if checked > fetched => {
                 checked.as_str() <= retry_cutoff_iso
             }
-            _ => true,
+            // Audit #8: when checked == fetched (or only fetched is
+            // set), the row was just fetched — compare the latest
+            // timestamp against the cutoff instead of returning true
+            // unconditionally, or the 30-minute cooldown is bypassed
+            // and a just-fetched row is re-fetched on the next run.
+            _ => {
+                let latest = self
+                    .detail_checked_at
+                    .as_deref()
+                    .or(self.detail_fetched_at.as_deref());
+                match latest {
+                    Some(ts) => ts <= retry_cutoff_iso,
+                    None => true,
+                }
+            }
         }
     }
 }

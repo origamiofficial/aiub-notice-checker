@@ -1,12 +1,8 @@
 use chrono::NaiveDate;
-use futures_util::future::{Either, select};
 use std::collections::HashSet;
-use std::pin::{Pin, pin};
-use std::time::Duration;
 use tl::{HTMLTag, Node, Parser, ParserOptions, VDom};
 use worker::{
-    AbortController, Delay, Fetch, Headers, Method, Request, RequestInit, RequestRedirect, Result,
-    console_warn, url::Url,
+    Headers, Method, Request, RequestInit, RequestRedirect, Result, console_warn, url::Url,
 };
 
 use crate::config::{
@@ -14,6 +10,7 @@ use crate::config::{
     MAX_URL_LENGTH, NOTICE_PATH,
 };
 use crate::errors::AppError;
+use crate::fetch;
 use crate::models::Notice;
 
 pub(crate) const USER_AGENT: &str = concat!(
@@ -81,27 +78,16 @@ pub async fn fetch_html(target_url: &str) -> Result<String> {
             .with_redirect(RequestRedirect::Manual);
 
         let req = Request::new_with_init(&current_url, &init)?;
-        let controller = AbortController::default();
-        let signal = controller.signal();
-
-        let fetch = Fetch::Request(req);
-        let send_fut = fetch.send_with_signal(&signal);
-        // Medium #5: ONE shared 15s deadline covers `send()` AND the
-        // body read — a fresh Delay per phase previously allowed one
-        // fetch to take up to 30s. `select` returns the losing future,
-        // so the same Delay is reused for the body read below.
-        // `timeout` is a named local (not `pin!(...)` inline): the
-        // Pin borrowing it is returned by `select` and reused for the
-        // body read below, so it must outlive this statement.
-        let mut timeout = Delay::from(Duration::from_millis(HTTP_TIMEOUT_MS));
-
-        let (mut resp, timeout_fut) = match select(pin!(send_fut), Pin::new(&mut timeout)).await {
-            Either::Left((res, timeout_fut)) => match res {
-                Ok(r) => (r, timeout_fut),
-                Err(e) => return Err(AppError::Fetch(e.to_string()).into()),
-            },
-            Either::Right(((), _)) => {
-                controller.abort();
+        // Audit #19: the shared fetch-with-timeout skeleton — one
+        // 15s deadline for send + body read, with the caller's error
+        // mapping. The response is inspected before the body is read
+        // (redirects, non-2xx, Content-Length pre-check).
+        let pending = match fetch::send_with_timeout(req, HTTP_TIMEOUT_MS).await {
+            fetch::SendOutcome::Sent(pending) => pending,
+            fetch::SendOutcome::SendFailed(e) => {
+                return Err(AppError::Fetch(e.to_string()).into());
+            }
+            fetch::SendOutcome::SendTimedOut => {
                 return Err(AppError::Fetch(format!(
                     "HTTP timeout after {HTTP_TIMEOUT_MS}ms fetching {current_url}"
                 ))
@@ -109,6 +95,7 @@ pub async fn fetch_html(target_url: &str) -> Result<String> {
             }
         };
 
+        let resp = pending.response();
         let status = resp.status_code();
         if (300..400).contains(&status)
             && let Some(loc) = resp.headers().get("Location")?
@@ -145,11 +132,9 @@ pub async fn fetch_html(target_url: &str) -> Result<String> {
         // the timeout (and the 2 MB cap only fired after full buffering).
         // The deadline is the same one started above, so send + body
         // share 15s.
-        let text_fut = resp.text();
-        let text = match select(pin!(text_fut), timeout_fut).await {
-            Either::Left((res, _)) => res?,
-            Either::Right(((), _)) => {
-                controller.abort();
+        let text = match pending.read_body().await {
+            fetch::BodyOutcome::Read(_resp, body) => body?,
+            fetch::BodyOutcome::TimedOut => {
                 return Err(AppError::Fetch(format!(
                     "HTTP timeout after {HTTP_TIMEOUT_MS}ms reading body of {current_url}"
                 ))
@@ -301,10 +286,19 @@ fn extract_listing_fields(
         published_date = parse_date_to_iso(&prefix).or_else(|| parse_date_to_iso(dt_attr));
     }
     if published_date.is_none() {
-        let raw_time = state.time_text.as_ref().or(state.date_text.as_ref());
-        if let Some(raw) = raw_time {
-            published_date = parse_date_to_iso(raw);
-        }
+        // Audit #6: a `<time>` holding a clock time ("10:30 AM") does
+        // not parse as a date — fall through and try the `.date`
+        // candidate instead of giving up with no date.
+        published_date = state
+            .time_text
+            .as_ref()
+            .and_then(|raw| parse_date_to_iso(raw))
+            .or_else(|| {
+                state
+                    .date_text
+                    .as_ref()
+                    .and_then(|raw| parse_date_to_iso(raw))
+            });
     }
 
     ListingFields {
@@ -935,9 +929,17 @@ fn extract_iso_date_from_card(tag: &HTMLTag, parser: &Parser) -> Option<String> 
         }
     }
 
+    // Audit #6: a `<time>` holding a clock time ("10:30 AM") does not
+    // parse as a date — fall through and try the `.date` candidate
+    // instead of giving up with no date.
     if let Some(raw_time) = find_first_text_in_tag(tag, parser, "time")
-        .or_else(|| find_first_text_in_tag(tag, parser, ".date"))
         && let Some(iso) = parse_date_to_iso(&raw_time)
+    {
+        return Some(iso);
+    }
+
+    if let Some(raw_date) = find_first_text_in_tag(tag, parser, ".date")
+        && let Some(iso) = parse_date_to_iso(&raw_date)
     {
         return Some(iso);
     }
@@ -1044,7 +1046,18 @@ pub fn normalize_aiub_url(raw_href: &str, base_url: &str, allow_external: bool) 
     let Ok(base) = Url::parse(base_url) else {
         return String::new();
     };
-    let Ok(mut parsed) = base.join(trimmed) else {
+    // Audit #5: a scheme-less href starting with the bare host
+    // ("www.aiub.edu/notice/x") must not be joined onto the base —
+    // `Url::join` would treat the host as a path segment and produce
+    // https://www.aiub.edu/www.aiub.edu/notice/x. Give it a scheme
+    // first so it parses as an absolute URL.
+    let with_scheme: std::borrow::Cow<'_, str> =
+        if trimmed.to_ascii_lowercase().starts_with(BASE_HOST) {
+            format!("https://{trimmed}").into()
+        } else {
+            trimmed.into()
+        };
+    let Ok(mut parsed) = base.join(&with_scheme) else {
         return String::new();
     };
 
@@ -1077,12 +1090,25 @@ pub fn normalize_aiub_url(raw_href: &str, base_url: &str, allow_external: bool) 
         return String::new();
     }
 
-    let mut out = parsed.to_string();
+    // Audit #5: strip trailing slashes from the parsed path, not just
+    // from the serialized URL — "/notice/test/?a=1" and
+    // "/notice/test?a=1" are the same notice and must normalize to
+    // one link, but the first form does not end with '/'. Copy the
+    // host comparison to a bool first: `host` borrows `parsed`, and
+    // `set_path` needs a mutable borrow.
+    let is_aiub_host = host == BASE_HOST;
+    if is_aiub_host {
+        // Own the stripped path first: `path()` borrows `parsed`,
+        // and `set_path` needs it mutably.
+        let stripped = parsed.path().trim_end_matches('/').to_string();
+        if !stripped.is_empty() {
+            parsed.set_path(&stripped);
+        }
+    }
+
+    let out = parsed.to_string();
     if out.len() > MAX_URL_LENGTH {
         return String::new();
-    }
-    if host == BASE_HOST && out.ends_with('/') && parsed.path() != "/" {
-        out.pop();
     }
     out
 }
