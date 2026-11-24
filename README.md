@@ -445,7 +445,7 @@ Runtime secrets (`TELEGRAM_*`, `FACEBOOK_*`) remain persisted in Cloudflare Secr
 
 ## 📦 Release Pipeline & Benchmarking
 
-The repository includes an automated release workflow (`.github/workflows/release.yml`) implementing a **single-digit rolling semver** scheme (`src/version.rs` and `scripts/version-bump.sh`):
+The repository includes an automated release workflow (`.github/workflows/release.yml`) implementing a **single-digit rolling semver** scheme (`scripts/version-bump.sh`):
 
 - **Release Rolling Window (24h):**
   - Releases within 24 hours of the previous release increment the patch version $Z$ (e.g. `6.0.4` $\to$ `6.0.5`).
@@ -456,7 +456,7 @@ The repository includes an automated release workflow (`.github/workflows/releas
   ```bash
   cargo run --release --bin benchmark -- <html_file> <version> <duration_ms> <output_json>
   ```
-  The workflow asserts that all 500 notices parse successfully, measures average latency per notice, generates `scrape-benchmark.json`, and attaches the compiled `worker-bundle.zip` to the GitHub Release.
+  The workflow asserts that all 500 notices parse successfully, measures parse latency as the median of 5 runs, generates `scrape-benchmark.json`, and attaches the compiled `worker-bundle.zip` to the GitHub Release.
 
 ---
 
@@ -628,7 +628,6 @@ aiub-notice-checker/
 │   ├── scraper.rs                     # HTML fetching, redirect handling, and tl DOM parsing
 │   ├── telegram.rs                    # Telegram Bot API client, rate-limit handler, and retries
 │   ├── tests.rs                       # Comprehensive unit and regression test suite (156 tests)
-│   └── version.rs                     # Single-digit rolling semver rollover calculation logic
 ├── Cargo.toml                         # Rust crate manifest, dependencies, and release profiles
 ├── LICENSE                            # MIT License
 ├── README.md                          # Project documentation

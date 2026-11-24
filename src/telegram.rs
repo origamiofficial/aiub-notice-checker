@@ -1,10 +1,7 @@
-use futures_util::future::{Either, select};
 use serde::{Deserialize, Serialize};
-use std::pin::{Pin, pin};
 use std::time::Duration;
 use worker::{
-    AbortController, Delay, Fetch, Headers, Method, Request, RequestInit, Result, console_log,
-    console_warn,
+    Delay, Headers, Method, Request, RequestInit, Result, console_log, console_warn,
     d1::{D1Database, D1DatabaseSession},
 };
 
@@ -32,7 +29,6 @@ struct SendMessagePayload<'a> {
 
 #[derive(Deserialize)]
 struct TelegramResponse {
-    #[allow(dead_code)]
     ok: bool,
     description: Option<String>,
     parameters: Option<TelegramResponseParams>,
@@ -165,6 +161,19 @@ pub(crate) fn classify_telegram_status(status: u16) -> TelegramStatusAction {
     }
 }
 
+/// Pure 2xx delivery check (audit #3): the Bot API's `ok` field must
+/// be true — a 2xx carrying `{"ok":false,...}` (e.g. the bot was
+/// blocked) is not a delivery, and an unparsable body proves nothing
+/// either. `false` means the caller falls through to the error/auth
+/// handling below, using `description`, so the notice is retried
+/// instead of recorded as sent.
+#[must_use]
+pub(crate) fn telegram_body_delivered(raw_body: &str) -> bool {
+    serde_json::from_str::<TelegramResponse>(raw_body)
+        .map(|r| r.ok)
+        .unwrap_or(false)
+}
+
 /// Pure inline-retry decision for a Telegram 429 (Phase C, Medium #10):
 /// retry inline only while attempts remain AND the server's
 /// `retry_after` fits the inline budget (`TELEGRAM_MAX_RETRY_WAIT_SECS`);
@@ -204,29 +213,15 @@ async fn send_raw_message(
             .with_body(Some(body_json.as_str().into()));
 
         let req = Request::new_with_init(&url, &init)?;
-        let controller = AbortController::default();
-        let signal = controller.signal();
-
-        let fetch = Fetch::Request(req);
-        let send_fut = fetch.send_with_signal(&signal);
-        // Medium #5: ONE shared 15s deadline covers `send()` AND the
-        // body read — a fresh Delay per phase previously allowed one
-        // send to take up to 30s. `select` returns the losing future,
-        // so the same Delay is reused for the body read below.
-        // `timeout` is a named local (not `pin!(...)` inline): the
-        // Pin borrowing it is returned by `select` and reused for the
-        // body read below, so it must outlive this statement.
-        let mut timeout = Delay::from(Duration::from_millis(HTTP_TIMEOUT_MS));
-
-        let (mut resp, timeout_fut) = match select(pin!(send_fut), Pin::new(&mut timeout)).await {
-            Either::Left((res, timeout_fut)) => match res {
-                Ok(r) => (r, timeout_fut),
-                Err(e) => {
-                    return Err(AppError::Fetch(redact_token(&e.to_string(), bot_api_key)).into());
-                }
-            },
-            Either::Right(((), _)) => {
-                controller.abort();
+        // Audit #19: the shared fetch-with-timeout skeleton — one
+        // 15s deadline for send + body read, with the caller's error
+        // mapping (send errors are token-redacted).
+        let pending = match crate::fetch::send_with_timeout(req, HTTP_TIMEOUT_MS).await {
+            crate::fetch::SendOutcome::Sent(pending) => pending,
+            crate::fetch::SendOutcome::SendFailed(e) => {
+                return Err(AppError::Fetch(redact_token(&e.to_string(), bot_api_key)).into());
+            }
+            crate::fetch::SendOutcome::SendTimedOut => {
                 return Err(AppError::Fetch(format!(
                     "Telegram API timeout after {HTTP_TIMEOUT_MS}ms"
                 ))
@@ -234,17 +229,15 @@ async fn send_raw_message(
             }
         };
 
-        let status = resp.status_code();
+        let status = pending.response().status_code();
         // M9: the 15s timeout must cover the body read too, not just
         // `send()` — a stalled body stream previously hung the send past
         // the timeout. On timeout, fail the attempt (the caller retries
         // on the next run) instead of blocking the worker. The deadline
         // is the same one started above, so send + body share 15s.
-        let text_fut = resp.text();
-        let raw_body = match select(pin!(text_fut), timeout_fut).await {
-            Either::Left((res, _)) => res.unwrap_or_default(),
-            Either::Right(((), _)) => {
-                controller.abort();
+        let raw_body = match pending.read_body().await {
+            crate::fetch::BodyOutcome::Read(_resp, body) => body.unwrap_or_default(),
+            crate::fetch::BodyOutcome::TimedOut => {
                 return Err(AppError::Fetch(format!(
                     "Telegram API timeout after {HTTP_TIMEOUT_MS}ms reading response body"
                 ))
@@ -253,7 +246,7 @@ async fn send_raw_message(
         };
 
         let action = classify_telegram_status(status);
-        if action == TelegramStatusAction::Success {
+        if action == TelegramStatusAction::Success && telegram_body_delivered(&raw_body) {
             Delay::from(Duration::from_millis(TELEGRAM_PACE_MS)).await;
             return Ok(TelegramSendResult::Sent);
         }

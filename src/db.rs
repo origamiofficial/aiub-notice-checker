@@ -166,6 +166,79 @@ pub fn build_upsert_statement(
     }
 }
 
+/// Test-only SQL mirrors for the three [`build_upsert_statement`]
+/// branches, so their semantics can be tested behaviourally against a
+/// real SQLite database in tests (same pattern as
+/// `lightweight_detail_update_sql()` above).
+///
+/// The production builder duplicates these SQL literals because the
+/// `worker::query!` macro requires a string literal — keep the two in
+/// sync if either changes.
+///
+/// - `(true, true)`: detail attempted and fetched — stores the fetched
+///   body/attachments and sets `detail_fetched_at`.
+/// - `(true, false)`: detail attempted but not fetched — stores empty
+///   body/attachments and leaves `detail_fetched_at` NULL.
+/// - `(false, _)`: detail not attempted — stores empty body/
+///   attachments and leaves both detail timestamps NULL.
+#[cfg(test)]
+pub fn upsert_statement_sql(detail_attempted: bool, detail_fetched: bool) -> &'static str {
+    if detail_attempted && detail_fetched {
+        "INSERT INTO notices (
+            title, description, link, published_date, body_text, attachments_json,
+            content_hash, first_seen_at, last_seen_at, detail_checked_at, detail_fetched_at,
+            content_changed_at
+        ) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, ?7, ?8, ?8, ?8, ?8, ?8)
+        ON CONFLICT(link) DO UPDATE SET
+            title = excluded.title,
+            description = excluded.description,
+            published_date = COALESCE(excluded.published_date, notices.published_date),
+            body_text = excluded.body_text,
+            attachments_json = excluded.attachments_json,
+            content_changed_at = CASE
+                WHEN notices.content_hash != excluded.content_hash THEN excluded.content_changed_at
+                ELSE notices.content_changed_at
+            END,
+            content_hash = excluded.content_hash,
+            last_seen_at = excluded.last_seen_at,
+            detail_checked_at = excluded.detail_checked_at,
+            detail_fetched_at = excluded.detail_fetched_at"
+    } else if detail_attempted {
+        "INSERT INTO notices (
+            title, description, link, published_date, body_text, attachments_json,
+            content_hash, first_seen_at, last_seen_at, detail_checked_at, detail_fetched_at,
+            content_changed_at
+        ) VALUES (?1, ?2, ?3, NULLIF(?4, ''), '', '[]', ?5, ?6, ?6, ?6, NULL, ?6)
+        ON CONFLICT(link) DO UPDATE SET
+            title = excluded.title,
+            description = excluded.description,
+            published_date = COALESCE(excluded.published_date, notices.published_date),
+            content_changed_at = CASE
+                WHEN notices.content_hash != excluded.content_hash THEN excluded.content_changed_at
+                ELSE notices.content_changed_at
+            END,
+            content_hash = excluded.content_hash,
+            last_seen_at = excluded.last_seen_at,
+            detail_checked_at = excluded.detail_checked_at"
+    } else {
+        "INSERT INTO notices (
+            title, description, link, published_date, body_text, attachments_json,
+            content_hash, first_seen_at, last_seen_at, detail_checked_at, detail_fetched_at,
+            content_changed_at
+        ) VALUES (?1, ?2, ?3, NULLIF(?4, ''), '', '[]', ?5, ?6, ?6, NULL, NULL, ?6)
+        ON CONFLICT(link) DO UPDATE SET
+            title = excluded.title,
+            description = excluded.description,
+            published_date = COALESCE(excluded.published_date, notices.published_date),
+            content_changed_at = CASE
+                WHEN notices.content_hash != excluded.content_hash THEN excluded.content_changed_at
+                ELSE notices.content_changed_at
+            END,
+            content_hash = excluded.content_hash,
+            last_seen_at = excluded.last_seen_at"
+    }
+}
+
 /// The SQL used by [`build_lightweight_detail_update`], extracted as a pure
 /// function so its semantics can be tested behaviourally against a real
 /// SQLite database in tests (L2) without a Cloudflare D1 binding.
@@ -277,6 +350,20 @@ pub async fn execute_batch(
                         metrics.rows_read += meta.rows_read.unwrap_or(0);
                         metrics.rows_written += meta.rows_written.unwrap_or(0);
                     }
+                    // Audit #9: a batch can resolve with a failed
+                    // result inside instead of rejecting — the
+                    // metadata alone does not prove the statement
+                    // applied. Count it failed and log the error, or
+                    // the partial-failure machinery is bypassed in
+                    // exactly the failure mode it guards.
+                    if !res.success() {
+                        metrics.failed_statements += 1;
+                        worker::console_warn!(
+                            "[D1 Batch Partial Failure] Chunk {} statement reported success=false: {:?}; counting it as failed.",
+                            chunk_idx,
+                            res.error()
+                        );
+                    }
                 }
             }
             Err(batch_err) => {
@@ -345,13 +432,28 @@ async fn execute_statements_bisect(
     match session.batch(stmts.to_vec()).await {
         Ok(results) => {
             let mut metrics = D1Metrics::default();
-            for res in results {
+            let mut succeeded = 0;
+            for (i, res) in results.iter().enumerate() {
                 if let Ok(Some(meta)) = res.meta() {
                     metrics.rows_read += meta.rows_read.unwrap_or(0);
                     metrics.rows_written += meta.rows_written.unwrap_or(0);
                 }
+                // Audit #9: same check as in `execute_batch` — a
+                // resolved batch can still contain a failed result,
+                // which must not count as applied.
+                if res.success() {
+                    succeeded += 1;
+                } else {
+                    metrics.failed_statements += 1;
+                    worker::console_warn!(
+                        "[D1 Batch Fallback] Chunk {} statement {} reported success=false: {:?}; counting it as failed.",
+                        chunk_idx,
+                        offset + i,
+                        res.error()
+                    );
+                }
             }
-            (metrics, stmts.len())
+            (metrics, succeeded)
         }
         Err(err) => {
             if stmts.len() == 1 {
@@ -447,18 +549,6 @@ pub fn build_tg_hash_sync_statement(
     )
 }
 
-/// Silent hash sync for Telegram (keeps tg_last_notified_hash in sync without re-posting).
-#[allow(dead_code)]
-pub async fn mark_tg_hash_sync(
-    db: &D1Database,
-    session: &D1DatabaseSession,
-    link: &str,
-    content_hash: &str,
-) -> Result<D1Metrics> {
-    let stmt = build_tg_hash_sync_statement(db, link, content_hash)?;
-    execute_batch(session, vec![stmt]).await
-}
-
 // ── Facebook delivery tracking ───────────────────────────────────────
 
 /// O1: builds an attempt-mark statement without executing it (see
@@ -527,18 +617,6 @@ pub fn build_fb_hash_sync_statement(
         content_hash,
         link,
     )
-}
-
-/// Silent hash sync for Facebook (keeps fb_last_notified_hash in sync without re-posting).
-#[allow(dead_code)]
-pub async fn mark_fb_hash_sync(
-    db: &D1Database,
-    session: &D1DatabaseSession,
-    link: &str,
-    content_hash: &str,
-) -> Result<D1Metrics> {
-    let stmt = build_fb_hash_sync_statement(db, link, content_hash)?;
-    execute_batch(session, vec![stmt]).await
 }
 
 // ── Operational state (app_state table) ──────────────────────────────

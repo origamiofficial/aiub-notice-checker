@@ -26,7 +26,6 @@ struct BenchmarkReport {
     /// this by the notice count and called it latency, which is why
     /// 6,263 ms vs 3,859 ms looked like a regression on identical HTML.
     pub total_duration_ms: u64,
-    pub avg_latency_per_notice_ms: u64,
     /// O2: parse-only timing — `parse_listing_html` run
     /// `PARSE_RUNS` times over the already-fetched HTML, with the
     /// median reported. This is the actual parser performance signal;
@@ -35,7 +34,6 @@ struct BenchmarkReport {
     pub parse_runs: usize,
     pub parse_durations_ms: Vec<u64>,
     pub parse_duration_ms_median: u64,
-    pub avg_parse_latency_per_notice_ms: u64,
     pub html_size_bytes: usize,
     pub threshold_met: bool,
     pub notices: Vec<BenchmarkNotice>,
@@ -45,9 +43,14 @@ struct BenchmarkReport {
 /// run (allocator warm-up) and any single slow outlier.
 pub const PARSE_RUNS: usize = 5;
 
-/// Median of a non-empty slice (upper median for even lengths).
+/// Median of a slice (upper median for even lengths). An empty slice
+/// returns 0 — the benchmark always passes `PARSE_RUNS` durations, so
+/// this is only a guard against an index panic, not a real signal.
 /// Pure and unit-tested below.
 pub fn median_u64(values: &mut [u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
     values.sort_unstable();
     values[values.len() / 2]
 }
@@ -114,18 +117,6 @@ fn main() {
         });
     }
 
-    let avg_latency_ms = if total_scraped > 0 {
-        duration_ms / (total_scraped as u64)
-    } else {
-        0
-    };
-
-    let avg_parse_latency_ms = if total_scraped > 0 {
-        parse_duration_ms_median / (total_scraped as u64)
-    } else {
-        0
-    };
-
     let threshold_met = total_scraped >= 500;
     let failure_count = if threshold_met { 0 } else { 1 };
 
@@ -138,11 +129,9 @@ fn main() {
         success_count: total_scraped,
         failure_count,
         total_duration_ms: duration_ms,
-        avg_latency_per_notice_ms: avg_latency_ms,
         parse_runs: PARSE_RUNS,
         parse_durations_ms,
         parse_duration_ms_median,
-        avg_parse_latency_per_notice_ms: avg_parse_latency_ms,
         html_size_bytes: html_size,
         threshold_met,
         notices,
@@ -166,8 +155,8 @@ fn main() {
         total_scraped, threshold_met
     );
     println!(
-        "Fetch: {} ms ({} ms/notice); parse (median of {} runs): {} ms ({} ms/notice)",
-        duration_ms, avg_latency_ms, PARSE_RUNS, parse_duration_ms_median, avg_parse_latency_ms
+        "Fetch: {} ms; parse (median of {} runs): {} ms",
+        duration_ms, PARSE_RUNS, parse_duration_ms_median
     );
 
     if !threshold_met {
@@ -202,5 +191,11 @@ mod tests {
     fn median_ignores_a_slow_outlier() {
         // O2: a cold first run must not move the reported parse time.
         assert_eq!(median_u64(&mut [900, 12, 11, 13, 12]), 12);
+    }
+
+    #[test]
+    fn median_empty_slice_returns_zero() {
+        // Audit #20: the old indexing panicked on an empty slice.
+        assert_eq!(median_u64(&mut []), 0);
     }
 }
