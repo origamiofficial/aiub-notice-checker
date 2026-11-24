@@ -1,6 +1,6 @@
 [package]
 name = "aiub-notice-checker"
-version = "6.3.0"
+version = "6.3.1"
 edition = "2024"
 rust-version = "1.100"
 description = "Cloudflare Worker that checks AIUB notices and posts them to Telegram and Facebook"
