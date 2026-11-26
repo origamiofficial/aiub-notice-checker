@@ -1043,6 +1043,15 @@ pub fn normalize_aiub_url(raw_href: &str, base_url: &str, allow_external: bool) 
         return String::new();
     }
 
+    // A bare email address as href ("probation@aiub.edu", seen in the
+    // 26 Nov 2026 probation notice footer) must not be joined onto the
+    // base URL — `Url::join` would produce the bogus
+    // https://www.aiub.edu/probation@aiub.edu. A real relative link
+    // always contains a '/'; a bare email never does.
+    if trimmed.contains('@') && !trimmed.contains('/') {
+        return String::new();
+    }
+
     let Ok(base) = Url::parse(base_url) else {
         return String::new();
     };

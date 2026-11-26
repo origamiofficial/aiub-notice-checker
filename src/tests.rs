@@ -681,6 +681,35 @@ mod scraper_tests {
         assert!(url.is_empty(), "URLs with userinfo should be rejected");
     }
 
+    // ── Bare email hrefs (26 Nov 2026 probation notice) ──────────────
+
+    #[test]
+    fn normalize_aiub_url_drops_bare_email_href() {
+        // The probation notice footer links "probation@aiub.edu" with a
+        // bare href; it must not become
+        // https://www.aiub.edu/probation@aiub.edu.
+        let url = normalize_aiub_url(
+            "probation@aiub.edu",
+            "https://www.aiub.edu/notice/test",
+            true,
+        );
+        assert!(
+            url.is_empty(),
+            "bare email hrefs must be dropped, got {url}"
+        );
+    }
+
+    #[test]
+    fn normalize_aiub_url_keeps_at_sign_in_real_path() {
+        // A real relative link that happens to contain '@' still works.
+        let url = normalize_aiub_url(
+            "/Files/Uploads/photo@2x.webp",
+            "https://www.aiub.edu/notice/test",
+            true,
+        );
+        assert_eq!(url, "https://www.aiub.edu/Files/Uploads/photo@2x.webp");
+    }
+
     #[test]
     fn normalize_aiub_url_allow_external() {
         let url = normalize_aiub_url(
