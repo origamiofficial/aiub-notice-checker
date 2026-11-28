@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "aiub-notice-checker"
-version = "6.4.0"
+version = "6.5.0"
 dependencies = [
  "chrono",
  "futures-util",
